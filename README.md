@@ -29,10 +29,18 @@ makes it the missing piece between a shimmed runtime and running real `esbuild`,
 
 ## Status
 
-**Stage 0: scaffolding.** The ELF64 header and program-header tables parse, with tests. Nothing executes yet.
+**Stage 0: reading, not executing.** The ELF64 header, program-header tables, section headers and symbol tables parse,
+with tests: section and symbol names resolve through their string tables, and `st_info` is split into binding and type.
+Nothing executes yet. There is no translator, no WASM emitter, no relocation handling and no syscall layer in this
+repository today.
 
-**Tests:** 8 There is no
-translator, no WASM emitter and no syscall layer in this repository today.
+Refusals are named, not generic, and that is the point: a 32-bit, big-endian, stripped, or 16-byte-symbol-entry object is
+rejected with a reason, because a parser that guesses an offset produces confident nonsense downstream.
+
+What does **not** work yet: relocations (`RELA`/`REL`), extended section numbering (`e_shnum == 0` with the real count in
+the first section's `sh_size`), and mapping `PT_LOAD` segments into WASM memory.
+
+**Tests:** 16
 
 ```bash
 npm ci && npm run verify
