@@ -29,7 +29,9 @@ makes it the missing piece between a shimmed runtime and running real `esbuild`,
 
 ## Status
 
-**Stage 0: scaffolding.** The ELF64 header and program-header tables parse, with tests. Nothing executes yet. There is no
+**Stage 0: scaffolding.** The ELF64 header and program-header tables parse, with tests. Nothing executes yet.
+
+**Tests:** 8 There is no
 translator, no WASM emitter and no syscall layer in this repository today.
 
 ```bash

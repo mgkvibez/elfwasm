@@ -7,7 +7,7 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "verify": "npm run typecheck && npm test"
+    "verify": "npm run typecheck && npm test && node tools/check-test-count.mjs"
   },
   "devDependencies": {
     "typescript": "^5.6.0",
