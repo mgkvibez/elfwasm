@@ -40,7 +40,7 @@ rejected with a reason, because a parser that guesses an offset produces confide
 What does **not** work yet: relocations (`RELA`/`REL`), extended section numbering (`e_shnum == 0` with the real count in
 the first section's `sh_size`), and mapping `PT_LOAD` segments into WASM memory.
 
-**Tests:** 16
+**Tests:** 17
 
 ```bash
 npm ci && npm run verify

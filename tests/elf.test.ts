@@ -213,3 +213,49 @@ describe("ELF64 symbol table", () => {
     expect(() => parseSymbols(bytes, sections, { dynamic: true })).toThrow(/no \.dynsym section/);
   });
 });
+
+/**
+ * A real binary, when the machine has one.
+ *
+ * Synthetic tables prove the parser matches the spec as I read it; this proves it matches files a linker actually
+ * produced, which is the only claim that matters. The host read is a dynamic import so the parser keeps zero
+ * dependencies and no Node types, and the test is skipped rather than failed where no ELF64 host binary exists.
+ */
+describe("a real ELF64 binary from the host", () => {
+  const load = async (path: string): Promise<Uint8Array | undefined> => {
+    try {
+      // @ts-expect-error node:fs is intentionally outside this project's type surface
+      const { readFileSync } = await import("node:fs");
+      return new Uint8Array(readFileSync(path));
+    } catch {
+      return undefined;
+    }
+  };
+
+  it("parses header, segments, sections and dynamic symbols end to end", async () => {
+    let bytes: Uint8Array | undefined;
+    for (const candidate of ["/bin/ls", "/usr/bin/ls", "/bin/sh"]) {
+      const loaded = await load(candidate);
+      if (loaded !== undefined && isElf64(loaded)) {
+        bytes = loaded;
+        break;
+      }
+    }
+    if (bytes === undefined) return; // no ELF64 host binary here: nothing to assert
+
+    const header = parseElfHeader(bytes);
+    const segments = parseProgramHeaders(bytes, header);
+    const sections = parseSectionHeaders(bytes, header);
+
+    expect(loadableSegments(segments).length).toBeGreaterThan(0);
+    expect(sections.length).toBe(header.sectionHeaderCount);
+    expect(findSection(sections, ".text")).toBeDefined();
+
+    const dynamic = parseSymbols(bytes, sections, { dynamic: true });
+    expect(dynamic.length).toBeGreaterThan(0);
+    expect(dynamic.some((symbol) => symbol.name.length > 0)).toBe(true);
+    for (const segment of loadableSegments(segments)) {
+      expect(Number(segment.offset + segment.fileSize)).toBeLessThanOrEqual(bytes.length);
+    }
+  });
+});
