@@ -288,3 +288,87 @@ export function parseSymbols(
   }
   return symbols;
 }
+
+/**
+ * Relocations, which is the last thing a linker has to understand before a loader can exist.
+ *
+ * Only `RELA` is supported, which is what x86-64 and aarch64 both use. `REL` (the 32-bit Intel style, where the addend
+ * lives at the relocation site in memory rather than in the file) is refused by name: reading it as if it were `RELA`
+ * would produce relocations with addend zero, which link to the wrong place instead of failing.
+ */
+export interface Relocation {
+  readonly offset: bigint;
+  readonly symbolIndex: number;
+  readonly type: number;
+  /** The symbol's name, when the table links to one this file can read. */
+  readonly symbolName: string;
+  readonly addend: bigint;
+}
+
+const SHT_RELA = 4;
+const SHT_REL = 9;
+const RELA_SIZE = 24;
+
+export function parseRelocations(
+  bytes: Uint8Array,
+  sections: readonly SectionHeader[],
+  options: { dynamic?: boolean } = {},
+): Relocation[] {
+  const label = options.dynamic ? "dynamic relocations" : "relocations";
+  const sites = sections.filter(
+    (section) => section.type === SHT_RELA && (!options.dynamic || section.name.includes("dyn")),
+  );
+  if (sites.length === 0) {
+    const relStyle = sections.filter((section) => section.type === SHT_REL);
+    if (relStyle.length > 0) {
+      throw new ElfFormatError(
+        `only RELA relocations are supported: ${relStyle.map((s) => s.name).join(", ")} uses REL, ` +
+          "whose addend lives in memory at the relocation site and cannot be read from the file",
+      );
+    }
+    throw new ElfFormatError(`no ${label} in this object`);
+  }
+
+  const symbolsBySection = new Map<number, ElfSymbol[]>();
+  const out: Relocation[] = [];
+  for (const site of sites) {
+    if (Number(site.entrySize) !== RELA_SIZE) {
+      throw new ElfFormatError(
+        `${site.name} has ${site.entrySize.toString()}-byte entries: expected ${RELA_SIZE} for Elf64_Rela`,
+      );
+    }
+    const symbolSection = sections[site.link];
+    if (symbolSection === undefined) {
+      throw new ElfFormatError(`${site.name} links to section ${site.link}, which does not exist`);
+    }
+    if (symbolSection.type !== SHT_SYMTAB && symbolSection.type !== SHT_DYNSYM) {
+      throw new ElfFormatError(`${site.name} links to ${symbolSection.name}, which is not a symbol table`);
+    }
+    let symbols = symbolsBySection.get(site.link);
+    if (symbols === undefined) {
+      symbols = parseSymbols(bytes, sections, { dynamic: symbolSection.type === SHT_DYNSYM });
+      symbolsBySection.set(site.link, symbols);
+    }
+
+    const start = Number(site.offset);
+    const size = Number(site.size);
+    if (start + size > bytes.length) {
+      throw new ElfFormatError(`${site.name} runs past the end of the file`);
+    }
+    const dv = view(bytes);
+    for (let offset = start; offset < start + size; offset += RELA_SIZE) {
+      const info = dv.getBigUint64(offset + 8, true);
+      const symbolIndex = Number(info >> 32n);
+      // symbol 0 is the reserved null symbol, so index 0 means "no symbol" rather than "symbols[0]"
+      const symbol = symbolIndex === 0 ? undefined : symbols[symbolIndex - 1];
+      out.push({
+        offset: dv.getBigUint64(offset, true),
+        symbolIndex,
+        type: Number(info & 0xffffffffn),
+        symbolName: symbol?.name ?? "",
+        addend: dv.getBigInt64(offset + 16, true),
+      });
+    }
+  }
+  return out;
+}

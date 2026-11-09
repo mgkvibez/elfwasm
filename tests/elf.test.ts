@@ -5,6 +5,7 @@ import {
   findSection,
   isElf64,
   loadableSegments,
+  parseRelocations,
   parseElfHeader,
   parseProgramHeaders,
   parseSectionHeaders,
@@ -157,6 +158,98 @@ function buildElfWithSections(options: { shnum?: number; shstrndx?: number; symE
   return bytes;
 }
 
+/**
+ * A synthetic ELF64 with sections, symbols and optional RELA relocations.
+ *
+ * Sections: 0 null, 1 .text, 2 .shstrtab, 3 .symtab, 4 .strtab, 5 .rela.text (when asked for)
+ */
+function sectionElf(
+  options: {
+    relas?: { target: bigint; symbol: number; type: number; addend: bigint }[];
+    relStyle?: boolean;
+    relaEntrySize?: number;
+  } = {},
+): Uint8Array {
+  const relas = options.relas ?? [];
+  const hasRelocations = relas.length > 0 || options.relStyle === true;
+  const shnum = hasRelocations ? 6 : 5;
+  const names = hasRelocations
+    ? "\u0000.text\u0000.shstrtab\u0000.symtab\u0000.strtab\u0000.rela.text\u0000"
+    : "\u0000.text\u0000.shstrtab\u0000.symtab\u0000.strtab\u0000";
+  const strings = "\u0000main\u0000helper\u0000";
+
+  const shstrOffset = 64 + 56;
+  const symOffset = shstrOffset + names.length;
+  const strOffset = symOffset + 24 * 3;
+  const relaOffset = strOffset + strings.length;
+  const relaCount = options.relStyle ? 1 : relas.length;
+  const relaEntrySize = options.relaEntrySize ?? 24;
+  const relaBytes = options.relStyle ? 16 : relaCount * 24;
+  const shoff = relaOffset + relaBytes;
+
+  const bytes = new Uint8Array(shoff + 64 * shnum);
+  const dv = new DataView(bytes.buffer);
+  bytes.set([0x7f, 0x45, 0x4c, 0x46], 0);
+  bytes[4] = 2;
+  bytes[5] = 1;
+  dv.setUint16(16, 2, true);
+  dv.setUint16(18, 0x3e, true);
+  dv.setBigUint64(24, 0x401000n, true);
+  dv.setBigUint64(32, 64n, true);
+  dv.setUint16(54, 56, true);
+  dv.setUint16(56, 1, true);
+  dv.setBigUint64(40, BigInt(shoff), true);
+  dv.setUint16(58, 64, true);
+  dv.setUint16(60, shnum, true);
+  dv.setUint16(62, 2, true);
+  dv.setUint32(64, 1, true);
+  dv.setUint32(64 + 4, 5, true);
+  dv.setBigUint64(64 + 32, 120n, true);
+  dv.setBigUint64(64 + 40, 120n, true);
+
+  for (let i = 0; i < names.length; i += 1) bytes[shstrOffset + i] = names.charCodeAt(i);
+  for (let i = 0; i < strings.length; i += 1) bytes[strOffset + i] = strings.charCodeAt(i);
+
+  const symAt = (i: number, nameOffset: number, info: number, value: bigint, size: bigint) => {
+    const base = symOffset + i * 24;
+    dv.setUint32(base, nameOffset, true);
+    dv.setUint8(base + 4, info);
+    dv.setUint16(base + 6, 1, true);
+    dv.setBigUint64(base + 8, value, true);
+    dv.setBigUint64(base + 16, size, true);
+  };
+  symAt(0, 0, 0, 0n, 0n);
+  symAt(1, 1, 0x12, 0x401000n, 32n);
+  symAt(2, 6, 0x02, 0x401020n, 16n);
+
+  const section = (i: number, nameOff: number, type: number, offset: number, size: number, link: number, entsize: number) => {
+    const base = shoff + i * 64;
+    dv.setUint32(base, nameOff, true);
+    dv.setUint32(base + 4, type, true);
+    dv.setBigUint64(base + 24, BigInt(offset), true);
+    dv.setBigUint64(base + 32, BigInt(size), true);
+    dv.setUint32(base + 40, link, true);
+    dv.setBigUint64(base + 56, BigInt(entsize), true);
+  };
+  section(0, 0, 0, 0, 0, 0, 0);
+  section(1, 1, 1, 0, 0, 0, 0);
+  section(2, 7, 3, shstrOffset, names.length, 0, 0);
+  section(3, 17, 2, symOffset, 24 * 3, 4, 24);
+  section(4, 25, 3, strOffset, strings.length, 0, 0);
+  if (hasRelocations) {
+    section(5, 35, options.relStyle ? 9 : 4, relaOffset, relaBytes, 3, relaEntrySize);
+  }
+
+  relas.forEach((rela, index) => {
+    const base = relaOffset + index * 24;
+    dv.setBigUint64(base, rela.target, true);
+    dv.setBigUint64(base + 8, (BigInt(rela.symbol) << 32n) | BigInt(rela.type), true);
+    dv.setBigInt64(base + 16, rela.addend, true);
+  });
+
+  return bytes;
+}
+
 describe("ELF64 section headers", () => {
   it("reads the table and resolves every section name", () => {
     const header = parseElfHeader(buildElfWithSections());
@@ -245,6 +338,11 @@ describe("a real ELF64 binary from the host", () => {
 
     const header = parseElfHeader(bytes);
     const segments = parseProgramHeaders(bytes, header);
+    const sectionsForRelocations = parseSectionHeaders(bytes, header);
+    const relocations = parseRelocations(bytes, sectionsForRelocations, { dynamic: true });
+    // a dynamically linked binary relocates something; zero would mean we silently read nothing
+    expect(relocations.length).toBeGreaterThan(0);
+    expect(relocations.some((relocation) => relocation.symbolName !== "")).toBe(true);
     const sections = parseSectionHeaders(bytes, header);
 
     expect(loadableSegments(segments).length).toBeGreaterThan(0);
@@ -257,5 +355,53 @@ describe("a real ELF64 binary from the host", () => {
     for (const segment of loadableSegments(segments)) {
       expect(Number(segment.offset + segment.fileSize)).toBeLessThanOrEqual(bytes.length);
     }
+  });
+});
+
+describe("ELF64 relocations", () => {
+  it("reads a R_X86_64_64 relocation with its symbol and addend", () => {
+    const bytes = sectionElf({ relas: [{ target: 0x404000n, symbol: 1, type: 1, addend: 8n }] });
+    const header = parseElfHeader(bytes);
+    const sections = parseSectionHeaders(bytes, header);
+    const relocations = parseRelocations(bytes, sections);
+    expect(relocations).toHaveLength(1);
+    expect(relocations[0]!.offset).toBe(0x404000n);
+    expect(relocations[0]!.type).toBe(1);
+    expect(relocations[0]!.addend).toBe(8n);
+    expect(relocations[0]!.symbolName).toBe("main");
+  });
+
+  it("keeps a negative addend negative", () => {
+    const bytes = sectionElf({ relas: [{ target: 0x1000n, symbol: 2, type: 4, addend: -16n }] });
+    const header = parseElfHeader(bytes);
+    const relocations = parseRelocations(bytes, parseSectionHeaders(bytes, header));
+    expect(relocations[0]!.addend).toBe(-16n);
+    expect(relocations[0]!.symbolName).toBe("helper");
+  });
+
+  it("treats symbol index zero as no symbol rather than the null entry", () => {
+    const bytes = sectionElf({ relas: [{ target: 0x2000n, symbol: 0, type: 8, addend: 0n }] });
+    const header = parseElfHeader(bytes);
+    const relocations = parseRelocations(bytes, parseSectionHeaders(bytes, header));
+    expect(relocations[0]!.symbolIndex).toBe(0);
+    expect(relocations[0]!.symbolName).toBe("");
+  });
+
+  it("refuses REL relocations by name instead of reading addend zero", () => {
+    const bytes = sectionElf({ relStyle: true });
+    const header = parseElfHeader(bytes);
+    expect(() => parseRelocations(bytes, parseSectionHeaders(bytes, header))).toThrow(/only RELA relocations are supported/);
+  });
+
+  it("refuses an object with no relocations at all", () => {
+    const bytes = sectionElf({});
+    const header = parseElfHeader(bytes);
+    expect(() => parseRelocations(bytes, parseSectionHeaders(bytes, header))).toThrow(/no relocations in this object/);
+  });
+
+  it("refuses a relocation entry size that is not Elf64_Rela", () => {
+    const bytes = sectionElf({ relas: [{ target: 1n, symbol: 1, type: 1, addend: 0n }], relaEntrySize: 16 });
+    const header = parseElfHeader(bytes);
+    expect(() => parseRelocations(bytes, parseSectionHeaders(bytes, header))).toThrow(/expected 24/);
   });
 });

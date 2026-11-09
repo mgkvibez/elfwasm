@@ -37,10 +37,14 @@ repository today.
 Refusals are named, not generic, and that is the point: a 32-bit, big-endian, stripped, or 16-byte-symbol-entry object is
 rejected with a reason, because a parser that guesses an offset produces confident nonsense downstream.
 
-What does **not** work yet: relocations (`RELA`/`REL`), extended section numbering (`e_shnum == 0` with the real count in
-the first section's `sh_size`), and mapping `PT_LOAD` segments into WASM memory.
+Relocations (`RELA`) parse too, with their symbol resolved by name and the addend kept signed. `REL`, whose addend lives
+in memory rather than in the file, is refused by name, because reading it as `RELA` would relocate to the wrong address
+instead of failing.
 
-**Tests:** 17
+What does **not** work yet: `REL` relocations, extended section numbering (`e_shnum == 0` with the real count in the first
+section's `sh_size`), and mapping `PT_LOAD` segments into WASM memory. Nothing is translated or executed.
+
+**Tests:** 23
 
 ```bash
 npm ci && npm run verify
