@@ -29,10 +29,10 @@ makes it the missing piece between a shimmed runtime and running real `esbuild`,
 
 ## Status
 
-**Stage 1 done, Stage 2 done for the integer subset.** The ELF64 header, program-header tables, section headers, symbol tables and `RELA`
+**Stage 1 done, Stage 2 done for the integer subset, Stage 3 started.** The ELF64 header, program-header tables, section headers, symbol tables and `RELA`
 relocations parse, the `PT_LOAD` segments are placed into a WASM linear memory, and the x86-64 decoder covers the subset a
-statically linked musl `hello world` uses. Nothing executes yet: there is no translator, no WASM emitter and no syscall
-layer in this repository today.
+statically linked musl `hello world` uses. Straight-line code now executes: x86-64 bytes are decoded and translated into a WASM module that Node runs and whose
+returned value is compared against the number the same bytes compute natively. There is no syscall layer yet.
 
 Refusals are named, not generic, and that is the point: a 32-bit, big-endian, stripped, or 16-byte-symbol-entry object is
 rejected with a reason, because a parser that guesses an offset produces confident nonsense downstream.
@@ -57,7 +57,7 @@ section's `sh_size`), SSE and `x87`, translation to WASM, and any syscall. Two h
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 60
+**Tests:** 76
 
 ```bash
 npm ci && npm run verify
@@ -104,6 +104,22 @@ Measured on `/bin/ls`, the decoder accounts for the first 57 instructions of `.t
 before it is decoded, and the instruction it stops on is named as SSE rather than as a 16-bit operand size, because those
 send a reader to different places in the architecture.
 
+## The translator
+
+`translate` takes the decoder's instructions and emits one WASM function: no parameters, one `i64` result, sixteen `i64`
+locals for the sixteen registers in encoding order. The subset is straight-line arithmetic only, `mov`, `add`, `sub`,
+`xor`, `and`, `or`, `imul` at 32 and 64 bits, ending in `ret`, and the value returned is `rax`.
+
+Two decisions are load-bearing rather than incidental. A 32-bit operand names the 64-bit local and carries width 32, and
+a 32-bit write narrows and widens through `i32` so the upper half is zeroed: that is why `mov $-1, %eax` leaves `rax` at
+`0xffffffff` and `add $2, %eax` then yields `1` rather than `0x100000001`. And the module's section lengths are computed
+from the bytes they contain, because a stale length is the one mistake in this format that produces a module which loads
+and misbehaves instead of one that fails to load.
+
+Everything else is refused by name and offset: a branch, memory either way, `syscall`, a `ret` with a stack adjustment,
+a block that does not return, and code after `ret`. Refusing is the honest option while the rest of the machine does not
+exist: a translator that skipped an instruction would produce a module that runs and computes the wrong number.
+
 ## Roadmap
 
 1. **ELF loading** (done): ELF64 headers, `PT_LOAD` segments mapped into a WASM `MemoryImage`, `RELA` relocations, and
@@ -111,7 +127,8 @@ send a reader to different places in the architecture.
 2. **Decoder** (done for the hello-world subset): ModRM, SIB, REX, RIP-relative addressing, and named refusals. SSE,
    `x87`, the string instructions and 16-bit operands are outside it, and an `objdump`-driven fixture keeps the boundaries
    honest.
-3. **Translator**: IR to WASM, one function per basic block, registers in locals.
+3. **Translator** (started): straight-line arithmetic to WASM, registers in locals, results checked by running the
+   module. Branches and flags next, then memory against the mapped image.
 4. **Syscall layer**: `write`, `exit_group`, `brk`, `mmap`, then the file syscalls, each behind a capability check.
 5. **Evidence**: the same binary run under real Linux and under the translator, stdout and exit code compared.
 
