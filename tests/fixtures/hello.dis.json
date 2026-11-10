@@ -128,5 +128,215 @@
     "offset": 98,
     "mnemonic": "ret",
     "length": 1
+  },
+  {
+    "offset": 99,
+    "mnemonic": "endbr64",
+    "length": 4
+  },
+  {
+    "offset": 103,
+    "mnemonic": "test",
+    "length": 3
+  },
+  {
+    "offset": 106,
+    "mnemonic": "test",
+    "length": 5
+  },
+  {
+    "offset": 111,
+    "mnemonic": "test",
+    "length": 7
+  },
+  {
+    "offset": 118,
+    "mnemonic": "movzbl",
+    "length": 3
+  },
+  {
+    "offset": 121,
+    "mnemonic": "movzbl",
+    "length": 4
+  },
+  {
+    "offset": 125,
+    "mnemonic": "movzwl",
+    "length": 4
+  },
+  {
+    "offset": 129,
+    "mnemonic": "movsbq",
+    "length": 4
+  },
+  {
+    "offset": 133,
+    "mnemonic": "movslq",
+    "length": 3
+  },
+  {
+    "offset": 136,
+    "mnemonic": "movslq",
+    "length": 3
+  },
+  {
+    "offset": 139,
+    "mnemonic": "imul",
+    "length": 4
+  },
+  {
+    "offset": 143,
+    "mnemonic": "imul",
+    "length": 4
+  },
+  {
+    "offset": 147,
+    "mnemonic": "imul",
+    "length": 3
+  },
+  {
+    "offset": 150,
+    "mnemonic": "neg",
+    "length": 3
+  },
+  {
+    "offset": 153,
+    "mnemonic": "not",
+    "length": 3
+  },
+  {
+    "offset": 156,
+    "mnemonic": "setne",
+    "length": 3
+  },
+  {
+    "offset": 159,
+    "mnemonic": "setb",
+    "length": 3
+  },
+  {
+    "offset": 162,
+    "mnemonic": "sete",
+    "length": 4
+  },
+  {
+    "offset": 166,
+    "mnemonic": "shl",
+    "length": 4
+  },
+  {
+    "offset": 170,
+    "mnemonic": "shr",
+    "length": 2
+  },
+  {
+    "offset": 172,
+    "mnemonic": "sar",
+    "length": 3
+  },
+  {
+    "offset": 175,
+    "mnemonic": "and",
+    "length": 3
+  },
+  {
+    "offset": 178,
+    "mnemonic": "or",
+    "length": 3
+  },
+  {
+    "offset": 181,
+    "mnemonic": "and",
+    "length": 3
+  },
+  {
+    "offset": 184,
+    "mnemonic": "or",
+    "length": 4
+  },
+  {
+    "offset": 188,
+    "mnemonic": "xor",
+    "length": 6
+  },
+  {
+    "offset": 194,
+    "mnemonic": "add",
+    "length": 3
+  },
+  {
+    "offset": 197,
+    "mnemonic": "sub",
+    "length": 3
+  },
+  {
+    "offset": 200,
+    "mnemonic": "cmp",
+    "length": 3
+  },
+  {
+    "offset": 203,
+    "mnemonic": "cmp",
+    "length": 3
+  },
+  {
+    "offset": 206,
+    "mnemonic": "push",
+    "length": 2
+  },
+  {
+    "offset": 208,
+    "mnemonic": "push",
+    "length": 5
+  },
+  {
+    "offset": 213,
+    "mnemonic": "cwtl",
+    "length": 1
+  },
+  {
+    "offset": 214,
+    "mnemonic": "cltq",
+    "length": 2
+  },
+  {
+    "offset": 216,
+    "mnemonic": "cltd",
+    "length": 1
+  },
+  {
+    "offset": 217,
+    "mnemonic": "cqto",
+    "length": 2
+  },
+  {
+    "offset": 219,
+    "mnemonic": "leave",
+    "length": 1
+  },
+  {
+    "offset": 220,
+    "mnemonic": "int3",
+    "length": 1
+  },
+  {
+    "offset": 221,
+    "mnemonic": "ud2",
+    "length": 2
+  },
+  {
+    "offset": 223,
+    "mnemonic": "jo",
+    "length": 6
+  },
+  {
+    "offset": 229,
+    "mnemonic": "jns",
+    "length": 6
+  },
+  {
+    "offset": 235,
+    "mnemonic": "jg",
+    "length": 6
   }
 ]

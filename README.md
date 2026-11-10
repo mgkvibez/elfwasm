@@ -29,7 +29,7 @@ makes it the missing piece between a shimmed runtime and running real `esbuild`,
 
 ## Status
 
-**Stage 1 done, Stage 2 started.** The ELF64 header, program-header tables, section headers, symbol tables and `RELA`
+**Stage 1 done, Stage 2 done for the integer subset.** The ELF64 header, program-header tables, section headers, symbol tables and `RELA`
 relocations parse, the `PT_LOAD` segments are placed into a WASM linear memory, and the x86-64 decoder covers the subset a
 statically linked musl `hello world` uses. Nothing executes yet: there is no translator, no WASM emitter and no syscall
 layer in this repository today.
@@ -53,11 +53,11 @@ Verified against `/bin/ls` on the host: 4 segments, 3 WASM pages (192 KiB), 143,
 zero-filled, entry `0x61d0` translated to WASM offset `0x61d0` holding `0x31`, the first byte of real x86-64 code.
 
 What does **not** work yet: `REL` relocations, extended section numbering (`e_shnum == 0` with the real count in the first
-section's `sh_size`), instruction decoding, translation to WASM, and any syscall. Two honest limits of the mapping:
+section's `sh_size`), SSE and `x87`, translation to WASM, and any syscall. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 51
+**Tests:** 60
 
 ```bash
 npm ci && npm run verify
@@ -67,21 +67,42 @@ npm ci && npm run verify
 ## The decoder
 
 `decode` turns code bytes into a flat instruction list: a mnemonic, its operands, and where each instruction starts. The
-covered set is what a statically linked musl `hello world` needs in its own code and in the libc it calls: `mov` in its
-register, memory, immediate and RIP-relative forms, `lea`, `xor`, `add`, `sub`, `cmp`, `push`, `pop`, `call`, the
-conditional and unconditional jumps, `syscall`, `ret` and `nop`. ModRM and SIB decode in full, so `[rsp+4*rax+8]` is one
-operand rather than a convention, and a byte-sized immediate comes back sign-extended (`sub rcx, -3`, not `253`).
+covered set is what a statically linked musl `hello world` needs in its own code and in the libc it calls:
+
+- moves: `mov` in every register, memory, immediate and RIP-relative form, byte moves included, plus `lea`, `movzx`,
+  `movsx` and `movsxd`;
+- arithmetic that sets flags: `add`, `sub`, `and`, `or`, `xor`, `cmp`, `test`, `imul`, `neg`, `not`, the arithmetic
+  shifts, and the accumulator-immediate forms;
+- control: `call`, `ret` with and without its stack-cleanup immediate, the whole conditional-jump family in both the short and near
+  encodings, `jmp`, `setcc`, `syscall`, `leave`, `endbr64`, `int3`, `ud2`, `nop`, and `push`/`pop` (`push` with an
+  immediate too);
+- the sign-extension pair by width: `cwde`/`cdqe` and `cdq`/`cqo`.
+
+ModRM and SIB decode in full, so `[rsp+4*rax+8]` is one operand rather than a convention, and a byte-sized immediate
+comes back sign-extended (`sub rcx, -3`, not `253`).
+
+Three details are read from the encoding because guessing them is silent rather than loud. A byte register's name depends
+on whether REX is present: code 4 is `ah` without it and `spl` with it. A `0x66` before `0x0f` is the mandatory prefix of
+an SSE encoding, not a 16-bit operand size, so it is refused as SSE. And a segment prefix is kept on the memory operand,
+because dropping `fs` from `mov %fs:0x28, %rax` would turn a thread-local read into a read of address `0x28`, which is a
+plausible looking load of the wrong memory. The linker's alignment padding (`66 2e 0f 1f 84 00`) counts as one ten-byte
+`nop`; it was a `0x66` refusal before, which stopped a walk of a real binary at the first function boundary instead of at
+real code.
 
 It is tested against binutils rather than against itself. `tests/fixtures/hello.s` is assembled by `as`, its `.text` is
 extracted, and `objdump`'s listing is committed beside it by `tools/build-decode-fixture.sh`. The test then requires the
-decoder to place every one of the fixture's 26 instructions at the offset objdump placed it, with the same length, so a
+decoder to place every one of the fixture's 68 instructions at the offset objdump placed it, with the same length, so a
 wrong instruction length cannot pass: a decoder that is one byte out still returns plausible looking instructions, just
 not the ones the compiler emitted, and everything after that point is out of phase.
 
-Everything outside the subset is refused by offset, never skipped: an SSE opcode, a 16-bit operand size, a segment
-override, a lock prefix, a truncated instruction, and the `lea` form that cannot exist are each named. Measured on
-`/bin/ls`, the decoder accounts for the first 26 instructions of `.text` and then refuses at offset `0x76` on a `0x66`
-prefix, which is where glibc's SSE starts. That refusal is the claim: the byte before it is exactly where the subset ends.
+Everything outside the subset is refused by offset, never skipped: an SSE opcode, a 16-bit operand size, a lock or repeat
+prefix, `mul`/`div` (which read and write implicit registers), the rotates, `movzx` from a 16-bit register, a truncated
+instruction, and the `lea` form that cannot exist are each named.
+
+Measured on `/bin/ls`, the decoder accounts for the first 57 instructions of `.text` and then refuses at offset `0x10a` on
+`66 0f 6f`, which is `movdqa`: the first SSE instruction in glibc's startup path. That refusal is the claim. Every byte
+before it is decoded, and the instruction it stops on is named as SSE rather than as a 16-bit operand size, because those
+send a reader to different places in the architecture.
 
 ## Roadmap
 

@@ -32,6 +32,49 @@ _start:
 bump:
     addq $1, %rax
     ret
+    # the second slice: what a compiler emits once the prologue is done
+    endbr64
+    testq %rax, %rax
+    testl $255, %eax
+    testq $4096, %rcx
+    movzbl %al, %ecx
+    movzbl 3(%rdi), %edx
+    movzwl 4(%rdi), %edx
+    movsbq %al, %rdx
+    movslq %eax, %r8
+    movsxd %r8d, %r9
+    imulq %rcx, %rax
+    imulq $7, %r8, %r9
+    imull $3, %eax, %edx
+    negq %rax
+    notq %rcx
+    setne %al
+    setb %cl
+    sete %r10b
+    shlq $3, %rax
+    shrl $1, %eax
+    sarq %cl, %rdx
+    andq %rcx, %rax
+    orq %rdx, %rax
+    andl $15, %eax
+    orq $64, %rax
+    xorq $255, %rax
+    addq %rcx, %rax
+    subq %rcx, %r8
+    cmpq %rcx, %rax
+    cmpl $5, %eax
+    pushq $42
+    pushq $1000
+    cwde
+    cltq
+    cdq
+    cqto
+    leave
+    int3
+    ud2
+    jo .done
+    jns .skip
+    jg .done
     .section .rodata
 message:
     .ascii "hello, world\n"

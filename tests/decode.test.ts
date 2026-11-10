@@ -13,8 +13,30 @@ import { findSection, isElf64, parseElfHeader, parseProgramHeaders, parseSection
 const hex = (text: string): Uint8Array =>
   Uint8Array.from(text.trim().split(/\s+/).map((pair) => Number.parseInt(pair, 16)));
 
-/** objdump spells the same mnemonic with a size suffix (`movq`, `movl`), which the IR does not carry. */
-const family = (mnemonic: string): string => mnemonic.replace(/^(mov)[qlwb]$/, "$1");
+/**
+ * objdump's spelling mapped onto the IR's, in one place so the mapping is auditable.
+ *
+ * Two different things are going on. Size suffixes (`movq`, `movl`, `movw`, `movb`) say how wide the operand is, which the
+ * IR carries on the operand instead of the mnemonic, so they are stripped. Aliases are objdump's own names for
+ * instructions with a longer official name (`cltq` is `cdqe`, `cqto` is `cqo`), and the extend instructions carry the
+ * source size and the destination size in the mnemonic (`movzbl` is "zero-extend byte to long"), which the IR spells as
+ * `movzx` with a byte source operand.
+ */
+const ALIASES: Record<string, string> = {
+  cltq: "cdqe",
+  // objdump calls the 0x63 instruction movslq, and the IR keeps Intel's movsxd: same opcode, same operand
+  movslq: "movsxd",
+  cwtl: "cwde",
+  cqto: "cqo",
+  cltd: "cdq",
+};
+const family = (mnemonic: string): string => {
+  if (ALIASES[mnemonic] !== undefined) return ALIASES[mnemonic]!;
+  // movzbl / movzwl / movsbq / movswq: the sizes are in the name, the destination size is the operand's `bits`
+  const extended = /^(movz|movs)(b|w)([wlq])$/.exec(mnemonic);
+  if (extended !== null) return `${extended[1]}x`;
+  return mnemonic.replace(/^(mov|test|imul|neg|not|shl|shr|sar|cmp|add|sub|and|or|xor)[qlwb]$/, "$1");
+};
 
 const asBytes = async (): Promise<Uint8Array> => {
   // @ts-expect-error node:fs is intentionally outside this project's type surface
@@ -114,16 +136,82 @@ describe("decoding assembler output", () => {
   });
 });
 
+describe("the pieces a compiler leans on", () => {
+  it("names a byte register from the encoding: ah without REX, spl with it", () => {
+    // 88 /r is `mov r/m8, r8`; with rm 4 the name is `ah` unless REX is present, when it is `spl`
+    expect(decode(hex("88 c4"))[0]!.operands).toEqual([
+      { kind: "reg", name: "ah", bits: 8 },
+      { kind: "reg", name: "al", bits: 8 },
+    ]);
+    expect(decode(hex("40 88 c4"))[0]!.operands).toEqual([
+      { kind: "reg", name: "spl", bits: 8 },
+      { kind: "reg", name: "al", bits: 8 },
+    ]);
+  });
+
+  it("reads endbr64 as its own four-byte instruction rather than as a repeat prefix", () => {
+    const [instruction, next] = decode(hex("f3 0f 1e fa 90"));
+    expect({ op: instruction!.op, length: instruction!.length }).toEqual({ op: "endbr64", length: 4 });
+    expect(next!.op).toBe("nop");
+  });
+
+  it("reads the linker's alignment padding as one nop, not as a 16-bit prefix", () => {
+    const [instruction] = decode(hex("66 2e 0f 1f 84 00 00 00 00 00"));
+    expect({ op: instruction!.op, length: instruction!.length }).toEqual({ op: "nop", length: 10 });
+  });
+
+  it("sign-extends and zero-extends from memory, with the destination width on the operand", () => {
+    const [zero] = decode(hex("0f b6 07"));
+    // a 32-bit operand keeps the 64-bit name and carries its width, which is the IR's convention for every width but
+    // the byte, where the encoding itself distinguishes al from ah
+    expect({ op: zero!.op, dst: zero!.operands[0] }).toEqual({ op: "movzx", dst: { kind: "reg", name: "rax", bits: 32 } });
+    const [sign] = decode(hex("48 0f be 07"));
+    expect({ op: sign!.op, dst: sign!.operands[0] }).toEqual({ op: "movsx", dst: { kind: "reg", name: "rax", bits: 64 } });
+  });
+
+  it("refuses a 16-bit register source for movzx, which would need the prefix it does not decode", () => {
+    expect(refuseBytes(hex("0f b7 c0")).message).toContain("needs a 0x66 prefix");
+  });
+
+  it("calls an SSE encoding SSE, not a 16-bit operand size, when the 0x66 prefix is the mandatory one", () => {
+    // 66 0f 6f is movdqa: the 0x66 here is part of the SIMD encoding, and saying "16-bit operand" would be wrong
+    expect(refuseBytes(hex("66 0f 6f 05 00 00 00 00")).message).toContain("SSE");
+    // and the unprefixed form, xorps, is SSE too
+    expect(refuseBytes(hex("0f 57 c0")).message).toContain("SSE");
+  });
+
+  it("refuses mul, div and the rotates by name rather than pretending they are in the subset", () => {
+    expect(refuseBytes(hex("f7 f1")).message).toContain("implicit registers");
+    expect(refuseBytes(hex("d1 c0")).message).toContain("rotate");
+  });
+
+  it("reads a shift by cl as cl, not as a fixed count", () => {
+    const [instruction] = decode(hex("48 d3 fa"));
+    expect(instruction!.op).toBe("sar");
+    expect(instruction!.operands[1]).toEqual({ kind: "reg", name: "cl", bits: 8 });
+  });
+
+  it("reads the sign-extension pair by width, so cdqe and cqo are not confused with cwde and cdq", () => {
+    expect(decode(hex("48 98"))[0]!.op).toBe("cdqe");
+    expect(decode(hex("98"))[0]!.op).toBe("cwde");
+    expect(decode(hex("48 99"))[0]!.op).toBe("cqo");
+    expect(decode(hex("99"))[0]!.op).toBe("cdq");
+  });
+});
+
+/** The error a refusal raises, so a test can assert on what it says rather than only that it threw. */
+const refuseBytes = (bytes: Uint8Array): DecodeError => {
+  try {
+    decode(bytes);
+  } catch (error) {
+    if (error instanceof DecodeError) return error;
+    throw error;
+  }
+  throw new Error(`the decoder accepted these bytes: ${[...bytes].map((byte) => byte.toString(16)).join(" ")}`);
+};
+
 describe("refusals", () => {
-  const refuse = (bytes: Uint8Array): DecodeError => {
-    try {
-      decode(bytes);
-    } catch (error) {
-      if (error instanceof DecodeError) return error;
-      throw error;
-    }
-    throw new Error("expected the decoder to refuse these bytes");
-  };
+  const refuse = refuseBytes;
 
   it("names the offset of an opcode it does not implement instead of skipping it", () => {
     // nop, then 0f 28 c0 (movaps) which needs SSE and is not in this subset, then ret
@@ -141,8 +229,13 @@ describe("refusals", () => {
     expect(refuse(hex("66 89 c0")).message).toContain("16-bit");
   });
 
-  it("refuses a segment override, which resolves through a base the loader has not set up", () => {
-    expect(refuse(hex("64 48 8b 04 25 00 00 00 00")).message).toContain("segment override");
+  it("reads the stack canary load with its segment, so `fs:0x28` is not left looking like address 0x28", () => {
+    // 64 48 8b 04 25 28 00 00 00 is `mov %fs:0x28, %rax`, the first thing most functions do
+    const [instruction] = decode(hex("64 48 8b 04 25 28 00 00 00"));
+    expect(instruction!.op).toBe("mov");
+    expect(instruction!.length).toBe(9);
+    const source = instruction!.operands[1]!;
+    expect(source).toMatchObject({ kind: "memory", segment: "fs", displacement: 0x28n, ripRelative: false });
   });
 
   it("refuses a lock prefix rather than dropping it, since dropping it changes the meaning", () => {
