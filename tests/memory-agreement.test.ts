@@ -35,6 +35,7 @@ _start:
 const runtime = (
   globalThis as unknown as {
     WebAssembly: {
+      Memory: new (descriptor: { initial: number }) => { readonly buffer: ArrayBuffer };
       Module: new (bytes: Uint8Array) => unknown;
       Instance: new (
         module: unknown,
@@ -105,6 +106,11 @@ const PROGRAMS = [
     expected: 7 + 5,
     memory: { symbol: "slot", bytes: [7, 0, 0, 0, 0, 0, 0, 0] },
   },
+  {
+    name: "stack",
+    expected: 10,
+    stackPages: 2,
+  },
 ] as const;
 
 const toolchain = ["as", "ld", "nm"].every(has);
@@ -134,26 +140,33 @@ describe.skipIf(!toolchain)("memory against the processor, on a linked binary", 
         const addresses = addressSpaceOf(image);
         const code = symbol(executable, "target");
 
-        const memory = createMemory(image);
+        // a program that uses the stack needs pages above the image, which the caller allocates, not the module
+        const stackPages = "stackPages" in program ? program.stackPages : 0;
+        const pages = image.pages + stackPages;
+        const memory =
+          stackPages === 0 ? createMemory(image) : new runtime.Memory({ initial: pages });
         loadImage(bytes, image, memory);
         const buffer = new Uint8Array(memory.buffer);
         const codeStart = fileOffsetOf(image, code.address);
         const module = translateBytes(bytes.subarray(codeStart, codeStart + code.size), "main", {
           addresses,
           codeAddress: code.address,
-          memoryPages: image.pages,
+          ...(stackPages === 0 ? { memoryPages: image.pages } : { memoryPages: pages, stackPages }),
         });
         const instance = new runtime.Instance(new runtime.Module(module), { env: { memory } });
         const translated = Number(instance.exports.main!());
 
+
         expect(native).toBe(program.expected);
         expect(translated & 0xff).toBe(native);
 
-        // and the store landed in the caller's memory at the address the image maps for the symbol
-        const slot = symbol(executable, program.memory.symbol);
-        const offset = addresses.offsetOf(slot.address);
-        expect(offset).toBeTypeOf("number");
-        expect(Array.from(buffer.subarray(offset!, offset! + 8))).toEqual([...program.memory.bytes]);
+        // a program with a data symbol also checks where its store landed, in the caller's memory rather than in a report
+        if ("memory" in program) {
+          const slot = symbol(executable, program.memory.symbol);
+          const offset = addresses.offsetOf(slot.address);
+          expect(offset).toBeTypeOf("number");
+          expect(Array.from(buffer.subarray(offset!, offset! + 8))).toEqual([...program.memory.bytes]);
+        }
       } finally {
         rmSync(directory, { recursive: true, force: true });
       }

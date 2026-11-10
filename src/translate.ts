@@ -54,8 +54,15 @@ export interface TranslateOptions {
   readonly addresses?: AddressSpace;
   /** Virtual address of the first byte of `instructions`, for RIP-relative operands. Defaults to 0. */
   readonly codeAddress?: bigint;
-  /** Pages to import when the body touches memory. Defaults to the smallest memory that can hold one page. */
+  /** Pages to import when the body touches memory. Defaults to the image's own pages plus `stackPages`. */
   readonly memoryPages?: number;
+  /**
+   * Pages above the image reserved for the stack, and the opt-in that enables stack translation at all.
+   *
+   * It is not a default because it changes what the caller has to allocate: the import minimum grows, so a caller that
+   * supplies the image's pages alone gets an instantiation error rather than a program with a stack it did not ask for.
+   */
+  readonly stackPages?: number;
 }
 
 export class TranslateError extends Error {
@@ -245,6 +252,138 @@ function resolveAddresses(
       }),
     };
   });
+}
+
+/** The pages the module imports: the image's own, plus whatever was set aside for the stack. */
+function totalPages(options: TranslateOptions): number {
+  const declared = options.addresses?.pages ?? 0;
+  return options.memoryPages ?? (declared + (options.stackPages ?? 0) || 1);
+}
+
+/**
+ * Where a stack sits when the image occupies the bottom of the imported memory.
+ *
+ * It grows down from the top page, which keeps it clear of every segment the image maps, and its floor is the image's last
+ * page: a push that would descend into the image traps instead of quietly overwriting code. `%rsp` holds a *virtual*
+ * address, like every other pointer here, so the top and the floor are both stated in the image's own terms.
+ */
+function stackBounds(options: TranslateOptions): { top: bigint; floor: bigint } {
+  const base = options.addresses?.baseAddress;
+  if (base === undefined) {
+    throw new TranslateError(0, "a stack needs the mapped image: pass addresses from image.addressSpaceOf()");
+  }
+  return {
+    top: base + BigInt(totalPages(options) * PAGE_SIZE),
+    floor: base + BigInt((options.addresses?.pages ?? 0) * PAGE_SIZE),
+  };
+}
+
+/** True when anything in this function uses the stack: a push, a pop, `leave`, or a stack-relative operand. */
+function usesStack(instructions: readonly Instruction[]): boolean {
+  return instructions.some(
+    (instruction) =>
+      instruction.op === "push" ||
+      instruction.op === "pop" ||
+      instruction.op === "leave" ||
+      instruction.operands.some(
+        (operand) =>
+          operand.kind === "memory" &&
+          [operand.base, operand.index].some((register) => register === "rsp" || register === "rbp"),
+      ),
+  );
+}
+
+/** The synthetic operand a stack access is expressed as, so it reuses the same address and bound machinery. */
+const STACK_OPERAND: Operand = {
+  kind: "memory",
+  base: "rsp",
+  scale: 1,
+  displacement: 0n,
+  ripRelative: false,
+  bits: 64,
+};
+
+/**
+ * `%rsp` moved by a signed number of bytes, ready for the access that follows it.
+ *
+ * One `i64.add` in both directions. Writing the negative case as a subtraction would subtract a negative number, which is
+ * a push that pushes upwards: the arithmetic is modular, so adding a negative constant is the descent.
+ */
+function adjustStack(bytes: bigint): number[] {
+  const rsp = REGISTERS.indexOf("rsp");
+  return [...localGet(rsp), ...i64Const(bytes), OP.i64Add, ...localSet(rsp)];
+}
+
+/**
+ * `push`: the pointer descends first, then the value is written at where it now points.
+ *
+ * The floor check comes between those two steps, so a push that would leave the stack's own pages traps before it writes
+ * rather than after: a write into the image would overwrite the program and look like a wrong answer later.
+ */
+function translatePush(instruction: Instruction, options: TranslateOptions): number[] {
+  const operand = instruction.operands[0];
+  if (operand === undefined) {
+    throw new TranslateError(instruction.offset, "push needs an operand");
+  }
+  const value =
+    operand.kind === "immediate"
+      ? i64Const(BigInt.asIntN(64, operand.value))
+      : operand.kind === "reg"
+        ? read(operand, instruction)
+        : (() => {
+            throw new TranslateError(
+              instruction.offset,
+              "push of a memory operand is not translated yet: it needs the same address machinery as a store",
+            );
+          })();
+  const { floor } = stackBounds(options);
+  return [
+    ...adjustStack(-8n),
+    ...localGet(REGISTERS.indexOf("rsp")),
+    ...i64Const(floor),
+    OP.i64LtU,
+    OP.ifEmpty,
+    OP.emptyBlockType,
+    OP.unreachable,
+    OP.end,
+    ...runtimeAddressCode(STACK_OPERAND, instruction, options, 64),
+    ...value,
+    OP.i64Store,
+    ...memarg(0),
+  ];
+}
+
+/** `pop`: the value is read where the pointer points, then the pointer rises. */
+function translatePop(instruction: Instruction, options: TranslateOptions): number[] {
+  const operand = instruction.operands[0];
+  if (operand === undefined) {
+    throw new TranslateError(instruction.offset, "pop needs an operand");
+  }
+  if (operand.kind !== "reg") {
+    throw new TranslateError(instruction.offset, `pop into ${operand.kind} is not translated yet`);
+  }
+  return [
+    ...runtimeAddressCode(STACK_OPERAND, instruction, options, 64),
+    OP.i64Load,
+    ...memarg(0),
+    ...write(operand, instruction),
+    ...adjustStack(8n),
+  ];
+}
+
+/** `leave`, which is `mov %rbp, %rsp` followed by `pop %rbp`: the frame pointer restores the stack it was given. */
+function translateLeave(instruction: Instruction, options: TranslateOptions): number[] {
+  const rbp = REGISTERS.indexOf("rbp");
+  return [
+    ...localGet(rbp),
+    ...localSet(REGISTERS.indexOf("rsp")),
+    // the pop reads through the same address machinery as any other stack access, so it is bound-checked too
+    ...runtimeAddressCode(STACK_OPERAND, instruction, options, 64),
+    OP.i64Load,
+    ...memarg(0),
+    ...localSet(rbp),
+    ...adjustStack(8n),
+  ];
 }
 
 /** The WASM that pushes a memory operand's address, which `resolveAddresses` has already established. */
@@ -599,6 +738,7 @@ function translateLoop(
   scope: Scope,
   out: number[],
   loops: LoopHeads,
+  options: TranslateOptions,
 ): number {
   const exit = bodyEnd + 1;
   const exitOffset = instructions[exit]?.offset;
@@ -610,7 +750,7 @@ function translateLoop(
   const nested: Scope = new Map([...scope].map(([key, value]) => [key, value + (leaves ? 2 : 1)] as const));
   nested.set(head, 0);
   if (leaves) nested.set(exit, 1);
-  translateRange(instructions, head, bodyEnd + 1, nested, out, { set: false, width: 64 }, loops, true);
+  translateRange(instructions, head, bodyEnd + 1, nested, out, { set: false, width: 64 }, loops, options, true);
   out.push(OP.end);
   if (leaves) out.push(OP.end);
   return exit;
@@ -632,6 +772,7 @@ function translateRange(
   out: number[],
   flags: Flags,
   loops: LoopHeads,
+  options: TranslateOptions,
   /** True when the caller has already opened this loop, so the head must not be opened a second time. */
   insideLoop = false,
 ): number {
@@ -641,7 +782,7 @@ function translateRange(
     const loopEnd = insideLoop ? undefined : loops.get(index);
     insideLoop = false;
     if (loopEnd !== undefined && loopEnd >= index && loopEnd < to) {
-      index = translateLoop(instructions, index, loopEnd, scope, out, loops);
+      index = translateLoop(instructions, index, loopEnd, scope, out, loops, options);
       flags.set = false;
       continue;
     }
@@ -679,7 +820,7 @@ function translateRange(
       // the bytes it skips are unreachable, and are emitted behind an always-false branch so that the module stays
       // structured and a jmp past code this cannot translate is refused rather than quietly skipped
       out.push(...i32Const(0), OP.ifEmpty, OP.emptyBlockType);
-      translateRange(instructions, index + 1, target, new Map(scope), out, { set: false, width: 64 }, loops);
+      translateRange(instructions, index + 1, target, new Map(scope), out, { set: false, width: 64 }, loops, options);
       out.push(OP.end);
       flags.set = false;
       index = target;
@@ -727,9 +868,9 @@ function translateRange(
         const shared: Scope = new Map([...scope].map(([key, value]) => [key, value + 1] as const));
         shared.set(join.join, 0);
         out.push(...condition, OP.ifEmpty, OP.emptyBlockType);
-        translateRange(instructions, target, join.join, new Map(shared), out, { set: false, width: 64 }, loops);
+        translateRange(instructions, target, join.join, new Map(shared), out, { set: false, width: 64 }, loops, options);
         out.push(OP.elseOp);
-        translateRange(instructions, index + 1, join.jmp, new Map(shared), out, { set: false, width: 64 }, loops);
+        translateRange(instructions, index + 1, join.jmp, new Map(shared), out, { set: false, width: 64 }, loops, options);
         out.push(OP.end);
         flags.set = false;
         index = join.join;
@@ -739,7 +880,7 @@ function translateRange(
       out.push(...condition, OP.i32Eqz, OP.ifEmpty, OP.emptyBlockType);
       const nested: Scope = new Map([...scope].map(([key, value]) => [key, value + 1] as const));
       nested.set(target, 0);
-      translateRange(instructions, index + 1, target, nested, out, { set: flags.set, width: flags.width }, loops);
+      translateRange(instructions, index + 1, target, nested, out, { set: flags.set, width: flags.width }, loops, options);
       out.push(OP.end);
       // after the join, a comparison made on one side is not known to have happened on the other, so the flags are
       // dropped rather than assumed
@@ -754,6 +895,29 @@ function translateRange(
       flags.width = translated.width;
       index += 1;
       continue;
+    }
+    if (instruction.op === "push" || instruction.op === "pop") {
+      out.push(
+        ...(instruction.op === "push"
+          ? translatePush(instruction, options)
+          : translatePop(instruction, options)),
+      );
+      // a push or pop touches memory, so a condition set before it cannot be trusted after it
+      flags.set = false;
+      index += 1;
+      continue;
+    }
+    if (instruction.op === "leave") {
+      out.push(...translateLeave(instruction, options));
+      flags.set = false;
+      index += 1;
+      continue;
+    }
+    if (instruction.op === "call") {
+      throw new TranslateError(
+        instruction.offset,
+        "call is not translated yet: a translated function has no calling convention to call another with",
+      );
     }
     if (instruction.op === "mov") {
       out.push(...translateMov(instruction));
@@ -789,23 +953,39 @@ export function translate(
   const body: number[] = [];
   const flags: Flags = { set: false, width: 64 };
   const loops = findLoops(instructions);
-  translateRange(instructions, 0, instructions.length, new Map(), body, flags, loops);
+  /*
+   * The stack's pointer is set here rather than by the caller, because `%rsp` is a local and locals start at zero. Pointing
+   * it at the top of the imported memory is the one decision that makes every later push and pop arithmetic rather than a
+   * special case, and it happens before the body so a stack access in the first instruction is already legal.
+   */
+  if (usesStack(instructions)) {
+    if ((options.stackPages ?? 0) < 1) {
+      throw new TranslateError(
+        0,
+        "this function uses the stack, so it needs stackPages: pass how many pages to set aside above the image",
+      );
+    }
+    const { top } = stackBounds(options);
+    body.push(...i64Const(top), ...localSet(REGISTERS.indexOf("rsp")));
+  }
+  translateRange(instructions, 0, instructions.length, new Map(), body, flags, loops, options);
   if (!instructions.some((instruction) => instruction.op === "ret")) {
     throw new TranslateError(
       instructions.at(-1)?.offset ?? 0,
       "the block does not end in ret, so it has no value to return",
     );
   }
-  const touchesMemory = instructions.some((instruction) =>
-    instruction.operands.some((operand) => operand.kind === "memory"),
-  );
+  const stackUsed = usesStack(instructions);
+  const touchesMemory =
+    stackUsed ||
+    instructions.some((instruction) => instruction.operands.some((operand) => operand.kind === "memory"));
   return module({
     name,
     locals: LOCAL_COUNT,
     body,
     result: I64,
     // the import appears only when something addresses memory, so a module that reads nothing still needs nothing
-    ...(touchesMemory ? { memory: { minimumPages: options.memoryPages ?? 1 } } : {}),
+    ...(touchesMemory || stackUsed ? { memory: { minimumPages: totalPages(options) } } : {}),
   });
 }
 

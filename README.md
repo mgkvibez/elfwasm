@@ -58,7 +58,7 @@ section's `sh_size`), SSE and `x87`, translation to WASM, and any syscall. Two h
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 125
+**Tests:** 137
 
 ```bash
 npm ci && npm run verify
@@ -171,9 +171,22 @@ flags it needs, `jo` and its relatives, a `ret` with a stack adjustment, a block
 Refusing is the honest option while the rest of the machine does not exist: a translator that skipped an instruction would
 produce a module that runs and computes the wrong number.
 
-The stack is the notable gap. `%rsp`-relative addressing translates, but nothing sets `%rsp`: there is no prologue and no
-calling convention yet, so a stack access traps on the bound check rather than silently reading the base of memory. That is
-the next increment, and it is the one that lets a translated function `push`, `pop`, and call another.
+### The stack
+
+A function that uses the stack says so with `stackPages`, and the prologue points `%rsp` at the top of the imported memory:
+the image occupies the bottom pages, the stack grows down from the top, and its floor is the image's last page. That floor
+is checked on every `push` and on `pop`/`leave`, so a descent into the image traps rather than overwriting the program and
+producing a wrong answer two instructions later. `push` is a descent followed by a store, `pop` a load followed by a rise,
+and `leave` is `mov %rbp, %rsp` then `pop %rbp`, which is what makes a frame re-entrant: the bytes stay where they are and
+the accounting forgets them.
+
+`stackPages` is opt-in rather than a default because it changes what the caller must allocate: the import minimum grows, so
+a caller who supplies the image's pages alone gets a refusal at translation and an instantiation error at load, rather than
+a program with a stack it did not size.
+
+`call` is refused by name. It needs a calling convention, which means deciding where arguments and the return address live
+and how a translated callee is reached, and none of that exists yet: `ret` still returns the module's own result. So the
+stack works inside one function (frames, spills, `push`/`pop`) and not yet between two.
 
 ## Checked against the processor, not against itself
 
@@ -191,8 +204,8 @@ run with no toolchain.
 `tools/native/memory/` is assembled and linked at whatever addresses the linker picks, the resulting *executable's* program
 headers are read into a `MemoryImage`, its `PT_LOAD` segments are copied into a fresh `WebAssembly.Memory`, the bytes the
 symbol table gives for `target` are translated with that image as its address space, and both versions run. Two programs:
-an absolute store and load (42), and a pointer in a register that is read through, added to, written back, and read again
-with a displacement (12). Each one's expected number is stated in the test rather than taken from either side, and the
+an absolute store and load (42), a pointer in a register that is read through, added to, written back, and read again with
+a displacement (12), and a stack frame with a spill, a push/pop pair and a `leave` (10). Each one's expected number is stated in the test rather than taken from either side, and the
 store is then read out of the caller's buffer at the offset the image maps for the symbol. The linked binary's own headers
 choose every address, so no part of that test hardcodes one.
 
@@ -204,8 +217,9 @@ choose every address, so no part of that test hardcodes one.
    `x87`, the string instructions and 16-bit operands are outside it, and an `objdump`-driven fixture keeps the boundaries
    honest.
 3. **Translator** (in progress): arithmetic, flags as comparisons, forward branches, loops, memory against the mapped image
-   including register-relative and indexed addressing with a bound check, registers in locals, results checked by running
-   the module and, where the toolchain allows, by the processor. The stack and a calling convention next.
+   including register-relative and indexed addressing with a bound check, and the stack with a checked floor, registers in
+   locals, results checked by running the module and, where the toolchain allows, by the processor. A calling convention
+   next.
 4. **Syscall layer**: `write`, `exit_group`, `brk`, `mmap`, then the file syscalls, each behind a capability check.
 5. **Evidence**: the same binary run under real Linux and under the translator, stdout and exit code compared.
 
