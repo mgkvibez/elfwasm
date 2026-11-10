@@ -87,57 +87,76 @@ function fileOffsetOf(image: MemoryImage, address: bigint): number {
   throw new Error(`0x${address.toString(16)} is not in a file-backed segment`);
 }
 
+/**
+ * The programs, and the number the processor should produce for each.
+ *
+ * Writing the expected value here rather than deriving it means both sides are checked against a third thing: a program
+ * whose assembler output happened to be wrong would still disagree with a wrong expectation, but a translation that
+ * agreed with a wrong assembler would not go unnoticed the way it would if the expectation came from the translator.
+ */
+const PROGRAMS = [
+  {
+    name: "memory",
+    expected: 0x2a,
+    memory: { symbol: "slot", bytes: [0x2a, 0, 0, 0, 0, 0, 0, 0] },
+  },
+  {
+    name: "addressing",
+    expected: 7 + 5,
+    memory: { symbol: "slot", bytes: [7, 0, 0, 0, 0, 0, 0, 0] },
+  },
+] as const;
+
 const toolchain = ["as", "ld", "nm"].every(has);
 
 describe.skipIf(!toolchain)("memory against the processor, on a linked binary", () => {
-  it("stores and loads the same value the processor does, in an image built from that binary", () => {
-    const directory = mkdtempSync(join(tmpdir(), "elfwasm-memory-"));
-    try {
-      const startPath = join(directory, "start.s");
-      execFileSync("sh", ["-c", `cat > ${startPath} <<'EOF'\n${START}EOF`]);
-      const startObject = join(directory, "start.o");
-      const programObject = join(directory, "memory.o");
-      const executable = join(directory, "memory");
+  for (const program of PROGRAMS) {
+    it(`agrees with the processor about ${program.name}, through an image built from that binary`, () => {
+      const directory = mkdtempSync(join(tmpdir(), `elfwasm-${program.name}-`));
+      try {
+        const startPath = join(directory, "start.s");
+        execFileSync("sh", ["-c", `cat > ${startPath} <<'EOF'\n${START}EOF`]);
+        const startObject = join(directory, "start.o");
+        const programObject = join(directory, "program.o");
+        const executable = join(directory, program.name);
 
-      execFileSync("as", ["--64", "-o", startObject, startPath]);
-      execFileSync("as", ["--64", "-o", programObject, "tools/native/memory/memory.s"]);
-      // -no-pie because the program addresses its global absolutely, which is the addressing this increment translates
-      execFileSync("ld", ["-nostdlib", "-no-pie", "-o", executable, startObject, programObject]);
-      execFileSync("chmod", ["+x", executable]);
+        execFileSync("as", ["--64", "-o", startObject, startPath]);
+        execFileSync("as", ["--64", "-o", programObject, `tools/native/memory/${program.name}.s`]);
+        // -no-pie because these programs address their data symbols absolutely, which is the addressing being translated
+        execFileSync("ld", ["-nostdlib", "-no-pie", "-o", executable, startObject, programObject]);
+        execFileSync("chmod", ["+x", executable]);
 
-      const native = status(executable);
+        const native = status(executable);
 
-      // the executable's own program headers decide where things are, so nothing here hardcodes an address
-      const bytes = Uint8Array.from(readFileSync(executable) as Uint8Array);
-      const image = imageOf(bytes);
-      const addresses = addressSpaceOf(image);
-      const code = symbol(executable, "target");
-      const slot = symbol(executable, "slot");
+        // the executable's own program headers decide where things are, so nothing here hardcodes an address
+        const bytes = Uint8Array.from(readFileSync(executable) as Uint8Array);
+        const image = imageOf(bytes);
+        const addresses = addressSpaceOf(image);
+        const code = symbol(executable, "target");
 
-      const memory = createMemory(image);
-      loadImage(bytes, image, memory);
-      const buffer = new Uint8Array(memory.buffer);
-      const codeBytes = bytes.subarray(
-        fileOffsetOf(image, code.address),
-        fileOffsetOf(image, code.address) + code.size,
-      );
-      const module = translateBytes(codeBytes, "main", {
-        addresses,
-        codeAddress: code.address,
-        memoryPages: image.pages,
-      });
-      const instance = new runtime.Instance(new runtime.Module(module), { env: { memory } });
-      const translated = Number(instance.exports.main!());
+        const memory = createMemory(image);
+        loadImage(bytes, image, memory);
+        const buffer = new Uint8Array(memory.buffer);
+        const codeStart = fileOffsetOf(image, code.address);
+        const module = translateBytes(bytes.subarray(codeStart, codeStart + code.size), "main", {
+          addresses,
+          codeAddress: code.address,
+          memoryPages: image.pages,
+        });
+        const instance = new runtime.Instance(new runtime.Module(module), { env: { memory } });
+        const translated = Number(instance.exports.main!());
 
-      expect(native).toBe(0x2a);
-      expect(translated & 0xff).toBe(native);
+        expect(native).toBe(program.expected);
+        expect(translated & 0xff).toBe(native);
 
-      // and the store landed in the caller's memory at the address the image maps for that symbol
-      const slotOffset = addresses.offsetOf(slot.address);
-      expect(slotOffset).toBeTypeOf("number");
-      expect(Array.from(buffer.subarray(slotOffset!, slotOffset! + 8))).toEqual([0x2a, 0, 0, 0, 0, 0, 0, 0]);
-    } finally {
-      rmSync(directory, { recursive: true, force: true });
-    }
-  });
+        // and the store landed in the caller's memory at the address the image maps for the symbol
+        const slot = symbol(executable, program.memory.symbol);
+        const offset = addresses.offsetOf(slot.address);
+        expect(offset).toBeTypeOf("number");
+        expect(Array.from(buffer.subarray(offset!, offset! + 8))).toEqual([...program.memory.bytes]);
+      } finally {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    });
+  }
 });

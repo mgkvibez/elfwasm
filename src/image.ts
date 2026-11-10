@@ -242,12 +242,15 @@ export function toWasmAddress(image: MemoryImage, virtualAddress: bigint): numbe
  * the instruction's offset and can name it.
  */
 export interface AddressSpace {
+  /** The virtual address that sits at WASM offset 0, which a run-time address has to subtract. */
+  readonly baseAddress: bigint;
   /** WASM byte offset of this virtual address, or undefined when no segment maps it. */
   offsetOf(virtualAddress: bigint): number | undefined;
 }
 
 export function addressSpaceOf(image: MemoryImage): AddressSpace {
   return {
+    baseAddress: image.baseAddress,
     offsetOf(virtualAddress: bigint): number | undefined {
       for (const segment of image.segments) {
         if (virtualAddress >= segment.virtualAddress && virtualAddress < segment.virtualAddress + segment.memorySize) {

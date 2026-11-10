@@ -136,6 +136,7 @@ export function module(options: ModuleOptions): Uint8Array {
 export const OP = {
   localGet: 0x20,
   localSet: 0x21,
+  localTee: 0x22,
   i32Const: 0x41,
   i64Const: 0x42,
   i64Add: 0x7c,
@@ -147,6 +148,8 @@ export const OP = {
   i64Shl: 0x86,
   i32WrapI64: 0xa7,
   i64ExtendI32U: 0xad,
+  // a trap, which is what an address outside the image becomes: a wild read is worse than a stopped program
+  unreachable: 0x00,
   // memory access: the address is on the stack and the memarg carries alignment and a constant offset
   i32Load: 0x28,
   i64Load: 0x29,

@@ -82,6 +82,14 @@ export type Operand =
        */
       readonly wasmOffset?: number;
       /**
+       * For an address only the code can know: the WASM that pushes its offset, emitted by the translator up front.
+       *
+       * A constant address becomes `i32.const`; an address through a register becomes a subtraction against the image
+       * base, a bound check, and a truncation. Deciding that once, in one place, is what keeps every load and store from
+       * carrying its own copy of the rule.
+       */
+      readonly addressCode?: readonly number[];
+      /**
        * The segment prefix, when there is one.
        *
        * `fs` is the one that matters in practice: `mov %fs:0x28, %rax` is the stack canary's read, and a translator that

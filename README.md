@@ -58,7 +58,7 @@ section's `sh_size`), SSE and `x87`, translation to WASM, and any syscall. Two h
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 113
+**Tests:** 125
 
 ```bash
 npm ci && npm run verify
@@ -156,12 +156,24 @@ never filled, so every address would read zero while looking legitimate; importi
 `WebAssembly.Memory`, copies the segments in, and the module addresses that same buffer. The import appears only when the
 body touches memory, so a function that reads nothing still needs nothing.
 
-Everything else is refused by name and offset: addressing through a base or index register (the address only exists once
-the code runs), a segment override such as `%fs:` (WASM has no segments, and reading `0x28` as a plain address would
-silently load the wrong memory), an address no segment maps, `syscall`, `setcc` and the flags it needs, `jo` and its
-relatives, a `ret` with a stack adjustment, a block that does not return, and code after `ret`. Refusing is the honest
-option while the rest of the machine does not exist: a translator that skipped an instruction would produce a module that
-runs and computes the wrong number.
+A register-relative operand is the same idea with the arithmetic moved to run time, because a pointer is a register
+holding a virtual address. `0x400100(%rcx)` becomes "subtract the image base from `rcx`, add the displacement", and
+`(%rcx,%rax,4)` adds the index shifted left by two. Both are bound-checked before the access: WASM has one flat buffer and
+no faulting pages, so an address outside the image would read whatever sits at that offset and look entirely legitimate.
+The check is unsigned against `limit - width`, which catches a null pointer (a small negative offset becomes a huge unsigned
+one), an address past the end, and an access whose last bytes run off the end, all with the same comparison, and it traps
+rather than reading. The bound is the memory the module imports, so it is the caller's memory and not a number invented
+here.
+
+Everything else is refused by name and offset: a segment override such as `%fs:` (WASM has no segments, and reading `0x28`
+as a plain address would silently load the wrong memory), a constant address no segment maps, `syscall`, `setcc` and the
+flags it needs, `jo` and its relatives, a `ret` with a stack adjustment, a block that does not return, and code after `ret`.
+Refusing is the honest option while the rest of the machine does not exist: a translator that skipped an instruction would
+produce a module that runs and computes the wrong number.
+
+The stack is the notable gap. `%rsp`-relative addressing translates, but nothing sets `%rsp`: there is no prologue and no
+calling convention yet, so a stack access traps on the bound check rather than silently reading the base of memory. That is
+the next increment, and it is the one that lets a translated function `push`, `pop`, and call another.
 
 ## Checked against the processor, not against itself
 
@@ -175,12 +187,14 @@ Currently eight programs, and they agree: a countdown loop (5), a sum loop (10),
 comparisons at each width (3, 2 and 3). It skips rather than fails when binutils is absent, because a cold checkout must
 run with no toolchain.
 
-`tests/memory-agreement.test.ts` does the same for memory, and does it end to end: `tools/native/memory/memory.s` is
-assembled and linked at whatever addresses the linker picks, the resulting *executable's* program headers are read into a
-`MemoryImage`, its `PT_LOAD` segments are copied into a fresh `WebAssembly.Memory`, the bytes the symbol table gives for
-`target` are translated with that image as its address space, and both versions run. They agree (42), and the store is
-then read out of the caller's buffer at the offset the image maps for `slot`. The linked binary's own headers choose every
-address there, so no part of that test hardcodes one.
+`tests/memory-agreement.test.ts` does the same for memory, and does it end to end. Each program in
+`tools/native/memory/` is assembled and linked at whatever addresses the linker picks, the resulting *executable's* program
+headers are read into a `MemoryImage`, its `PT_LOAD` segments are copied into a fresh `WebAssembly.Memory`, the bytes the
+symbol table gives for `target` are translated with that image as its address space, and both versions run. Two programs:
+an absolute store and load (42), and a pointer in a register that is read through, added to, written back, and read again
+with a displacement (12). Each one's expected number is stated in the test rather than taken from either side, and the
+store is then read out of the caller's buffer at the offset the image maps for the symbol. The linked binary's own headers
+choose every address, so no part of that test hardcodes one.
 
 ## Roadmap
 
@@ -189,9 +203,9 @@ address there, so no part of that test hardcodes one.
 2. **Decoder** (done for the hello-world subset): ModRM, SIB, REX, RIP-relative addressing, and named refusals. SSE,
    `x87`, the string instructions and 16-bit operands are outside it, and an `objdump`-driven fixture keeps the boundaries
    honest.
-3. **Translator** (in progress): arithmetic, flags as comparisons, forward branches, loops and memory against the mapped
-   image, registers in locals, results checked by running the module and, where the toolchain allows, by the processor.
-   Register-relative addressing and the stack next.
+3. **Translator** (in progress): arithmetic, flags as comparisons, forward branches, loops, memory against the mapped image
+   including register-relative and indexed addressing with a bound check, registers in locals, results checked by running
+   the module and, where the toolchain allows, by the processor. The stack and a calling convention next.
 4. **Syscall layer**: `write`, `exit_group`, `brk`, `mmap`, then the file syscalls, each behind a capability check.
 5. **Evidence**: the same binary run under real Linux and under the translator, stdout and exit code compared.
 

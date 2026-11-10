@@ -30,7 +30,17 @@ const REGISTERS = [
 /** The two locals `cmp` and `test` leave their operands in, so a branch can be the comparison. */
 const CMP_A = REGISTERS.length;
 const CMP_B = REGISTERS.length + 1;
-const LOCAL_COUNT = REGISTERS.length + 2;
+/**
+ * Where a computed address waits between its bound check and its use.
+ *
+ * It cannot be one of the comparison locals: `cmp (%rax), %rbx` keeps its first operand in `CMP_A` while the second is being
+ * loaded, and an address check that wrote `CMP_A` there would silently compare the address against the value.
+ */
+const ADDR = REGISTERS.length + 2;
+const LOCAL_COUNT = REGISTERS.length + 3;
+
+/** WASM's page size, which is what a bound is expressed in. */
+const PAGE_SIZE = 64 * 1024;
 
 /**
  * What the translator needs to know about the world outside the bytes.
@@ -57,16 +67,21 @@ export class TranslateError extends Error {
   }
 }
 
+function localOfRegister(name: string, instruction: Instruction): number {
+  // the 32-bit and 8-bit names share the 64-bit local, which is x86's own model: a narrow write lands in the same register
+  const base = name.replace(/^r(\d+)[bwd]?$/, (_match, digits: string) => `r${digits}`);
+  const index = REGISTERS.indexOf(base as (typeof REGISTERS)[number]);
+  if (index < 0) {
+    throw new TranslateError(instruction.offset, `register ${name} is not one of the 64-bit registers`);
+  }
+  return index;
+}
+
 function localOf(operand: Operand, instruction: Instruction): number {
   if (operand.kind !== "reg") {
     throw new TranslateError(instruction.offset, `expected a register operand, found ${operand.kind}`);
   }
-  const base = operand.name.replace(/^r(\d+)[bwd]?$/, (_match, digits: string) => `r${digits}`);
-  const index = REGISTERS.indexOf(base as (typeof REGISTERS)[number]);
-  if (index < 0) {
-    throw new TranslateError(instruction.offset, `register ${operand.name} is not one of the 64-bit registers`);
-  }
-  return index;
+  return localOfRegister(operand.name, instruction);
 }
 
 function read(operand: Operand, instruction: Instruction): number[] {
@@ -109,11 +124,9 @@ function virtualAddressOf(operand: Operand, instruction: Instruction, options: T
     );
   }
   if (operand.base !== undefined || operand.index !== undefined) {
-    const named = [operand.base, operand.index].filter((register) => register !== undefined).join(", ");
     throw new TranslateError(
       instruction.offset,
-      `addressing through ${named} is not translated yet: the address is computed at run time, and this translator only ` +
-        `resolves addresses it can know now`,
+      "a register-relative address reached the constant path, which is a bug in this translator",
     );
   }
   // RIP-relative is measured from the end of this instruction, which is what the processor adds the displacement to
@@ -124,11 +137,79 @@ function virtualAddressOf(operand: Operand, instruction: Instruction, options: T
 }
 
 /**
+ * The WASM that pushes the address of an address-through-a-register operand, or a refusal.
+ *
+ * A register holds a virtual address at run time, so the subtraction against the image base and the bound check have to
+ * happen there too. The bound is not a formality: WASM has one flat memory and no faulting pages, so an address outside the
+ * image would read whatever happens to sit at that offset and look entirely legitimate. The check turns that into a trap.
+ *
+ * The check is unsigned and against `limit - width`, so a negative offset, an offset past the end and a width that would
+ * run off the end all fail the same comparison. `i64.gt_u` on a wrapped small negative number is a huge unsigned number,
+ * which is exactly what it is.
+ */
+function runtimeAddressCode(
+  operand: Operand,
+  instruction: Instruction,
+  options: TranslateOptions,
+  width: 8 | 16 | 32 | 64,
+): number[] {
+  if (operand.kind !== "memory") {
+    throw new TranslateError(instruction.offset, `expected a memory operand, found ${operand.kind}`);
+  }
+  const addresses = options.addresses;
+  if (addresses === undefined) {
+    throw new TranslateError(
+      instruction.offset,
+      "a memory operand needs the mapped image: pass addresses from image.addressSpaceOf()",
+    );
+  }
+  if (operand.segment !== undefined) {
+    throw new TranslateError(
+      instruction.offset,
+      `a %${operand.segment}: operand needs a segment base, and WASM has no segments: refusing rather than reading the ` +
+        `offset as a plain address`,
+    );
+  }
+  // the address is a sum of parts, and each part is pushed before the add that consumes the two before it
+  const parts: number[][] = [];
+  if (operand.base !== undefined) {
+    // a register's value is a virtual address, so the image's own base is subtracted before anything is addressed
+    parts.push([
+      ...localGet(localOfRegister(operand.base, instruction)),
+      ...i64Const(addresses.baseAddress),
+      OP.i64Sub,
+    ]);
+  }
+  if (operand.index !== undefined) {
+    const shift = { 1: 0n, 2: 1n, 4: 2n, 8: 3n }[operand.scale];
+    const scaled = [...localGet(localOfRegister(operand.index, instruction))];
+    if (shift !== 0n) scaled.push(...i64Const(shift), OP.i64Shl);
+    parts.push(scaled);
+  }
+  const code = [...parts[0]!];
+  for (const part of parts.slice(1)) code.push(...part, OP.i64Add);
+  if (operand.displacement !== 0n) code.push(...i64Const(operand.displacement), OP.i64Add);
+
+  const limit = BigInt((options.memoryPages ?? 1) * PAGE_SIZE) - BigInt(width / 8);
+  return [
+    ...code,
+    OP.localTee, ...unsigned(ADDR),
+    ...i64Const(limit), OP.i64GtU,
+    OP.ifEmpty, OP.emptyBlockType, OP.unreachable, OP.end,
+    OP.localGet, ...unsigned(ADDR),
+    OP.i32WrapI64,
+  ];
+}
+
+/**
  * Resolve every memory operand up front, so the translation never re-derives an address.
  *
  * Doing this in one pass rather than inside each opcode's translation has a second effect worth stating: an operand that
  * cannot be resolved is refused whether or not the instruction around it is one this translator happens to support, so a
  * caller reading errors gets the more fundamental complaint first.
+ *
+ * An address that is a constant and an address that is a register subtraction both end up as code here, in the same field,
+ * so every load and store has one thing to splice and no opinion about which kind it got.
  */
 function resolveAddresses(
   instructions: readonly Instruction[],
@@ -141,6 +222,11 @@ function resolveAddresses(
       ...instruction,
       operands: instruction.operands.map((operand) => {
         if (operand.kind !== "memory") return operand;
+        // a register-relative address is only knowable at run time, so it becomes code rather than a number
+        if (operand.base !== undefined || operand.index !== undefined) {
+          const width = operand.bits ?? 32;
+          return { ...operand, addressCode: runtimeAddressCode(operand, instruction, options, width) };
+        }
         const virtual = virtualAddressOf(operand, instruction, options);
         if (addresses === undefined) {
           throw new TranslateError(
@@ -155,10 +241,16 @@ function resolveAddresses(
             `address ${hex(virtual)} is not mapped by any segment, so there is no byte to access`,
           );
         }
-        return { ...operand, wasmOffset: offset };
+        return { ...operand, wasmOffset: offset, addressCode: i32Const(offset) };
       }),
     };
   });
+}
+
+/** The WASM that pushes a memory operand's address, which `resolveAddresses` has already established. */
+function addressOf(operand: Operand, instruction: Instruction): number[] {
+  if (operand.kind === "memory" && operand.addressCode !== undefined) return [...operand.addressCode];
+  return [...i32Const(wasmOffsetOf(operand, instruction))];
 }
 
 /** The resolved offset of a memory operand, which `resolveAddresses` has already established. */
@@ -174,17 +266,16 @@ function wasmOffsetOf(operand: Operand, instruction: Instruction): number {
 
 /** A load at the operand's width, as an i64, because every register is an i64 local. */
 function loadFromMemory(operand: Operand, width: 32 | 64, instruction: Instruction): number[] {
-  const offset = wasmOffsetOf(operand, instruction);
-  if (width === 64) return [...i32Const(offset), OP.i64Load, ...memarg(0)];
+  const address = addressOf(operand, instruction);
+  if (width === 64) return [...address, OP.i64Load, ...memarg(0)];
   // a 32-bit load zeroes the upper half of the destination, which is x86's own rule for `movl`
-  return [...i32Const(offset), OP.i32Load, ...memarg(0), WIDEN_32];
+  return [...address, OP.i32Load, ...memarg(0), WIDEN_32];
 }
 
 /** A store: the address goes on the stack first, the value on top, which is the order `store` pops them in. */
 function storeToMemory(operand: Operand, value: readonly number[], width: 8 | 16 | 32 | 64, instruction: Instruction): number[] {
-  const offset = wasmOffsetOf(operand, instruction);
   const code = { 8: OP.i32Store8, 16: OP.i32Store16, 32: OP.i32Store, 64: OP.i64Store }[width];
-  return [...i32Const(offset), ...value, code, ...memarg(0)];
+  return [...addressOf(operand, instruction), ...value, code, ...memarg(0)];
 }
 
 function translateMov(instruction: Instruction): number[] {
@@ -289,9 +380,9 @@ function operandCode(operand: Operand, width: 32 | 64, instruction: Instruction)
   }
   if (operand.kind === "memory") {
     // the load is already the operation's width, so there is nothing to narrow
-    const offset = wasmOffsetOf(operand, instruction);
-    if (width === 64) return [...i32Const(offset), OP.i64Load, ...memarg(0)];
-    return [...i32Const(offset), OP.i32Load, ...memarg(0)];
+    const address = addressOf(operand, instruction);
+    if (width === 64) return [...address, OP.i64Load, ...memarg(0)];
+    return [...address, OP.i32Load, ...memarg(0)];
   }
   const code = read(operand, instruction);
   return width === 32 ? [...code, NARROW_32] : code;

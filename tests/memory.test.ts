@@ -173,7 +173,9 @@ describe("address resolution", () => {
     expect(refusal(hex("64 48 8b 04 25 28 00 00 00 c3"))).toContain("a %fs: operand needs a segment base");
   });
 
-  it("refuses an index register by name", () => {
-    expect(refusal(hex("48 8b 04 88 c3"))).toContain("addressing through rax, rcx is not translated yet");
+  it("resolves an index register at run time instead of refusing it", () => {
+    // mov (%rax,%rcx,1), %rdx: the address is computed from two registers, so the translation defers it
+    const code = translateBytes(hex("48 8b 14 08 c3"), "main", { addresses: addressSpaceOf(imageOf()) });
+    expect(code.length).toBeGreaterThan(0);
   });
 });
