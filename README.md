@@ -58,7 +58,7 @@ section's `sh_size`), SSE and `x87`, translation to WASM, and any syscall. Two h
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 99
+**Tests:** 113
 
 ```bash
 npm ci && npm run verify
@@ -137,9 +137,31 @@ a 32-bit write narrows and widens through `i32` so the upper half is zeroed: tha
 from the bytes they contain, because a stale length is the one mistake in this format that produces a module which loads
 and misbehaves instead of one that fails to load.
 
-Everything else is refused by name and offset: memory either way, `syscall`, `setcc` and the flags it needs, `jo` and its
-relatives, a `ret` with a stack adjustment, a block that does not return, and code after `ret`. Refusing is the honest option while the rest of the machine does not
-exist: a translator that skipped an instruction would produce a module that runs and computes the wrong number.
+### Memory
+
+A memory operand names a virtual address, so translating one is a matter of resolving that address against the mapped
+image before any WASM is emitted. `translate` takes `addresses` (from `image.addressSpaceOf`) and, for RIP-relative
+operands, the virtual address of the first byte it was given: a `[rip + disp32]` operand is measured from that
+instruction's own end, exactly as the processor measures it. Both are resolved up front, in one pass, so a branch's
+recursion never re-derives an address.
+
+Loads and stores become real `i32.load`/`i64.load`/`i32.store`/`i64.store` with the resolved offset baked in, plus
+`i32.store8`/`i32.store16` for the narrower stores. A 32-bit load zero-extends and a 64-bit one does not, which is why
+`movl $-1, 0x400100 ; mov 0x400100, %rax` leaves `0xffffffff` and the same pair with `movq` leaves `-1`. The store width
+comes from the source operand's register, or, for an immediate, from the opcode the decoder recorded on the destination:
+guessing four bytes where one was meant would corrupt three neighbours and validate perfectly.
+
+The module *imports* its memory rather than declaring one. A module that owned its memory would have a buffer the loader
+never filled, so every address would read zero while looking legitimate; importing means the caller builds
+`WebAssembly.Memory`, copies the segments in, and the module addresses that same buffer. The import appears only when the
+body touches memory, so a function that reads nothing still needs nothing.
+
+Everything else is refused by name and offset: addressing through a base or index register (the address only exists once
+the code runs), a segment override such as `%fs:` (WASM has no segments, and reading `0x28` as a plain address would
+silently load the wrong memory), an address no segment maps, `syscall`, `setcc` and the flags it needs, `jo` and its
+relatives, a `ret` with a stack adjustment, a block that does not return, and code after `ret`. Refusing is the honest
+option while the rest of the machine does not exist: a translator that skipped an instruction would produce a module that
+runs and computes the wrong number.
 
 ## Checked against the processor, not against itself
 
@@ -153,6 +175,13 @@ Currently eight programs, and they agree: a countdown loop (5), a sum loop (10),
 comparisons at each width (3, 2 and 3). It skips rather than fails when binutils is absent, because a cold checkout must
 run with no toolchain.
 
+`tests/memory-agreement.test.ts` does the same for memory, and does it end to end: `tools/native/memory/memory.s` is
+assembled and linked at whatever addresses the linker picks, the resulting *executable's* program headers are read into a
+`MemoryImage`, its `PT_LOAD` segments are copied into a fresh `WebAssembly.Memory`, the bytes the symbol table gives for
+`target` are translated with that image as its address space, and both versions run. They agree (42), and the store is
+then read out of the caller's buffer at the offset the image maps for `slot`. The linked binary's own headers choose every
+address there, so no part of that test hardcodes one.
+
 ## Roadmap
 
 1. **ELF loading** (done): ELF64 headers, `PT_LOAD` segments mapped into a WASM `MemoryImage`, `RELA` relocations, and
@@ -160,9 +189,9 @@ run with no toolchain.
 2. **Decoder** (done for the hello-world subset): ModRM, SIB, REX, RIP-relative addressing, and named refusals. SSE,
    `x87`, the string instructions and 16-bit operands are outside it, and an `objdump`-driven fixture keeps the boundaries
    honest.
-3. **Translator** (in progress): arithmetic, flags as comparisons, forward branches and loops to structured WASM, registers
-   in locals, results checked by running the module and, where the toolchain allows, by the processor. Memory against the
-   mapped image next.
+3. **Translator** (in progress): arithmetic, flags as comparisons, forward branches, loops and memory against the mapped
+   image, registers in locals, results checked by running the module and, where the toolchain allows, by the processor.
+   Register-relative addressing and the stack next.
 4. **Syscall layer**: `write`, `exit_group`, `brk`, `mmap`, then the file syscalls, each behind a capability check.
 5. **Evidence**: the same binary run under real Linux and under the translator, stdout and exit code compared.
 

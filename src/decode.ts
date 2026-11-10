@@ -67,6 +67,21 @@ export type Operand =
       /** True for `[rip + disp32]`, whose address depends on the instruction's own length. */
       readonly ripRelative: boolean;
       /**
+       * The access width the encoding settled on, when the operand itself cannot carry one.
+       *
+       * A register names its own width and an immediate does not, so `mov $1, 0x404000` has no operand that says whether
+       * it writes one byte, four or eight: the opcode said it, and this is where it is kept. A store whose width was lost
+       * would write the wrong number of bytes into its neighbours.
+       */
+      readonly bits?: 8 | 16 | 32 | 64;
+      /**
+       * The WASM offset this operand was resolved to, filled in by the translator rather than by the decoder.
+       *
+       * The decoder deals in virtual addresses and knows nothing about a mapped image; resolution happens once, up front,
+       * so the translation itself never has to re-derive an address at each recursion into a branch.
+       */
+      readonly wasmOffset?: number;
+      /**
        * The segment prefix, when there is one.
        *
        * `fs` is the one that matters in practice: `mov %fs:0x28, %rax` is the stack canary's read, and a translator that
@@ -265,6 +280,7 @@ function decodeModRm(
 
   const memory: Operand = {
     kind: "memory",
+    bits,
     ...(base === undefined ? {} : { base }),
     ...(index === undefined ? {} : { index }),
     scale,
@@ -461,6 +477,13 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
     const modrm = decodeModRm(cursor, rex, bits, segment);
     const register = registerOperand(modrm.regField, rex.r, bits);
     return opcode === 0x01 ? finish("add", [modrm.rm, register]) : finish("sub", [modrm.rm, register]);
+  }
+  if (opcode === 0xc6) {
+    const modrm = decodeModRm(cursor, rex, 8, segment);
+    if (modrm.regField !== 0) {
+      throw new DecodeError(offset, "0xc6 with a /reg field other than 0 is not a mov and is not in the decoded subset");
+    }
+    return finish("mov", [modrm.rm, { kind: "immediate", value: readImmediate(cursor, 1) }]);
   }
   if (opcode === 0xc7) {
     const modrm = decodeModRm(cursor, rex, bits, segment);

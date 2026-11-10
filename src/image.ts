@@ -233,3 +233,28 @@ export function toWasmAddress(image: MemoryImage, virtualAddress: bigint): numbe
       `mapped ranges are ${image.segments.map((s) => `${hex(s.virtualAddress)}..${hex(s.virtualAddress + s.memorySize)}`).join(", ")}`,
   );
 }
+
+/**
+ * The image as an address space a translator can ask questions of.
+ *
+ * `toWasmAddress` throws, which is right for a loader and wrong for a translator: the translator is deciding whether an
+ * operand is translatable, so it needs the answer as a value. The refusal is not lost, it moves to the caller that has
+ * the instruction's offset and can name it.
+ */
+export interface AddressSpace {
+  /** WASM byte offset of this virtual address, or undefined when no segment maps it. */
+  offsetOf(virtualAddress: bigint): number | undefined;
+}
+
+export function addressSpaceOf(image: MemoryImage): AddressSpace {
+  return {
+    offsetOf(virtualAddress: bigint): number | undefined {
+      for (const segment of image.segments) {
+        if (virtualAddress >= segment.virtualAddress && virtualAddress < segment.virtualAddress + segment.memorySize) {
+          return segment.wasmAddress + Number(virtualAddress - segment.virtualAddress);
+        }
+      }
+      return undefined;
+    },
+  };
+}

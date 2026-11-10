@@ -18,7 +18,8 @@
  */
 
 import { decode, type Instruction, type Operand } from "./decode.js";
-import { I64, OP, i32Const, i64Const, localGet, localSet, module, unsigned } from "./emit.js";
+import { I64, OP, i32Const, i64Const, localGet, localSet, memarg, module, unsigned } from "./emit.js";
+import type { AddressSpace } from "./image.js";
 
 /** The register file, in the order the encoding numbers it. Index is the WASM local. */
 const REGISTERS = [
@@ -30,6 +31,22 @@ const REGISTERS = [
 const CMP_A = REGISTERS.length;
 const CMP_B = REGISTERS.length + 1;
 const LOCAL_COUNT = REGISTERS.length + 2;
+
+/**
+ * What the translator needs to know about the world outside the bytes.
+ *
+ * A memory operand names a virtual address, and turning that into a WASM offset needs the mapped image. Passing it in is
+ * what keeps the translator a pure function of its input plus an explicit description of where the code will live, rather
+ * than something that guesses at a base address.
+ */
+export interface TranslateOptions {
+  /** The mapped image's address space. Without it, a memory operand is refused rather than assumed. */
+  readonly addresses?: AddressSpace;
+  /** Virtual address of the first byte of `instructions`, for RIP-relative operands. Defaults to 0. */
+  readonly codeAddress?: bigint;
+  /** Pages to import when the body touches memory. Defaults to the smallest memory that can hold one page. */
+  readonly memoryPages?: number;
+}
 
 export class TranslateError extends Error {
   readonly offset: number;
@@ -69,14 +86,117 @@ function write(operand: Operand, instruction: Instruction): number[] {
 const NARROW_32 = OP.i32WrapI64;
 const WIDEN_32 = OP.i64ExtendI32U;
 
+function hex(value: bigint): string {
+  return `0x${value.toString(16)}`;
+}
+
+/**
+ * The virtual address a memory operand addresses, or a refusal that says which part of it is the obstacle.
+ *
+ * Every refusal names what it refused. `[%rcx]` is not "unsupported": it is an address the translator cannot know, because
+ * it depends on a register the program will compute later, and saying so is what stops a reader looking for the missing
+ * case in the wrong place.
+ */
+function virtualAddressOf(operand: Operand, instruction: Instruction, options: TranslateOptions): bigint {
+  if (operand.kind !== "memory") {
+    throw new TranslateError(instruction.offset, `expected a memory operand, found ${operand.kind}`);
+  }
+  if (operand.segment !== undefined) {
+    throw new TranslateError(
+      instruction.offset,
+      `a %${operand.segment}: operand needs a segment base, and WASM has no segments: refusing rather than reading the ` +
+        `offset as a plain address`,
+    );
+  }
+  if (operand.base !== undefined || operand.index !== undefined) {
+    const named = [operand.base, operand.index].filter((register) => register !== undefined).join(", ");
+    throw new TranslateError(
+      instruction.offset,
+      `addressing through ${named} is not translated yet: the address is computed at run time, and this translator only ` +
+        `resolves addresses it can know now`,
+    );
+  }
+  // RIP-relative is measured from the end of this instruction, which is what the processor adds the displacement to
+  if (operand.ripRelative) {
+    return (options.codeAddress ?? 0n) + BigInt(instruction.offset + instruction.length) + operand.displacement;
+  }
+  return operand.displacement;
+}
+
+/**
+ * Resolve every memory operand up front, so the translation never re-derives an address.
+ *
+ * Doing this in one pass rather than inside each opcode's translation has a second effect worth stating: an operand that
+ * cannot be resolved is refused whether or not the instruction around it is one this translator happens to support, so a
+ * caller reading errors gets the more fundamental complaint first.
+ */
+function resolveAddresses(
+  instructions: readonly Instruction[],
+  options: TranslateOptions,
+): readonly Instruction[] {
+  return instructions.map((instruction) => {
+    if (!instruction.operands.some((operand) => operand.kind === "memory")) return instruction;
+    const addresses = options.addresses;
+    return {
+      ...instruction,
+      operands: instruction.operands.map((operand) => {
+        if (operand.kind !== "memory") return operand;
+        const virtual = virtualAddressOf(operand, instruction, options);
+        if (addresses === undefined) {
+          throw new TranslateError(
+            instruction.offset,
+            `address ${hex(virtual)} needs the mapped image: pass addresses from image.addressSpaceOf()`,
+          );
+        }
+        const offset = addresses.offsetOf(virtual);
+        if (offset === undefined) {
+          throw new TranslateError(
+            instruction.offset,
+            `address ${hex(virtual)} is not mapped by any segment, so there is no byte to access`,
+          );
+        }
+        return { ...operand, wasmOffset: offset };
+      }),
+    };
+  });
+}
+
+/** The resolved offset of a memory operand, which `resolveAddresses` has already established. */
+function wasmOffsetOf(operand: Operand, instruction: Instruction): number {
+  if (operand.kind !== "memory" || operand.wasmOffset === undefined) {
+    throw new TranslateError(
+      instruction.offset,
+      "a memory operand reached the translation without a resolved address, which is a bug in this translator",
+    );
+  }
+  return operand.wasmOffset;
+}
+
+/** A load at the operand's width, as an i64, because every register is an i64 local. */
+function loadFromMemory(operand: Operand, width: 32 | 64, instruction: Instruction): number[] {
+  const offset = wasmOffsetOf(operand, instruction);
+  if (width === 64) return [...i32Const(offset), OP.i64Load, ...memarg(0)];
+  // a 32-bit load zeroes the upper half of the destination, which is x86's own rule for `movl`
+  return [...i32Const(offset), OP.i32Load, ...memarg(0), WIDEN_32];
+}
+
+/** A store: the address goes on the stack first, the value on top, which is the order `store` pops them in. */
+function storeToMemory(operand: Operand, value: readonly number[], width: 8 | 16 | 32 | 64, instruction: Instruction): number[] {
+  const offset = wasmOffsetOf(operand, instruction);
+  const code = { 8: OP.i32Store8, 16: OP.i32Store16, 32: OP.i32Store, 64: OP.i64Store }[width];
+  return [...i32Const(offset), ...value, code, ...memarg(0)];
+}
+
 function translateMov(instruction: Instruction): number[] {
   const [destination, source] = instruction.operands;
   if (destination === undefined || source === undefined) {
     throw new TranslateError(instruction.offset, "mov needs two operands");
   }
+  if (destination.kind === "memory") {
+    return translateMovToMemory(destination, source, instruction);
+  }
   if (destination.kind !== "reg") {
-    // a store into memory is a later increment; refusing it is what keeps this one honest
-    throw new TranslateError(instruction.offset, "a mov into memory is not translated yet");
+    throw new TranslateError(instruction.offset, `a mov into a ${destination.kind} is not translated`);
   }
   const width = destination.bits;
   if (width !== 32 && width !== 64) {
@@ -88,11 +208,60 @@ function translateMov(instruction: Instruction): number[] {
     return [...i64Const(value), ...write(destination, instruction)];
   }
   if (source.kind === "memory") {
-    throw new TranslateError(instruction.offset, "a mov from memory is not translated yet");
+    // the load already yields the destination's width, so no narrowing of a register is involved
+    return [...loadFromMemory(source, width, instruction), ...write(destination, instruction)];
   }
   const code = read(source, instruction);
   if (width === 32) return [...code, NARROW_32, WIDEN_32, ...write(destination, instruction)];
   return [...code, ...write(destination, instruction)];
+}
+
+/**
+ * A `mov` into memory.
+ *
+ * The width comes from the source rather than the destination, because the destination does not carry one: `movb $1,
+ * 0x404000` and `movq $1, 0x404000` differ only in the opcode and register, and the decoder has already resolved that into
+ * the source operand's width. A store whose width the decoder could not pin down is refused rather than guessed at, since
+ * writing four bytes where one was meant corrupts two neighbours silently.
+ */
+function translateMovToMemory(destination: Operand, source: Operand, instruction: Instruction): number[] {
+  if (source.kind === "memory") {
+    throw new TranslateError(instruction.offset, "a mov between two memory operands is not an x86 instruction");
+  }
+  const width = source.kind === "reg" ? source.bits : memoryStoreWidth(instruction);
+  if (width !== 8 && width !== 16 && width !== 32 && width !== 64) {
+    throw new TranslateError(instruction.offset, `a ${width}-bit store is not translated yet`);
+  }
+  if (source.kind === "immediate") {
+    const value = width === 64 ? source.value : BigInt.asUintN(width, source.value);
+    const code = width === 64 ? i64Const(value) : i32Const(Number(value));
+    return storeToMemory(destination, code, width, instruction);
+  }
+  const value = source.kind === "reg" ? read(source, instruction) : [];
+  if (width === 32 || width === 8 || width === 16) {
+    // a store reads the low bits of the register, so narrowing is a wrap rather than a reinterpretation
+    return storeToMemory(destination, [...value, NARROW_32], width, instruction);
+  }
+  return storeToMemory(destination, value, width, instruction);
+}
+
+/**
+ * The width of a store whose source is an immediate.
+ *
+ * x86 encodes `movb`/`movw`/`movl`/`movq` into memory as separate opcodes, so the width belongs to the instruction rather
+ * than to any operand: the decoder keeps it on the destination for exactly this reason. Without it the width is unknown,
+ * and guessing four bytes where one was meant would corrupt three neighbours while validating perfectly.
+ */
+function memoryStoreWidth(instruction: Instruction): 8 | 16 | 32 | 64 {
+  const destination = instruction.operands[0];
+  const bits = destination?.kind === "memory" ? destination.bits : undefined;
+  if (bits === undefined) {
+    throw new TranslateError(
+      instruction.offset,
+      "a store of an immediate whose width the encoding did not determine is not translated",
+    );
+  }
+  return bits;
 }
 
 /** The arithmetic, at both widths: a 32-bit operation happens in i32 and widens back, so it wraps at 32 bits. */
@@ -119,7 +288,10 @@ function operandCode(operand: Operand, width: 32 | 64, instruction: Instruction)
     return width === 32 ? i32Const(Number(BigInt.asIntN(32, operand.value))) : i64Const(operand.value);
   }
   if (operand.kind === "memory") {
-    throw new TranslateError(instruction.offset, `a ${instruction.op} from memory is not translated yet`);
+    // the load is already the operation's width, so there is nothing to narrow
+    const offset = wasmOffsetOf(operand, instruction);
+    if (width === 64) return [...i32Const(offset), OP.i64Load, ...memarg(0)];
+    return [...i32Const(offset), OP.i32Load, ...memarg(0)];
   }
   const code = read(operand, instruction);
   return width === 32 ? [...code, NARROW_32] : code;
@@ -135,7 +307,9 @@ function operandCode(operand: Operand, width: 32 | 64, instruction: Instruction)
 function operandCode64(operand: Operand, instruction: Instruction): number[] {
   if (operand.kind === "immediate") return i64Const(operand.value);
   if (operand.kind === "memory") {
-    throw new TranslateError(instruction.offset, `a ${instruction.op} from memory is not translated yet`);
+    // the comparison's own width decides, and a memory operand carries it: a byte of memory is not a 64-bit value
+    const width = operand.bits === 32 ? 32 : 64;
+    return loadFromMemory(operand, width, instruction);
   }
   return read(operand, instruction);
 }
@@ -512,10 +686,15 @@ function translateRange(
  * claims. Loops, jumps out of the branch they belong to, and anything the instruction set covers but the translator does
  * not are refused by name and offset.
  */
-export function translate(instructions: readonly Instruction[], name = "main"): Uint8Array {
+export function translate(
+  instructions: readonly Instruction[],
+  name = "main",
+  options: TranslateOptions = {},
+): Uint8Array {
   if (instructions.length === 0) {
     throw new TranslateError(0, "there is nothing to translate");
   }
+  instructions = resolveAddresses(instructions, options);
   const body: number[] = [];
   const flags: Flags = { set: false, width: 64 };
   const loops = findLoops(instructions);
@@ -526,10 +705,20 @@ export function translate(instructions: readonly Instruction[], name = "main"): 
       "the block does not end in ret, so it has no value to return",
     );
   }
-  return module({ name, locals: LOCAL_COUNT, body, result: I64 });
+  const touchesMemory = instructions.some((instruction) =>
+    instruction.operands.some((operand) => operand.kind === "memory"),
+  );
+  return module({
+    name,
+    locals: LOCAL_COUNT,
+    body,
+    result: I64,
+    // the import appears only when something addresses memory, so a module that reads nothing still needs nothing
+    ...(touchesMemory ? { memory: { minimumPages: options.memoryPages ?? 1 } } : {}),
+  });
 }
 
 /** Bytes to a module, which is the path every test uses: decode, translate, run. */
-export function translateBytes(bytes: Uint8Array, name = "main"): Uint8Array {
-  return translate(decode(bytes), name);
+export function translateBytes(bytes: Uint8Array, name = "main", options: TranslateOptions = {}): Uint8Array {
+  return translate(decode(bytes), name, options);
 }

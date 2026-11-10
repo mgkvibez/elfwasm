@@ -113,9 +113,10 @@ describe("refusals", () => {
     expect(refuse(hex("b8 01 00 00 00 83 f8 01 74 00 74 00 c3")).message).toContain("needs a cmp or test");
   });
 
-  it("refuses memory, which needs a linear memory and an address space before it can be right", () => {
-    expect(refuse(hex("48 8b 07 c3")).message).toContain("from memory is not translated yet");
-    expect(refuse(hex("48 89 07 c3")).message).toContain("into memory is not translated yet");
+  it("refuses addressing through a register, which it cannot resolve before the code runs", () => {
+    // memory itself is translated now; what is refused is an address that only exists at run time
+    expect(refuse(hex("48 8b 07 c3")).message).toContain("addressing through rdi is not translated yet");
+    expect(refuse(hex("48 89 07 c3")).message).toContain("addressing through rdi is not translated yet");
   });
 
   it("refuses a syscall, which belongs to the layer after this one", () => {
