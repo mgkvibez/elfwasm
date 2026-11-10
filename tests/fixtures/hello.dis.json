@@ -1,0 +1,132 @@
+[
+  {
+    "offset": 0,
+    "mnemonic": "mov",
+    "length": 7
+  },
+  {
+    "offset": 7,
+    "mnemonic": "mov",
+    "length": 7
+  },
+  {
+    "offset": 14,
+    "mnemonic": "lea",
+    "length": 7
+  },
+  {
+    "offset": 21,
+    "mnemonic": "mov",
+    "length": 7
+  },
+  {
+    "offset": 28,
+    "mnemonic": "syscall",
+    "length": 2
+  },
+  {
+    "offset": 30,
+    "mnemonic": "xor",
+    "length": 2
+  },
+  {
+    "offset": 32,
+    "mnemonic": "push",
+    "length": 1
+  },
+  {
+    "offset": 33,
+    "mnemonic": "mov",
+    "length": 3
+  },
+  {
+    "offset": 36,
+    "mnemonic": "sub",
+    "length": 4
+  },
+  {
+    "offset": 40,
+    "mnemonic": "movq",
+    "length": 8
+  },
+  {
+    "offset": 48,
+    "mnemonic": "mov",
+    "length": 5
+  },
+  {
+    "offset": 53,
+    "mnemonic": "mov",
+    "length": 3
+  },
+  {
+    "offset": 56,
+    "mnemonic": "mov",
+    "length": 5
+  },
+  {
+    "offset": 61,
+    "mnemonic": "add",
+    "length": 4
+  },
+  {
+    "offset": 65,
+    "mnemonic": "add",
+    "length": 7
+  },
+  {
+    "offset": 72,
+    "mnemonic": "sub",
+    "length": 4
+  },
+  {
+    "offset": 76,
+    "mnemonic": "cmp",
+    "length": 4
+  },
+  {
+    "offset": 80,
+    "mnemonic": "jne",
+    "length": 2
+  },
+  {
+    "offset": 82,
+    "mnemonic": "call",
+    "length": 5
+  },
+  {
+    "offset": 87,
+    "mnemonic": "je",
+    "length": 2
+  },
+  {
+    "offset": 89,
+    "mnemonic": "jmp",
+    "length": 2
+  },
+  {
+    "offset": 91,
+    "mnemonic": "nop",
+    "length": 1
+  },
+  {
+    "offset": 92,
+    "mnemonic": "pop",
+    "length": 1
+  },
+  {
+    "offset": 93,
+    "mnemonic": "ret",
+    "length": 1
+  },
+  {
+    "offset": 94,
+    "mnemonic": "add",
+    "length": 4
+  },
+  {
+    "offset": 98,
+    "mnemonic": "ret",
+    "length": 1
+  }
+]
