@@ -31,8 +31,9 @@ makes it the missing piece between a shimmed runtime and running real `esbuild`,
 
 **Stage 1 done, Stage 2 done for the integer subset, Stage 3 started.** The ELF64 header, program-header tables, section headers, symbol tables and `RELA`
 relocations parse, the `PT_LOAD` segments are placed into a WASM linear memory, and the x86-64 decoder covers the subset a
-statically linked musl `hello world` uses. Code with branches now executes: x86-64 bytes are decoded and translated into a structured WASM module that Node runs, and
-the value it returns is compared against the number the same bytes compute natively. There is no syscall layer yet.
+statically linked musl `hello world` uses. Code with loops executes: x86-64 bytes are decoded and translated into a structured WASM module that Node runs, and the
+number it returns is compared against the number the same bytes compute. Where binutils is installed that comparison is
+against the processor itself, not against a hand-written expectation. There is no syscall layer yet.
 
 Refusals are named, not generic, and that is the point: a 32-bit, big-endian, stripped, or 16-byte-symbol-entry object is
 rejected with a reason, because a parser that guesses an offset produces confident nonsense downstream.
@@ -57,7 +58,7 @@ section's `sh_size`), SSE and `x87`, translation to WASM, and any syscall. Two h
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 90
+**Tests:** 99
 
 ```bash
 npm ci && npm run verify
@@ -108,8 +109,8 @@ send a reader to different places in the architecture.
 
 `translate` takes the decoder's instructions and emits one WASM function: no parameters, one `i64` result, sixteen `i64`
 locals for the sixteen registers in encoding order. The subset is `mov`, `add`, `sub`, `xor`, `and`, `or`, `imul` at 32
-and 64 bits, `cmp` and `test`, the ten conditional branches that need only zf, sf, cf and of, a forward `jmp`, and `ret`,
-which returns `rax`.
+and 64 bits, `cmp` and `test`, the ten conditional branches that need only zf, sf, cf and of, `jmp` in both directions,
+loops, and `ret`, which returns `rax`.
 
 Flags are never materialised as variables. `cmp` and `test` leave their operands in two extra locals and a `jcc` becomes
 the comparison itself, at the width the operands were: that is why `cmp $-1, %eax ; jl` and `cmp $-1, %rax ; jl` behave
@@ -118,9 +119,17 @@ which is what the architecture defines it to be. `jo`, `jno`, `jp` and `jnp` are
 not computed and a branch on an uncomputed flag is a wrong answer.
 
 Branches become structure. WASM has no jump, so a forward conditional branch is an `if` around the bytes it skips with the
-condition negated, and a branch to the end of a region it sits in is `br_if` at the depth that reaches it. The cost is
-generality, and it is refused rather than fudged: a backward branch is a loop, and a jump into the middle of another
-branch is irreducible control flow, so neither can be expressed by nesting.
+condition negated, a branch to the end of a region it sits in is `br_if` at the depth that reaches it, and a backward
+branch is a `loop` with `br_if 0` re-entering it. A loop that contains a branch to the instruction just after it is
+wrapped in a `block`, and that branch becomes `br_if 1`: out of the loop, out of the block, and on.
+
+The compiler's if/else is recognised as one shape rather than translated branch by branch, and the reason is what a branch
+can reach: a conditional jump is an `if` around the code it skips, but a `jmp` out of that code has to leave the whole
+construct, which plain nesting cannot express. Translating the pattern as a single `if`/`else` whose end is the join fixed
+the case the naive version got wrong, where the else arm ran after a then arm that had already jumped past it.
+
+The cost is generality, and it is refused rather than fudged: a jump into the middle of a branch, or a branch leaving a
+loop for somewhere that is not just past it, is irreducible control flow and cannot be expressed by nesting.
 
 Two decisions are load-bearing rather than incidental. A 32-bit operand names the 64-bit local and carries width 32, and
 a 32-bit write narrows and widens through `i32` so the upper half is zeroed: that is why `mov $-1, %eax` leaves `rax` at
@@ -129,8 +138,20 @@ from the bytes they contain, because a stale length is the one mistake in this f
 and misbehaves instead of one that fails to load.
 
 Everything else is refused by name and offset: memory either way, `syscall`, `setcc` and the flags it needs, `jo` and its
-relatives, loops, a `ret` with a stack adjustment, a block that does not return, and code after `ret`. Refusing is the honest option while the rest of the machine does not
+relatives, a `ret` with a stack adjustment, a block that does not return, and code after `ret`. Refusing is the honest option while the rest of the machine does not
 exist: a translator that skipped an instruction would produce a module that runs and computes the wrong number.
+
+## Checked against the processor, not against itself
+
+`tests/native-agreement.test.ts` is the one check here that does not compare the translator with something this repository
+wrote. Each program in `tools/native/` is assembled by binutils, the exact bytes `objcopy` extracts are decoded and
+translated, and both versions are run: natively through a four-instruction `_start` that exits with the function's own
+result, and as a WASM module. The numbers must agree.
+
+Currently eight programs, and they agree: a countdown loop (5), a sum loop (10), one that leaves from the middle of a loop
+(10), nested loops (6), the if/else shape (10), and three that turn on the difference between signed and unsigned
+comparisons at each width (3, 2 and 3). It skips rather than fails when binutils is absent, because a cold checkout must
+run with no toolchain.
 
 ## Roadmap
 
@@ -139,8 +160,9 @@ exist: a translator that skipped an instruction would produce a module that runs
 2. **Decoder** (done for the hello-world subset): ModRM, SIB, REX, RIP-relative addressing, and named refusals. SSE,
    `x87`, the string instructions and 16-bit operands are outside it, and an `objdump`-driven fixture keeps the boundaries
    honest.
-3. **Translator** (in progress): straight-line arithmetic, flags as comparisons and forward branches to structured WASM,
-   registers in locals, results checked by running the module. Loops, then memory against the mapped image.
+3. **Translator** (in progress): arithmetic, flags as comparisons, forward branches and loops to structured WASM, registers
+   in locals, results checked by running the module and, where the toolchain allows, by the processor. Memory against the
+   mapped image next.
 4. **Syscall layer**: `write`, `exit_group`, `brk`, `mmap`, then the file syscalls, each behind a capability check.
 5. **Evidence**: the same binary run under real Linux and under the translator, stdout and exit code compared.
 

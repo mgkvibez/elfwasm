@@ -118,7 +118,10 @@ export const OP = {
   // control flow, which is what a branch translates into rather than into jumps
   i32Eqz: 0x45,
   ifEmpty: 0x04,
+  elseOp: 0x05,
   emptyBlockType: 0x40,
+  block: 0x02,
+  loop: 0x03,
   br: 0x0c,
   brIf: 0x0d,
   returnOp: 0x0f,

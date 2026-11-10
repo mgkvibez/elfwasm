@@ -104,11 +104,6 @@ describe("refusals", () => {
     expect(refuse(hex("48 c7 c0 01 00 00 00 75 00 c3")).message).toContain("needs a cmp or test");
   });
 
-  it("refuses a backward branch by name, because loops are the other half of control flow", () => {
-    // mov $1,%eax ; cmp $1,%eax ; jne -10 : the branch points back to the first instruction, which is a loop
-    expect(refuse(hex("b8 01 00 00 00 83 f8 01 75 f6 c3")).message).toContain("backward jne needs a loop");
-  });
-
   it("refuses the two flags it does not compute, overflow and parity", () => {
     expect(refuse(hex("48 85 c0 70 00 c3")).message).toContain("overflow or parity");
   });

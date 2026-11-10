@@ -107,6 +107,13 @@ const BINARY = {
 
 type BinaryOp = keyof typeof BINARY;
 
+/**
+ * An operand at the width the operation happens at, ready to sit next to the destination on the stack.
+ *
+ * A 32-bit register source must be narrowed as well as the destination. Narrowing only the destination is the bug this
+ * comment exists for: the destination arrives as i32 and the source as i64, and the module fails to validate, which is
+ * loud. The quiet version of the same mistake is a sign-extended source, which computes the wrong answer and validates.
+ */
 function operandCode(operand: Operand, width: 32 | 64, instruction: Instruction): number[] {
   if (operand.kind === "immediate") {
     return width === 32 ? i32Const(Number(BigInt.asIntN(32, operand.value))) : i64Const(operand.value);
@@ -114,7 +121,8 @@ function operandCode(operand: Operand, width: 32 | 64, instruction: Instruction)
   if (operand.kind === "memory") {
     throw new TranslateError(instruction.offset, `a ${instruction.op} from memory is not translated yet`);
   }
-  return read(operand, instruction);
+  const code = read(operand, instruction);
+  return width === 32 ? [...code, NARROW_32] : code;
 }
 
 /**
@@ -269,6 +277,81 @@ function branchTarget(instruction: Instruction): number {
 }
 
 /**
+ * The join of the if/else a compiler emits: `jcc else`, the then-arm, `jmp join`, the else-arm, `join:`.
+ *
+ * It is worth recognising as a shape rather than translating branch by branch, because the two forms differ in what a
+ * branch can reach. A conditional jump is an `if` around the code it skips, and the code under it falls through. But a
+ * `jmp` out of that code has to leave the whole construct, which plain nesting cannot express unless the construct is
+ * an `if`/`else` with the join as its end. Translating the pattern as one if/else is both simpler and correct, where
+ * the naive nesting silently ran the else arm after a then arm that had already jumped past it.
+ */
+function findJoin(
+  instructions: readonly Instruction[],
+  from: number,
+  limit: number,
+  target: number,
+  regionEnd: number,
+): { jmp: number; join: number } | undefined {
+  for (let index = from; index < limit; index += 1) {
+    const instruction = instructions[index]!;
+    if (instruction.op !== "jmp") continue;
+    const join = indexOfOffset(instructions, branchTarget(instruction));
+    // the jmp has to leave the arm it ends, and land inside the region being translated
+    if (join > index && join >= target && join <= regionEnd) return { jmp: index, join };
+  }
+  return undefined;
+}
+
+/** Loop heads, from the branch that closes each one: the last backward branch to a head is where that loop ends. */
+type LoopHeads = Map<number, number>;
+
+function findLoops(instructions: readonly Instruction[]): LoopHeads {
+  const heads: LoopHeads = new Map();
+  for (let index = 0; index < instructions.length; index += 1) {
+    const instruction = instructions[index]!;
+    if (!instruction.op.startsWith("j")) continue;
+    const target = branchTarget(instruction);
+    const targetIndex = instructions.findIndex((entry) => entry.offset === target);
+    if (targetIndex < 0 || targetIndex >= index) continue;
+    const known = heads.get(targetIndex);
+    if (known === undefined || known < index) heads.set(targetIndex, index);
+  }
+  return heads;
+}
+
+/**
+ * A loop, from its head to the branch that closes it.
+ *
+ * WASM has no jump back either, so a loop is a `loop` and the backward branch is `br_if 0`, re-entering it. Leaving from
+ * inside needs somewhere to go, so a loop that contains a branch to the instruction after it is wrapped in a `block`, and
+ * that branch is `br_if 1`: out of the loop, out of the block, and on. A loop with no such branch needs no block, and
+ * gets none, because an unused one is a nesting level that means nothing.
+ */
+function translateLoop(
+  instructions: readonly Instruction[],
+  head: number,
+  bodyEnd: number,
+  scope: Scope,
+  out: number[],
+  loops: LoopHeads,
+): number {
+  const exit = bodyEnd + 1;
+  const exitOffset = instructions[exit]?.offset;
+  const leaves = instructions
+    .slice(head, bodyEnd + 1)
+    .some((instruction) => instruction.op.startsWith("j") && exitOffset !== undefined && branchTarget(instruction) === exitOffset);
+  if (leaves) out.push(OP.block, OP.emptyBlockType);
+  out.push(OP.loop, OP.emptyBlockType);
+  const nested: Scope = new Map([...scope].map(([key, value]) => [key, value + (leaves ? 2 : 1)] as const));
+  nested.set(head, 0);
+  if (leaves) nested.set(exit, 1);
+  translateRange(instructions, head, bodyEnd + 1, nested, out, { set: false, width: 64 }, loops, true);
+  out.push(OP.end);
+  if (leaves) out.push(OP.end);
+  return exit;
+}
+
+/**
  * Translates `[from, to)` into `out`, returning where it stopped.
  *
  * Branches become structure rather than jumps, because WASM has no jump: a forward conditional branch is an `if` around
@@ -283,10 +366,20 @@ function translateRange(
   scope: Scope,
   out: number[],
   flags: Flags,
+  loops: LoopHeads,
+  /** True when the caller has already opened this loop, so the head must not be opened a second time. */
+  insideLoop = false,
 ): number {
   let index = from;
   while (index < to) {
     const instruction = instructions[index]!;
+    const loopEnd = insideLoop ? undefined : loops.get(index);
+    insideLoop = false;
+    if (loopEnd !== undefined && loopEnd >= index && loopEnd < to) {
+      index = translateLoop(instructions, index, loopEnd, scope, out, loops);
+      flags.set = false;
+      continue;
+    }
     if (instruction.op === "nop" || instruction.op === "endbr64") {
       index += 1;
       continue;
@@ -305,9 +398,6 @@ function translateRange(
     }
     if (instruction.op === "jmp") {
       const target = indexOfOffset(instructions, branchTarget(instruction));
-      if (target <= index) {
-        throw new TranslateError(instruction.offset, "a backward jmp needs a loop, which this does not translate yet");
-      }
       const exit = scope.get(target);
       if (exit !== undefined) {
         // an unconditional exit from the region: `br` rather than `br_if`, since the jump is not conditional on anything
@@ -315,10 +405,16 @@ function translateRange(
         // nothing after an unconditional exit is reachable inside this region, so the region ends here
         return to;
       }
+      if (target <= index) {
+        throw new TranslateError(
+          instruction.offset,
+          "a backward jmp needs a loop, and this one does not begin where a loop is opened",
+        );
+      }
       // the bytes it skips are unreachable, and are emitted behind an always-false branch so that the module stays
       // structured and a jmp past code this cannot translate is refused rather than quietly skipped
       out.push(...i32Const(0), OP.ifEmpty, OP.emptyBlockType);
-      translateRange(instructions, index + 1, target, new Map(scope), out, { set: false, width: 64 });
+      translateRange(instructions, index + 1, target, new Map(scope), out, { set: false, width: 64 }, loops);
       out.push(OP.end);
       flags.set = false;
       index = target;
@@ -336,12 +432,6 @@ function translateRange(
         throw new TranslateError(instruction.offset, `${instruction.op} needs a cmp or test before it in the same block`);
       }
       const target = indexOfOffset(instructions, branchTarget(instruction));
-      if (target <= index) {
-        throw new TranslateError(
-          instruction.offset,
-          `a backward ${instruction.op} needs a loop, which this does not translate yet`,
-        );
-      }
       const condition = conditionCode(suffix, flags.width);
       const depth = scope.get(target);
       if (depth !== undefined) {
@@ -356,11 +446,35 @@ function translateRange(
         index += 1;
         continue;
       }
+      if (target <= index) {
+        throw new TranslateError(
+          instruction.offset,
+          `a backward ${instruction.op} needs a loop, and this one does not begin where a loop is opened`,
+        );
+      }
+      const join = findJoin(instructions, index + 1, target, target, to);
+      if (join !== undefined) {
+        /*
+         * The if/else shape. When the condition holds, control goes to the target, so the target's arm comes first in
+         * the `if`; when it does not hold, the fall-through arm is the `else`. Both arms end at the join, which is the
+         * `if`'s own end, so the jmp that ended the then-arm has nothing left to do.
+         */
+        const shared: Scope = new Map([...scope].map(([key, value]) => [key, value + 1] as const));
+        shared.set(join.join, 0);
+        out.push(...condition, OP.ifEmpty, OP.emptyBlockType);
+        translateRange(instructions, target, join.join, new Map(shared), out, { set: false, width: 64 }, loops);
+        out.push(OP.elseOp);
+        translateRange(instructions, index + 1, join.jmp, new Map(shared), out, { set: false, width: 64 }, loops);
+        out.push(OP.end);
+        flags.set = false;
+        index = join.join;
+        continue;
+      }
       // a jump forward inside this region: an `if` around the bytes it skips, with the condition negated
       out.push(...condition, OP.i32Eqz, OP.ifEmpty, OP.emptyBlockType);
       const nested: Scope = new Map([...scope].map(([key, value]) => [key, value + 1] as const));
       nested.set(target, 0);
-      translateRange(instructions, index + 1, target, nested, out, { set: flags.set, width: flags.width });
+      translateRange(instructions, index + 1, target, nested, out, { set: flags.set, width: flags.width }, loops);
       out.push(OP.end);
       // after the join, a comparison made on one side is not known to have happened on the other, so the flags are
       // dropped rather than assumed
@@ -404,7 +518,8 @@ export function translate(instructions: readonly Instruction[], name = "main"): 
   }
   const body: number[] = [];
   const flags: Flags = { set: false, width: 64 };
-  translateRange(instructions, 0, instructions.length, new Map(), body, flags);
+  const loops = findLoops(instructions);
+  translateRange(instructions, 0, instructions.length, new Map(), body, flags, loops);
   if (!instructions.some((instruction) => instruction.op === "ret")) {
     throw new TranslateError(
       instructions.at(-1)?.offset ?? 0,
