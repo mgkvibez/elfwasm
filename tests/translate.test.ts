@@ -100,8 +100,22 @@ describe("refusals", () => {
     throw new Error("expected the translator to refuse these bytes");
   };
 
-  it("refuses a branch by name, because a block it cannot follow is a wrong answer waiting to happen", () => {
-    expect(refuse(hex("48 c7 c0 01 00 00 00 75 00 c3")).message).toContain("jne is not translated yet");
+  it("refuses a branch with no comparison before it, rather than deciding what the flags were", () => {
+    expect(refuse(hex("48 c7 c0 01 00 00 00 75 00 c3")).message).toContain("needs a cmp or test");
+  });
+
+  it("refuses a backward branch by name, because loops are the other half of control flow", () => {
+    // mov $1,%eax ; cmp $1,%eax ; jne -10 : the branch points back to the first instruction, which is a loop
+    expect(refuse(hex("b8 01 00 00 00 83 f8 01 75 f6 c3")).message).toContain("backward jne needs a loop");
+  });
+
+  it("refuses the two flags it does not compute, overflow and parity", () => {
+    expect(refuse(hex("48 85 c0 70 00 c3")).message).toContain("overflow or parity");
+  });
+
+  it("drops the comparison after a join, so the next branch cannot rely on flags one path already changed", () => {
+    // mov $1,%eax ; cmp $1,%eax ; je +0 ; je +0 ; ret
+    expect(refuse(hex("b8 01 00 00 00 83 f8 01 74 00 74 00 c3")).message).toContain("needs a cmp or test");
   });
 
   it("refuses memory, which needs a linear memory and an address space before it can be right", () => {
@@ -133,5 +147,70 @@ describe("the translator and the decoder agree about a real listing", () => {
     const instructions = decode(bytes);
     expect(translate(instructions).length).toBeGreaterThan(0);
     expect([...translate(instructions)]).toEqual([...translateBytes(bytes)]);
+  });
+});
+
+describe("flags become comparisons, not flag variables", () => {
+  it("takes a conditional branch when the comparison holds, skipping the bytes under it", () => {
+    // mov $5,%rax ; cmp $5,%rax ; jne +7 ; mov $1,%rax ; ret
+    expect(run(hex("48 c7 c0 05 00 00 00 48 83 f8 05 75 07 48 c7 c0 01 00 00 00 c3"))).toBe(1n);
+  });
+
+  it("falls through the same bytes when it does not hold", () => {
+    // the identical program with 6 against 5, so the jne is taken and rax keeps 6
+    expect(run(hex("48 c7 c0 06 00 00 00 48 83 f8 05 75 07 48 c7 c0 01 00 00 00 c3"))).toBe(6n);
+  });
+
+  it("compares at 32 bits when the operands are 32-bit, so -1 is less than 1 after mov $-1, %eax", () => {
+    // mov $-1,%eax ; cmp $1,%eax ; jl +7 ; mov $2,%rax ; ret
+    expect(run(hex("b8 ff ff ff ff 83 f8 01 7c 07 48 c7 c0 02 00 00 00 c3"))).toBe(0xffffffffn);
+  });
+
+  it("compares at 64 bits when the operands are 64-bit, where -1 is also less than 1", () => {
+    // WebAssembly's i64 arrives in JS as a signed BigInt, so the all-ones result is -1 here
+    expect(run(hex("48 c7 c0 ff ff ff ff 48 83 f8 01 7c 07 48 c7 c0 02 00 00 00 c3"))).toBe(-1n);
+  });
+
+  it("reads jb as unsigned at 32 bits, where 0xffffffff is not below 1", () => {
+    // mov $-1,%eax ; cmp $1,%eax ; jb +7 ; mov $2,%rax ; ret  ->  the branch is not taken
+    expect(run(hex("b8 ff ff ff ff 83 f8 01 72 07 48 c7 c0 02 00 00 00 c3"))).toBe(2n);
+  });
+
+  it("reads js after test as the sign of the mask, which is the idiom a compiler emits for a negative int", () => {
+    // mov $-1,%eax ; test %eax,%eax ; js +7 ; mov $2,%rax ; ret
+    expect(run(hex("b8 ff ff ff ff 85 c0 78 07 48 c7 c0 02 00 00 00 c3"))).toBe(0xffffffffn);
+  });
+
+  it("reads jl after test as js, which is what test a,a defines it to be", () => {
+    // mov $-1,%eax ; test %eax,%eax ; jl +7 ; mov $2,%rax ; ret
+    expect(run(hex("b8 ff ff ff ff 85 c0 7c 07 48 c7 c0 02 00 00 00 c3"))).toBe(0xffffffffn);
+  });
+});
+
+describe("branches nest as structure", () => {
+  it("nests one conditional branch inside another and branches out of both", () => {
+    /*
+     * mov $1,%eax ; cmp $1,%eax ; jne end ; mov $2,%eax ; cmp $2,%eax ; je end ; mov $3,%eax ; end: ret
+     * the outer branch wraps the inner one, and the inner je leaves both: rax is 2
+     */
+    expect(run(hex("b8 01 00 00 00 83 f8 01 75 0f b8 02 00 00 00 83 f8 02 74 05 b8 03 00 00 00 c3"))).toBe(2n);
+  });
+
+  it("runs the code under the inner branch when its condition fails", () => {
+    // the same program with `cmp $3,%eax`, so the inner je is not taken and rax ends at 3
+    expect(run(hex("b8 01 00 00 00 83 f8 01 75 0f b8 02 00 00 00 83 f8 03 74 05 b8 03 00 00 00 c3"))).toBe(3n);
+  });
+
+  it("translates the if/else shape a compiler emits, where the then-branch ends in a forward jmp", () => {
+    /*
+     * mov $1,%eax ; cmp $1,%eax ; jne else ; mov $10,%eax ; jmp end ; else: mov $20,%eax ; end: ret
+     * the equal case takes the then-branch and jumps over the else
+     */
+    expect(run(hex("b8 01 00 00 00 83 f8 01 75 0c b8 0a 00 00 00 eb 05 b8 14 00 00 00 c3"))).toBe(10n);
+  });
+
+  it("takes the else arm when the condition fails", () => {
+    // the same program comparing against 2, so the jne jumps to the else arm at offset 17 and never returns
+    expect(run(hex("b8 01 00 00 00 83 f8 02 75 07 b8 0a 00 00 00 eb 05 b8 14 00 00 00 c3"))).toBe(20n);
   });
 });

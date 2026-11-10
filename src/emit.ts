@@ -113,14 +113,27 @@ export const OP = {
   i64And: 0x83,
   i64Or: 0x84,
   i64Shl: 0x86,
-  i64Eq: 0x51,
-  i64Ne: 0x52,
-  i64LtS: 0x53,
-  i64GtS: 0x55,
-  i64LeS: 0x57,
-  i64GeS: 0x59,
   i32WrapI64: 0xa7,
   i64ExtendI32U: 0xad,
+  // control flow, which is what a branch translates into rather than into jumps
+  i32Eqz: 0x45,
+  ifEmpty: 0x04,
+  emptyBlockType: 0x40,
+  br: 0x0c,
+  brIf: 0x0d,
+  returnOp: 0x0f,
+  end: 0x0b,
+  // comparisons, which are how the flags become a condition: the flags themselves are never materialised
+  i32Eq: 0x46, i32Ne: 0x47, i32LtS: 0x48, i32LtU: 0x49, i32GtS: 0x4a,
+  i32GtU: 0x4b, i32LeS: 0x4c, i32LeU: 0x4d, i32GeS: 0x4e, i32GeU: 0x4f,
+  i64Eq: 0x51, i64Ne: 0x52, i64LtS: 0x53, i64LtU: 0x54, i64GtS: 0x55,
+  i64GtU: 0x56, i64LeS: 0x57, i64LeU: 0x58, i64GeS: 0x59, i64GeU: 0x5a,
+  i32Add: 0x6a,
+  i32Sub: 0x6b,
+  i32Mul: 0x6c,
+  i32And: 0x71,
+  i32Or: 0x72,
+  i32Xor: 0x73,
 } as const;
 
 export function localGet(index: number): number[] {
