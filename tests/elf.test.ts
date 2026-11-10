@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  buildMemoryImage,
+  createMemory,
+  imageOf,
+  loadImage,
+  toWasmAddress,
+} from "../src/image.js";
+import {
   ElfFormatError,
   findSection,
   isElf64,
@@ -403,5 +410,233 @@ describe("ELF64 relocations", () => {
     const bytes = sectionElf({ relas: [{ target: 1n, symbol: 1, type: 1, addend: 0n }], relaEntrySize: 16 });
     const header = parseElfHeader(bytes);
     expect(() => parseRelocations(bytes, parseSectionHeaders(bytes, header))).toThrow(/expected 24/);
+  });
+});
+
+/**
+ * A two-segment executable, so mapping is tested against bytes this file controls.
+ *
+ * Segment A sits at 0x400000 and carries the entry point; segment B sits one page later with a BSS tail, which is the
+ * case that distinguishes "copied the bytes" from "mapped the segment".
+ */
+function executableElf(
+  options: {
+    entry?: bigint;
+    segments?: Array<{
+      offset: number;
+      virtualAddress: bigint;
+      fileSize: number;
+      memorySize: number;
+      flags?: number;
+      alignment?: bigint;
+      data?: number[];
+    }>;
+  } = {},
+): Uint8Array {
+  const segments = options.segments ?? [
+    { offset: 0x200, virtualAddress: 0x400000n, fileSize: 4, memorySize: 4, data: [1, 2, 3, 4] },
+    { offset: 0x300, virtualAddress: 0x401000n, fileSize: 2, memorySize: 8, data: [5, 6] },
+  ];
+  const phnum = segments.length;
+  const end = segments.reduce((highest, segment) => Math.max(highest, segment.offset + segment.fileSize), 64 + 56 * phnum);
+  const bytes = new Uint8Array(end);
+  bytes.set([0x7f, 0x45, 0x4c, 0x46], 0);
+  bytes[4] = 2;
+  bytes[5] = 1;
+  const dv = new DataView(bytes.buffer);
+  dv.setUint16(16, 2, true);
+  dv.setUint16(18, 0x3e, true);
+  dv.setBigUint64(24, options.entry ?? 0x400001n, true);
+  dv.setBigUint64(32, 64n, true);
+  dv.setUint16(54, 56, true);
+  dv.setUint16(56, phnum, true);
+  segments.forEach((segment, index) => {
+    const ph = 64 + index * 56;
+    dv.setUint32(ph, 1, true);
+    dv.setUint32(ph + 4, segment.flags ?? 5, true);
+    dv.setBigUint64(ph + 8, BigInt(segment.offset), true);
+    dv.setBigUint64(ph + 16, segment.virtualAddress, true);
+    dv.setBigUint64(ph + 32, BigInt(segment.fileSize), true);
+    dv.setBigUint64(ph + 40, BigInt(segment.memorySize), true);
+    dv.setBigUint64(ph + 48, segment.alignment ?? 0x100n, true);
+    bytes.set(segment.data ?? [], segment.offset);
+  });
+  return bytes;
+}
+
+describe("mapping PT_LOAD segments into WASM memory", () => {
+  it("places each segment at its virtual address minus the page-aligned base", () => {
+    const bytes = executableElf();
+    const header = parseElfHeader(bytes);
+    const image = buildMemoryImage(bytes, header, parseProgramHeaders(bytes, header));
+    expect(image.baseAddress).toBe(0x400000n);
+    expect(image.segments.map((segment) => segment.wasmAddress)).toEqual([0x0, 0x1000]);
+    expect(image.entryAddress).toBe(1);
+  });
+
+  it("copies file bytes and zero-fills the BSS tail after it", () => {
+    const bytes = executableElf();
+    const image = imageOf(bytes);
+    const memory = createMemory(image);
+    const buffer = new Uint8Array(memory.buffer);
+    // pollute first: a loader that only copies bytes would pass on a fresh buffer and fail here
+    buffer.fill(0xaa);
+    loadImage(bytes, image, memory);
+    expect(Array.from(buffer.subarray(0, 4))).toEqual([1, 2, 3, 4]);
+    expect(buffer[0x1000]).toBe(5);
+    expect(buffer[0x1001]).toBe(6);
+    expect(Array.from(buffer.subarray(0x1002, 0x1008))).toEqual([0, 0, 0, 0, 0, 0]);
+  });
+
+  it("reserves whole 64 KiB pages, covering the highest mapped byte", () => {
+    const bytes = executableElf();
+    const image = imageOf(bytes);
+    expect(image.wasmBytes % (64 * 1024)).toBe(0);
+    expect(image.pages).toBe(image.wasmBytes / (64 * 1024));
+    expect(image.wasmBytes).toBeGreaterThanOrEqual(0x1008);
+  });
+
+  it("translates mapped addresses and refuses an unmapped one", () => {
+    const bytes = executableElf();
+    const image = imageOf(bytes);
+    expect(toWasmAddress(image, 0x400000n)).toBe(0);
+    expect(toWasmAddress(image, 0x401003n)).toBe(0x1003);
+    // the gap between the two segments is not mapped, and returning bytes from it would be a wild read
+    expect(() => toWasmAddress(image, 0x400800n)).toThrow(/not mapped by any PT_LOAD segment/);
+  });
+
+  it("refuses an entry point that is not inside an executable segment", () => {
+    const bytes = executableElf({
+      entry: 0x400fffn,
+    });
+    const header = parseElfHeader(bytes);
+    expect(() => buildMemoryImage(bytes, header, parseProgramHeaders(bytes, header))).toThrow(
+      /not inside any executable PT_LOAD segment/,
+    );
+  });
+
+  it("refuses a segment whose p_filesz exceeds its p_memsz", () => {
+    const bytes = executableElf({
+      segments: [{ offset: 0x200, virtualAddress: 0x400000n, fileSize: 8, memorySize: 4, data: [1, 2, 3, 4, 5, 6, 7, 8] }],
+    });
+    const header = parseElfHeader(bytes);
+    expect(() => buildMemoryImage(bytes, header, parseProgramHeaders(bytes, header))).toThrow(
+      /larger than p_memsz/,
+    );
+  });
+
+  it("refuses a segment that runs past the end of the file", () => {
+    const bytes = executableElf({
+      segments: [{ offset: 0x200, virtualAddress: 0x400000n, fileSize: 4, memorySize: 4, data: [1, 2, 3, 4] }],
+    });
+    const header = parseElfHeader(bytes);
+    const truncated = bytes.subarray(0, 0x202);
+    expect(() => buildMemoryImage(truncated, header, parseProgramHeaders(bytes, header))).toThrow(
+      /runs past the end of the file/,
+    );
+  });
+
+  it("refuses overlapping segments instead of letting the later one win", () => {
+    const bytes = executableElf({
+      segments: [
+        { offset: 0x200, virtualAddress: 0x400000n, fileSize: 4, memorySize: 8, data: [1, 2, 3, 4] },
+        { offset: 0x300, virtualAddress: 0x400004n, fileSize: 2, memorySize: 2, data: [5, 6], alignment: 1n },
+      ],
+    });
+    const header = parseElfHeader(bytes);
+    expect(() => buildMemoryImage(bytes, header, parseProgramHeaders(bytes, header))).toThrow(
+      /segments overlap in memory/,
+    );
+  });
+
+  it("refuses a segment whose address and offset disagree modulo p_align", () => {
+    const bytes = executableElf({
+      entry: 0x400810n,
+      segments: [
+        { offset: 0x200, virtualAddress: 0x400800n, fileSize: 4, memorySize: 4, data: [1, 2, 3, 4], alignment: 0x1000n },
+      ],
+    });
+    const header = parseElfHeader(bytes);
+    expect(() => buildMemoryImage(bytes, header, parseProgramHeaders(bytes, header))).toThrow(
+      /not congruent to its file offset/,
+    );
+  });
+
+  it("refuses an object with no PT_LOAD segment to map", () => {
+    const bytes = executableElf({
+      segments: [{ offset: 0x200, virtualAddress: 0x400000n, fileSize: 4, memorySize: 4, data: [1, 2, 3, 4], flags: 4 }],
+    });
+    const header = parseElfHeader(bytes);
+    const segments = parseProgramHeaders(bytes, header).map((segment) => ({ ...segment, type: 4 }));
+    expect(() => buildMemoryImage(bytes, header, segments)).toThrow(/no PT_LOAD segments/);
+  });
+
+  it("carries read, write and execute permissions per segment", () => {
+    const bytes = executableElf({
+      segments: [
+        { offset: 0x200, virtualAddress: 0x400000n, fileSize: 4, memorySize: 4, data: [1, 2, 3, 4], flags: 5 },
+        { offset: 0x300, virtualAddress: 0x401000n, fileSize: 2, memorySize: 2, data: [5, 6], flags: 6 },
+      ],
+    });
+    const image = imageOf(bytes);
+    expect(image.segments[0]!.permissions).toEqual({ read: true, write: false, execute: true });
+    expect(image.segments[1]!.permissions).toEqual({ read: true, write: true, execute: false });
+  });
+
+  it("refuses to write an image into memory that is too small for it", () => {
+    const bytes = executableElf();
+    const image = imageOf(bytes);
+    const small = { buffer: new ArrayBuffer(16) };
+    expect(() => loadImage(bytes, image, small)).toThrow(/refusing to write a partial image/);
+  });
+});
+
+describe("mapping a real ELF64 binary from the host", () => {
+  const load = async (path: string): Promise<Uint8Array | undefined> => {
+    try {
+      // @ts-expect-error node:fs is intentionally outside this project's type surface
+      const { readFileSync } = await import("node:fs");
+      return new Uint8Array(readFileSync(path));
+    } catch {
+      return undefined;
+    }
+  };
+
+  it("maps a host binary and reproduces its segment bytes exactly", async () => {
+    let bytes: Uint8Array | undefined;
+    for (const candidate of ["/bin/ls", "/usr/bin/ls", "/bin/sh"]) {
+      const loaded = await load(candidate);
+      if (loaded !== undefined && isElf64(loaded)) {
+        bytes = loaded;
+        break;
+      }
+    }
+    if (bytes === undefined) return; // no ELF64 host binary here: nothing to assert
+
+    const header = parseElfHeader(bytes);
+    const image = imageOf(bytes);
+    const memory = createMemory(image);
+    loadImage(bytes, image, memory);
+    const buffer = new Uint8Array(memory.buffer);
+
+    for (const segment of image.segments) {
+      const start = segment.wasmAddress;
+      const fileEnd = start + Number(segment.fileSize);
+      expect(Array.from(buffer.subarray(start, fileEnd))).toEqual(
+        Array.from(bytes.subarray(Number(segment.fileOffset), Number(segment.fileOffset + segment.fileSize))),
+      );
+      for (let offset = fileEnd; offset < start + Number(segment.memorySize); offset += 1) {
+        expect(buffer[offset]).toBe(0);
+      }
+    }
+
+    const entrySegment = image.segments.find((segment) => segment.permissions.execute);
+    expect(entrySegment).toBeDefined();
+    expect(toWasmAddress(image, header.entry)).toBe(image.entryAddress);
+
+    // loading twice must produce the same bytes as loading once, so a re-init cannot accumulate stale data
+    const afterFirstLoad = Array.from(buffer.subarray(0, image.wasmBytes));
+    loadImage(bytes, image, memory);
+    expect(Array.from(buffer.subarray(0, image.wasmBytes))).toEqual(afterFirstLoad);
   });
 });

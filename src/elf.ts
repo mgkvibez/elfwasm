@@ -58,6 +58,8 @@ export interface ProgramHeader {
   readonly virtualAddress: bigint;
   readonly fileSize: bigint;
   readonly memorySize: bigint;
+  /** `p_align`, which requires `p_vaddr` and `p_offset` to be congruent modulo it. */
+  readonly alignment: bigint;
 }
 
 const ELF_MAGIC = [0x7f, 0x45, 0x4c, 0x46] as const;
@@ -142,6 +144,7 @@ export function parseProgramHeaders(bytes: Uint8Array, header: ElfHeader): Progr
       virtualAddress: dv.getBigUint64(base + 16, true),
       fileSize: dv.getBigUint64(base + 32, true),
       memorySize: dv.getBigUint64(base + 40, true),
+      alignment: dv.getBigUint64(base + 48, true),
     });
   }
   return headers;

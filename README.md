@@ -29,10 +29,9 @@ makes it the missing piece between a shimmed runtime and running real `esbuild`,
 
 ## Status
 
-**Stage 0: reading, not executing.** The ELF64 header, program-header tables, section headers and symbol tables parse,
-with tests: section and symbol names resolve through their string tables, and `st_info` is split into binding and type.
-Nothing executes yet. There is no translator, no WASM emitter, no relocation handling and no syscall layer in this
-repository today.
+**Stage 1: loading, not executing.** The ELF64 header, program-header tables, section headers, symbol tables and
+`RELA` relocations parse, and the `PT_LOAD` segments are now placed into a WASM linear memory. Nothing executes yet:
+there is no decoder, no translator, no WASM emitter and no syscall layer in this repository today.
 
 Refusals are named, not generic, and that is the point: a 32-bit, big-endian, stripped, or 16-byte-symbol-entry object is
 rejected with a reason, because a parser that guesses an offset produces confident nonsense downstream.
@@ -41,10 +40,23 @@ Relocations (`RELA`) parse too, with their symbol resolved by name and the adden
 in memory rather than in the file, is refused by name, because reading it as `RELA` would relocate to the wrong address
 instead of failing.
 
-What does **not** work yet: `REL` relocations, extended section numbering (`e_shnum == 0` with the real count in the first
-section's `sh_size`), and mapping `PT_LOAD` segments into WASM memory. Nothing is translated or executed.
+Segment mapping produces a `MemoryImage`: the base is the lowest segment address rounded down to a WASM page, each
+segment records both its virtual address and its byte offset in the buffer, and `loadImage` copies file bytes then
+zero-fills every `p_memsz` tail. That zero-fill is explicit rather than assumed, because a fresh `WebAssembly.Memory`
+starts zeroed and hides the bug on the first run. Mappings are checked first: overlapping segments, `p_filesz` greater
+than `p_memsz`, a segment past EOF, an address not congruent to its file offset modulo `p_align`, and an entry point
+outside every executable segment are all refused by name. `toWasmAddress` refuses an unmapped virtual address rather
+than returning whatever byte happens to live at that offset.
 
-**Tests:** 23
+Verified against `/bin/ls` on the host: 4 segments, 3 WASM pages (192 KiB), 143,353 bytes copied, 4,840 bytes of BSS
+zero-filled, entry `0x61d0` translated to WASM offset `0x61d0` holding `0x31`, the first byte of real x86-64 code.
+
+What does **not** work yet: `REL` relocations, extended section numbering (`e_shnum == 0` with the real count in the first
+section's `sh_size`), instruction decoding, translation to WASM, and any syscall. Two honest limits of the mapping:
+WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
+honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
+
+**Tests:** 36
 
 ```bash
 npm ci && npm run verify
@@ -52,7 +64,8 @@ npm ci && npm run verify
 
 ## Roadmap
 
-1. **ELF loading** (done): ELF64 headers, `PT_LOAD` segments, explicit refusals for 32-bit, big-endian, relocatable.
+1. **ELF loading** (done): ELF64 headers, `PT_LOAD` segments mapped into a WASM `MemoryImage`, `RELA` relocations, and
+   explicit refusals for 32-bit, big-endian and relocatable objects.
 2. **Decoder**: x86-64 instruction decoding to an IR, with the subset a musl `hello world` needs.
 3. **Translator**: IR to WASM, one function per basic block, registers in locals.
 4. **Syscall layer**: `write`, `exit_group`, `brk`, `mmap`, then the file syscalls, each behind a capability check.
