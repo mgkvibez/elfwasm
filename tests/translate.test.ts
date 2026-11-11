@@ -120,8 +120,8 @@ describe("refusals", () => {
     expect(refuse(hex("48 8b 04 25 00 01 40 00 c3")).message).toContain("needs the mapped image");
   });
 
-  it("refuses a syscall, which belongs to the layer after this one", () => {
-    expect(refuse(hex("48 c7 c0 01 00 00 00 0f 05 c3")).message).toContain("syscall is not translated yet");
+  it("refuses a syscall unless the syscall layer was asked for", () => {
+    expect(refuse(hex("48 c7 c0 01 00 00 00 0f 05 c3")).message).toContain("syscall needs the syscall layer");
   });
 
   it("refuses a block that does not return, rather than emitting a function with nothing on the stack", () => {

@@ -50,8 +50,17 @@ function hex(text: string): Uint8Array {
   return Uint8Array.from(text.trim().split(/\s+/).map((byte) => Number.parseInt(byte, 16)));
 }
 
-/** Run against a memory this test prefills, and hand back both the result and the buffer afterwards. */
-function run(bytes: Uint8Array, fill?: (buffer: Uint8Array) => void): { result: bigint; buffer: Uint8Array } {
+/**
+ * Run against a memory this test prefills, and hand back both the result and the buffer afterwards.
+ *
+ * `codeAddress` is only needed by a test whose operand is RIP-relative: without it the bytes are assumed to start at address
+ * zero, which is fine for everything that names its addresses outright.
+ */
+function run(
+  bytes: Uint8Array,
+  fill?: (buffer: Uint8Array) => void,
+  codeAddress?: bigint,
+): { result: bigint; buffer: Uint8Array } {
   const mapped = image();
   const memory = new runtime.Memory({ initial: 1 });
   const buffer = new Uint8Array(memory.buffer);
@@ -60,15 +69,16 @@ function run(bytes: Uint8Array, fill?: (buffer: Uint8Array) => void): { result: 
   const module = translateBytes(bytes, "main", {
     addresses: addressSpaceOf(mapped),
     memoryPages: 1,
+    ...(codeAddress === undefined ? {} : { codeAddress }),
   });
   const instance = new runtime.Instance(new runtime.Module(module), { env: { memory } });
   return { result: instance.exports.main!(), buffer };
 }
 
 /** The same translation, called, with whatever it throws returned instead. */
-function attempt(bytes: Uint8Array): bigint | Error {
+function attempt(bytes: Uint8Array, codeAddress?: bigint): bigint | Error {
   try {
-    return run(bytes).result;
+    return run(bytes, undefined, codeAddress).result;
   } catch (error) {
     return error as Error;
   }
@@ -167,5 +177,47 @@ describe("refusals that remain", () => {
       return;
     }
     throw new Error("expected a refusal");
+  });
+});
+
+describe("lea, which names an address instead of reading one", () => {
+  it("puts a virtual address in a register, which a later load rebases", () => {
+    /*
+     * lea 0x2f8(%rip), %rax ; mov (%rax), %rax ; ret
+     *
+     * The displacement is relative to the byte after the `lea`, which is at virtual 0x400007, so the address it names is
+     * 0x4002ff... and the load that follows has to subtract the image base to reach offset 0x2ff. Both halves are the point:
+     * a `lea` that stored an offset would load from the wrong byte, and one that stored a rebased address would trap.
+     */
+    const { result } = run(
+      hex("48 8d 05 f8 02 00 00 48 8b 00 c3"),
+      (buffer) => {
+        buffer[0x2ff] = 0x5a;
+      },
+      0x400000n,
+    );
+    expect(result).toBe(0x5an);
+  });
+
+  it("adds a base register and a scaled index without reading memory", () => {
+    // lea (%rcx,%rax,4), %rax with %rcx = 0x400100 and %rax = 2, so the result is 0x400108, which holds 7
+    const { result } = run(
+      hex("48 c7 c1 00 01 40 00 48 c7 c0 02 00 00 00 48 8d 04 81 48 8b 00 c3"),
+      (buffer) => {
+        buffer[0x108] = 0x07;
+      },
+    );
+    expect(result).toBe(0x07n);
+  });
+
+  it("allows an address one past the end of memory, which is how a compiler finds the end of an array", () => {
+    // lea 0xfff9(%rip), %rax ; ret: 0x400007 + 0xfff9 is 0x410000, the first byte past the page, and that is a legal value
+    expect(attempt(hex("48 8d 05 f9 ff 00 00 c3"), 0x400000n)).toBe(0x410000n);
+  });
+
+  it("still traps when that address is then read", () => {
+    // the same lea, followed by a load: the value is legal, the access is not
+    const outcome = attempt(hex("48 8d 05 f9 ff 00 00 48 8b 00 c3"), 0x400000n);
+    expect(outcome).toBeInstanceOf(Error);
   });
 });

@@ -85,6 +85,13 @@ export interface ModuleOptions {
   readonly bodies: readonly (readonly number[])[];
   /** How many `i64` globals to declare, which is where the register file lives. */
   readonly globals?: number;
+  /**
+   * A host function to import as `env.syscall`, taking the call number and six arguments and returning the result.
+   *
+   * It is a *function* import, so it occupies index 0 of the function index space: every translated function shifts up by one,
+   * and the export follows. That is the off-by-one this file now has to get right in three places rather than one.
+   */
+  readonly importFunction?: { readonly module: string; readonly field: string };
   /** Present only when the body touches memory, so a module that reads nothing keeps needing nothing. */
   readonly memory?: MemoryImport;
 }
@@ -92,12 +99,45 @@ export interface ModuleOptions {
 /**
  * Builds the module: type, import, function, export, then code, in the order the format requires.
  *
- * There is at most one import, and it does not occupy the function index space, so the export index stays equal to the
- * function index when memory is imported and when it is not. That is the off-by-one this file cannot make.
+ * The import section can hold two entries now, and only one of them shifts an index: a memory import changes nothing about
+ * function numbering, and a function import takes index 0. So the export index is the count of imported *functions*, which is
+ * zero or one, and every instruction in the code section that names a function has to add the same number. Three places, one
+ * rule: the export below, and a `call` in the translator.
  */
 export function module(options: ModuleOptions): Uint8Array {
-  // the type section's body is a vector: a count, then the signature itself
-  const typeBody = [0x01, 0x60, 0x00, 0x01, I64]; // one type: no params, one i64 result
+  /*
+   * The type section's body is a vector: a count, then the signatures. Type 0 is every translated function, which takes
+   * nothing and returns `%rax`; type 1 is the host syscall, which takes the call number and six arguments.
+   */
+  const typeBody = [
+    ...(options.importFunction === undefined ? [0x01] : [0x02]),
+    0x60, 0x00, 0x01, I64,
+    ...(options.importFunction === undefined ? [] : [0x60, 0x07, I64, I64, I64, I64, I64, I64, I64, 0x01, I64]),
+  ];
+
+  const importName = (text: string): number[] => [
+    ...unsigned(text.length),
+    ...Array.from(text).map((character) => character.charCodeAt(0)),
+  ];
+  const importBody = [
+    ...(options.importFunction === undefined
+      ? []
+      : [
+          ...importName(options.importFunction.module),
+          ...importName(options.importFunction.field),
+          0x00, // a function import
+          0x01, // of type 1
+        ]),
+    ...(options.memory === undefined
+      ? []
+      : [
+          ...importName("env"),
+          ...importName("memory"),
+          0x02, // a memory
+          0x00, // limits: minimum only
+          ...unsigned(options.memory.minimumPages),
+        ]),
+  ];
   // every function shares that one type, so the function section is a count and a run of zeroes
   const functionBody = [...unsigned(options.bodies.length), ...options.bodies.map(() => 0x00)];
 
@@ -119,19 +159,14 @@ export function module(options: ModuleOptions): Uint8Array {
    * `env.memory`; the descriptor byte 0x02 says "memory", 0x00 says "limits with a minimum and no maximum", and the
    * minimum is a count of 64 KiB pages rather than a byte length.
    */
-  const importSection =
-    options.memory === undefined
-      ? []
-      : section(2, [
-          0x01, // one import
-          0x03, 0x65, 0x6e, 0x76, // module name "env"
-          0x06, 0x6d, 0x65, 0x6d, 0x6f, 0x72, 0x79, // field name "memory"
-          0x02, // a memory
-          0x00, // limits: minimum only
-          ...unsigned(options.memory.minimumPages),
-        ]);
+  const importSection = importBody.length === 0 ? [] : section(2, [
+    ...unsigned((options.importFunction === undefined ? 0 : 1) + (options.memory === undefined ? 0 : 1)),
+    ...importBody,
+  ]);
   const exportName = [...options.name].map((character) => character.charCodeAt(0));
-  const exportBody = [0x01, ...unsigned(exportName.length), ...exportName, 0x00, 0x00]; // one export, of function 0
+  // the entry is the first *defined* function, so an imported one in front of it moves the export up by one
+  const entryIndex = options.importFunction === undefined ? 0 : 1;
+  const exportBody = [0x01, ...unsigned(exportName.length), ...exportName, 0x00, ...unsigned(entryIndex)];
 
   /*
    * One local group of the same type, which is all a register file needs, then the body and its `end`. The size that

@@ -56,6 +56,9 @@ const CMP_B = 1;
 const ADDR = 2;
 const LOCAL_COUNT = 3;
 
+/** The imported syscall's function index, which is 0: an import comes before every function the module defines. */
+const SYSCALL_INDEX = 0;
+
 /** WASM's page size, which is what a bound is expressed in. */
 const PAGE_SIZE = 64 * 1024;
 
@@ -80,6 +83,13 @@ export interface TranslateOptions {
    * function in a different image.
    */
   readonly code?: { readonly bytes: Uint8Array; readonly virtualAddress: bigint };
+  /**
+   * Answer `syscall` through the imported host function, which is `Machine` in `src/syscalls.ts`.
+   *
+   * Off by default, like the stack, because it changes what the caller must supply: a module that can call the kernel needs an
+   * import at instantiation, and a caller who leaves it out gets a refusal at translation rather than a link error at load.
+   */
+  readonly syscalls?: boolean;
   /** Filled in by `translate` itself. A caller never sets this. */
   readonly calls?: CallRegistry;
   /**
@@ -267,6 +277,7 @@ function resolveAddresses(
       operands: instruction.operands.map((operand) => {
         if (operand.kind !== "memory") return operand;
         // a register-relative address is only knowable at run time, so it becomes code rather than a number
+        if (instruction.op === "lea") return { ...operand, addressCode: leaAddressCode(operand, instruction, options) };
         if (operand.base !== undefined || operand.index !== undefined) {
           const width = operand.bits ?? 32;
           return { ...operand, addressCode: runtimeAddressCode(operand, instruction, options, width) };
@@ -421,6 +432,42 @@ function translateLeave(instruction: Instruction, options: TranslateOptions): nu
     ...globalSet(rbp),
     ...adjustStack(8n),
   ];
+}
+
+/**
+ * The WASM that computes an address for `lea`, which is not the WASM that computes one for a load.
+ *
+ * A load's operand is rebased (`register - imageBase`) because memory is flat here and 0 there. A register, though, holds a
+ * virtual address already, so `lea` into it must leave the sum alone: `lea message(%rip), %rsi` has to put `message`'s virtual
+ * address in `%rsi`, and the load that later reads `(%rsi)` is the thing that rebases. Nothing is bound checked either, because
+ * an address one past the end is a legal value for `lea` to produce.
+ */
+function leaAddressCode(operand: Operand, instruction: Instruction, options: TranslateOptions): number[] {
+  if (operand.kind !== "memory") {
+    throw new TranslateError(instruction.offset, `lea needs a memory operand, found ${operand.kind}`);
+  }
+  const addresses = options.addresses;
+  if (addresses === undefined) {
+    throw new TranslateError(instruction.offset, "lea needs the mapped image: pass addresses from image.addressSpaceOf()");
+  }
+  if (operand.segment !== undefined) {
+    throw new TranslateError(instruction.offset, `lea from a %${operand.segment}: operand is not translated`);
+  }
+  if (operand.base === undefined && operand.index === undefined) {
+    return [...i64Const(virtualAddressOf(operand, instruction, options))];
+  }
+  const parts: number[][] = [];
+  if (operand.base !== undefined) parts.push([...globalGet(localOfRegister(operand.base, instruction))]);
+  if (operand.index !== undefined) {
+    const shift = { 1: 0n, 2: 1n, 4: 2n, 8: 3n }[operand.scale];
+    const scaled = [...globalGet(localOfRegister(operand.index, instruction))];
+    if (shift !== 0n) scaled.push(...i64Const(shift), OP.i64Shl);
+    parts.push(scaled);
+  }
+  const code = [...parts[0]!];
+  for (const part of parts.slice(1)) code.push(...part, OP.i64Add);
+  if (operand.displacement !== 0n) code.push(...i64Const(operand.displacement), OP.i64Add);
+  return code;
 }
 
 /** The WASM that pushes a memory operand's address, which `resolveAddresses` has already established. */
@@ -944,6 +991,39 @@ function translateRange(
       index += 1;
       continue;
     }
+    if (instruction.op === "syscall") {
+      if (options.syscalls !== true) {
+        throw new TranslateError(
+          instruction.offset,
+          "syscall needs the syscall layer: pass syscalls: true and instantiate with the machine's imports",
+        );
+      }
+      /*
+       * The call number is in `%rax` and the arguments in `%rdi`, `%rsi`, `%rdx`, `%r10`, `%r8`, `%r9`, in that order. Nothing
+       * is moved, because the host reads the same registers the kernel does: the arguments are already where they belong.
+       */
+      out.push(
+        ...globalGet(REGISTERS.indexOf("rax")),
+        ...globalGet(REGISTERS.indexOf("rdi")),
+        ...globalGet(REGISTERS.indexOf("rsi")),
+        ...globalGet(REGISTERS.indexOf("rdx")),
+        ...globalGet(REGISTERS.indexOf("r10")),
+        ...globalGet(REGISTERS.indexOf("r8")),
+        ...globalGet(REGISTERS.indexOf("r9")),
+        OP.call, ...unsigned(SYSCALL_INDEX),
+        ...globalSet(REGISTERS.indexOf("rax")),
+        /*
+         * The real instruction clobbers `%rcx` and `%r11`: the kernel leaves the return address in the first and `RFLAGS` in the
+         * second. Zero is not the value it leaves, but leaving them alone would let a program depend on a register the kernel
+         * overwrites, which is worse than an obviously wrong number.
+         */
+        ...i64Const(0n), ...globalSet(REGISTERS.indexOf("rcx")),
+        ...i64Const(0n), ...globalSet(REGISTERS.indexOf("r11")),
+      );
+      flags.set = false;
+      index += 1;
+      continue;
+    }
     if (instruction.op === "leave") {
       out.push(...translateLeave(instruction, options));
       flags.set = false;
@@ -969,10 +1049,23 @@ function translateRange(
       // the arguments are already where SysV puts them, because the machine's registers are module globals
       out.push(
         OP.call,
-        ...unsigned(options.calls.indexOf(target, instruction)),
+        ...unsigned(options.calls.indexOf(target, instruction) + (options.syscalls === true ? 1 : 0)),
         ...globalSet(REGISTERS.indexOf("rax")),
       );
       // a callee may clobber every flag and every caller-saved register, so nothing about the condition survives
+      flags.set = false;
+      index += 1;
+      continue;
+    }
+    if (instruction.op === "lea") {
+      const [destination, source] = instruction.operands;
+      if (destination === undefined || source === undefined) {
+        throw new TranslateError(instruction.offset, "lea needs a destination and an address");
+      }
+      if (source.kind !== "memory" || source.addressCode === undefined) {
+        throw new TranslateError(instruction.offset, "lea needs a memory operand and a resolved address");
+      }
+      out.push(...source.addressCode, ...write(destination, instruction));
       flags.set = false;
       index += 1;
       continue;
@@ -1095,10 +1188,18 @@ function bodyOf(
   }
   translateRange(resolved, 0, resolved.length, new Map(), body, flags, loops, options);
   if (!resolved.some((instruction) => instruction.op === "ret")) {
-    throw new TranslateError(
-      resolved.at(-1)?.offset ?? 0,
-      "the block does not end in ret, so it has no value to return",
-    );
+    /*
+     * A program's entry point usually ends in `exit`, which never comes back, so there is no value to return with. What it
+     * leaves is `%rax`, where the call's answer would have gone. Ending in anything else is a truncated function, and that is
+     * refused: guessing a value there would hide the truncation behind a plausible number.
+     */
+    if (resolved.at(-1)?.op !== "syscall") {
+      throw new TranslateError(
+        resolved.at(-1)?.offset ?? 0,
+        "the block does not end in ret or in a syscall, so it has no value to return",
+      );
+    }
+    body.push(...globalGet(REGISTERS.indexOf("rax")));
   }
   return body;
 }
@@ -1186,6 +1287,7 @@ function programOf(
     name,
     locals: LOCAL_COUNT,
     globals: REGISTERS.length,
+    ...(options.syscalls === true ? { importFunction: { module: "env", field: "syscall" } } : {}),
     bodies,
     // the import appears only when something addresses memory, so a module that reads nothing still needs nothing
     ...(touchesMemory ? { memory: { minimumPages: totalPages(options) } } : {}),

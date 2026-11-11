@@ -33,7 +33,9 @@ makes it the missing piece between a shimmed runtime and running real `esbuild`,
 relocations parse, the `PT_LOAD` segments are placed into a WASM linear memory, and the x86-64 decoder covers the subset a
 statically linked musl `hello world` uses. Code with loops executes: x86-64 bytes are decoded and translated into a structured WASM module that Node runs, and the
 number it returns is compared against the number the same bytes compute. Where binutils is installed that comparison is
-against the processor itself, not against a hand-written expectation. There is no syscall layer yet.
+against the processor itself, not against a hand-written expectation. A real `hello world`, assembled and linked by binutils, now runs
+translated: its `write` reaches a shim, its `exit` stops the module, and its stdout and exit status are compared with what
+Linux did.
 
 Refusals are named, not generic, and that is the point: a 32-bit, big-endian, stripped, or 16-byte-symbol-entry object is
 rejected with a reason, because a parser that guesses an offset produces confident nonsense downstream.
@@ -54,11 +56,12 @@ Verified against `/bin/ls` on the host: 4 segments, 3 WASM pages (192 KiB), 143,
 zero-filled, entry `0x61d0` translated to WASM offset `0x61d0` holding `0x31`, the first byte of real x86-64 code.
 
 What does **not** work yet: `REL` relocations, extended section numbering (`e_shnum == 0` with the real count in the first
-section's `sh_size`), SSE and `x87`, translation to WASM, and any syscall. Two honest limits of the mapping:
+section's `sh_size`), SSE and `x87`, libc (a `call` into it needs relocations this loader does not do), and every syscall but
+`write`, `exit` and `exit_group`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 145
+**Tests:** 155
 
 ```bash
 npm ci && npm run verify
@@ -107,10 +110,10 @@ send a reader to different places in the architecture.
 
 ## The translator
 
-`translate` takes the decoder's instructions and emits one WASM function: no parameters, one `i64` result, sixteen `i64`
-locals for the sixteen registers in encoding order. The subset is `mov`, `add`, `sub`, `xor`, `and`, `or`, `imul` at 32
-and 64 bits, `cmp` and `test`, the ten conditional branches that need only zf, sf, cf and of, `jmp` in both directions,
-loops, and `ret`, which returns `rax`.
+`translate` takes the decoder's instructions and emits one WASM function per x86-64 function: no parameters, one `i64`
+result, sixteen `i64` globals for the sixteen registers in encoding order. The subset is `mov`, `lea`, `add`, `sub`, `xor`,
+`and`, `or`, `imul` at 32 and 64 bits, `cmp` and `test`, the ten conditional branches that need only zf, sf, cf and of,
+`jmp` in both directions, loops, `call`, `syscall`, and `ret`, which returns `rax`.
 
 Flags are never materialised as variables. `cmp` and `test` leave their operands in two extra locals and a `jcc` becomes
 the comparison itself, at the width the operands were: that is why `cmp $-1, %eax ; jl` and `cmp $-1, %rax ; jl` behave
@@ -166,8 +169,9 @@ rather than reading. The bound is the memory the module imports, so it is the ca
 here.
 
 Everything else is refused by name and offset: a segment override such as `%fs:` (WASM has no segments, and reading `0x28`
-as a plain address would silently load the wrong memory), a constant address no segment maps, `syscall`, `setcc` and the
-flags it needs, `jo` and its relatives, a `ret` with a stack adjustment, a block that does not return, and code after `ret`.
+as a plain address would silently load the wrong memory), a constant address no segment maps, `syscall` when the layer is
+off, `setcc` and the flags it needs, `jo` and its relatives, a `ret` with a stack adjustment, a block that does not return,
+and code after `ret`.
 Refusing is the honest option while the rest of the machine does not exist: a translator that skipped an instruction would
 produce a module that runs and computes the wrong number.
 
@@ -199,8 +203,37 @@ are the next function or the linker's zero padding, and a strict decode of those
 instructions. What the walk leaves unreachable inside the range is refused: that means the address is not a function's start,
 or a branch lands inside another instruction.
 
-A call whose target is outside the region is refused by name. That is where libc lives, and reaching it needs the syscall
-layer, which does not exist yet.
+A call whose target is outside the region is refused by name. That is where libc lives, and reaching it needs more than a
+calling convention: libc's own code calls into a partly relocated image, so it is refused rather than translated into
+something that reads the wrong address. The kernel is reachable the way a program reaches it anyway, through `syscall`.
+
+`lea` is the one memory operand that is *not* rebased. A register here holds a virtual address, and a load through it
+subtracts the image base, so `lea message(%rip), %rsi` must leave `%rsi` holding `message`'s virtual address rather than a
+buffer offset: rebasing it there would address the wrong byte, and the load that follows would fault by exactly the base.
+For the same reason `lea` gets no bound check. An address one past the end of memory is how a compiler computes the end of
+an array, and refusing it would refuse a program that never reads the result; a load from the same address still traps.
+
+### The syscall layer
+
+`syscall` is a call to an imported host function taking the call number and six arguments. Nothing is moved to make that
+call: `%rax` holds the number and `%rdi`, `%rsi`, `%rdx`, `%r10`, `%r8`, `%r9` hold the arguments, which is where the
+instruction itself puts them, so the shim reads the registers the kernel reads. `%rcx` and `%r11` are clobbered, as the
+real instruction clobbers them, and flags are not trusted afterwards.
+
+Three calls are implemented, and that is the whole claim: `write`, `exit` and `exit_group`. Everything else returns
+`-ENOSYS`, which is what a kernel returns for a call it does not have, so a program that needs one fails the way it would
+on a machine without it rather than silently reading zeroes. A `write` whose buffer is not entirely inside the image returns
+`-EFAULT` instead of copying whatever follows it. An `exit` does not return, so it throws out of the module and the machine
+records the status: a WASM function cannot be stopped from inside an import any other way, and returning normally would let
+the program keep running past its own end.
+
+The memory is created by the machine, not by the module, because the kernel reads it too: `write` copies bytes out of the
+same buffer the program wrote them into. `syscalls: true` is opt-in for the reason `stackPages` is: it adds an import, so a
+caller who does not know about it gets a refusal at translation rather than an instantiation error at load.
+
+An imported function occupies index 0 of the WASM function index space, which shifts every translated function up by one.
+That is the kind of arithmetic that produces a module that validates and calls the wrong function, so it is pinned by a test
+that calls a callee in a module that also has the import, and that ends with the callee's own exit status.
 
 ## Checked against the processor, not against itself
 
@@ -213,6 +246,11 @@ Currently eight programs, and they agree: a countdown loop (5), a sum loop (10),
 (10), nested loops (6), the if/else shape (10), and three that turn on the difference between signed and unsigned
 comparisons at each width (3, 2 and 3). It skips rather than fails when binutils is absent, because a cold checkout must
 run with no toolchain.
+
+`tests/syscalls.test.ts` closes the loop the roadmap was aiming at: `hello world` is written in assembly, built by `as` and
+`ld`, run by Linux, and then its own `_start` bytes are translated and run against the shim. The executable's program headers
+become the image, so `lea message(%rip)` resolves against the address the loader would have chosen, and the two answers must
+match: `Hello, world!` on stdout, and a status.
 
 `tests/memory-agreement.test.ts` does the same for memory, and does it end to end. Each program in
 `tools/native/memory/` is assembled and linked at whatever addresses the linker picks, the resulting *executable's* program
@@ -232,10 +270,12 @@ choose every address, so no part of that test hardcodes one.
    honest.
 3. **Translator** (in progress): arithmetic, flags as comparisons, forward branches, loops, memory against the mapped image
    including register-relative and indexed addressing with a bound check, the stack with a checked floor, and calls between
-   translated functions with the registers as module globals, results checked by running the module and, where the toolchain
-   allows, by the processor.
-4. **Syscall layer**: `write`, `exit_group`, `brk`, `mmap`, then the file syscalls, each behind a capability check.
-5. **Evidence**: the same binary run under real Linux and under the translator, stdout and exit code compared.
+   translated functions with the registers as module globals, and `syscall`, results checked by running the module and,
+   where the toolchain allows, by the processor.
+4. **Syscall layer** (started): `write`, `exit` and `exit_group` answer; everything else is `ENOSYS`. Next are `brk`, `mmap`
+   and the file syscalls, each behind a capability check.
+5. **Evidence** (started): `hello world` runs under real Linux and under the translator, with stdout and exit status compared.
+   Next is a binary whose libc calls need relocations, which is a loader problem before it is a translator one.
 
 ## Non-goals
 
