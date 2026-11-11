@@ -29,6 +29,7 @@ const PAGE = 0x10000n;
 /** One page of memory at the origin, which is where both the code and the buffer a test writes from live. */
 const KNOWN: MemoryImage = {
   baseAddress: ORIGIN,
+  loadBias: 0n,
   wasmBytes: Number(PAGE),
   pages: 1,
   entryAddress: 0,

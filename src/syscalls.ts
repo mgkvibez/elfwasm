@@ -59,6 +59,14 @@ export interface MachineOptions {
   readonly image: MemoryImage;
   /** Pages to allocate. Defaults to the image's own pages, so a program with no stack gets exactly the image's memory. */
   readonly pages?: number;
+  /**
+   * The memory to run in, instead of creating one.
+   *
+   * A loaded image already lives in the memory its loader built, and the relocations were written into that buffer: running
+   * in a fresh one would address a copy taken before any of them were applied, which reads as a program whose pointers are
+   * all zero.
+   */
+  readonly memory?: LinearMemory;
 }
 
 /** What a finished program produced: its status and the bytes it wrote to each standard descriptor. */
@@ -84,7 +92,7 @@ export class Machine {
 
   constructor(options: MachineOptions) {
     this.addresses = addressSpaceOf(options.image);
-    this.memory = new WebAssembly.Memory({ initial: options.pages ?? options.image.pages });
+    this.memory = options.memory ?? new WebAssembly.Memory({ initial: options.pages ?? options.image.pages });
     this.imports = {
       env: {
         memory: this.memory,

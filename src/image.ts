@@ -9,7 +9,10 @@
  * Two things are deliberately explicit:
  *
  * 1. The image's base is the lowest segment address rounded down to a WASM page, so every segment keeps its exact
- *    relative distance from every other. A translator can therefore add a constant offset and be right.
+ *    relative distance from every other. A translator can therefore add a constant offset and be right. A position-
+ *    independent file is the exception the caller decides: `base` moves every segment by the same amount, which is what
+ *    a loader does when it chooses where a PIE lands, and the amount is kept as `loadBias` because relocations are
+ *    measured from it.
  * 2. Permissions are carried, not enforced. WASM cannot deny a write to a page, so `write`/`execute` here describe what
  *    the binary asked for. A translator that relies on the hardware to enforce it is wrong, and the type says so.
  */
@@ -61,6 +64,15 @@ declare const WebAssembly: {
 export interface MemoryImage {
   /** The virtual address that sits at WASM offset 0. Always a multiple of {@link WASM_PAGE_SIZE}. */
   readonly baseAddress: bigint;
+  /**
+   * The address the file's virtual address zero was loaded at: `baseAddress - originalBase`, and zero unless the caller
+   * asked for a different `base`.
+   *
+   * It is the origin an `R_X86_64_RELATIVE` addend is measured from, and the reason it is a separate field rather than
+   * `baseAddress`: the two agree for a file whose first segment starts at zero, and mean different things for a file that
+   * reserves the low pages itself.
+   */
+  readonly loadBias: bigint;
   /** Total bytes to reserve, rounded up to a whole number of WASM pages. */
   readonly wasmBytes: number;
   readonly pages: number;
@@ -82,6 +94,17 @@ function hex(value: bigint): string {
   return `0x${value.toString(16)}`;
 }
 
+export interface ImageOptions {
+  /**
+   * Where to put virtual address zero, instead of the file's own layout.
+   *
+   * A position-independent executable is linked at zero, so its own layout would map the null page: every segment shifts
+   * by `base`, and a program that dereferences a null pointer traps instead of reading the ELF header. Must be a multiple
+   * of the WASM page size, and must not be below the file's own layout.
+   */
+  readonly base?: bigint;
+}
+
 /**
  * Build the image description without allocating anything.
  *
@@ -92,6 +115,7 @@ export function buildMemoryImage(
   bytes: Uint8Array,
   header: ElfHeader,
   segments: readonly ProgramHeader[],
+  options: ImageOptions = {},
 ): MemoryImage {
   const loadable = loadableSegments(segments);
   if (loadable.length === 0) {
@@ -128,10 +152,26 @@ export function buildMemoryImage(
   }
 
   const page = BigInt(WASM_PAGE_SIZE);
-  const baseAddress = (lowest / page) * page;
-  if (highest - baseAddress > BigInt(WASM_ADDRESS_LIMIT)) {
+  const originalBase = (lowest / page) * page;
+  const baseAddress = options.base ?? originalBase;
+  if (baseAddress % page !== 0n) {
     throw new ElfFormatError(
-      `image would need ${highest - baseAddress} bytes of address space, past WASM's 32-bit limit of ${WASM_ADDRESS_LIMIT}`,
+      `base ${hex(baseAddress)} is not a multiple of the ${WASM_PAGE_SIZE}-byte WASM page: a caller choosing where an image` +
+        " lands chooses a page",
+    );
+  }
+  if (baseAddress < originalBase) {
+    throw new ElfFormatError(
+      `base ${hex(baseAddress)} is below the file's own layout at ${hex(originalBase)}: loading there would need address` +
+        " space the file already occupied",
+    );
+  }
+  const loadBias = baseAddress - originalBase;
+  const span = highest - originalBase;
+  if (span > BigInt(WASM_ADDRESS_LIMIT) || baseAddress + span > BigInt(WASM_ADDRESS_LIMIT)) {
+    throw new ElfFormatError(
+      `image would need ${span} bytes of address space from ${hex(baseAddress)}, past WASM's 32-bit limit of ` +
+        `${WASM_ADDRESS_LIMIT}`,
     );
   }
 
@@ -148,12 +188,13 @@ export function buildMemoryImage(
     }
   }
 
-  const wasmBytes = Math.ceil((Number(highest - baseAddress) || 1) / WASM_PAGE_SIZE) * WASM_PAGE_SIZE;
+  const wasmBytes = Math.ceil((Number(span) || 1) / WASM_PAGE_SIZE) * WASM_PAGE_SIZE;
 
   const mapped: MappedSegment[] = ordered.map((segment) => ({
-    virtualAddress: segment.virtualAddress,
+    // every segment moves by the same amount, so the distances between them, and their offsets in the buffer, do not change
+    virtualAddress: segment.virtualAddress + loadBias,
     fileOffset: segment.offset,
-    wasmAddress: Number(segment.virtualAddress - baseAddress),
+    wasmAddress: Number(segment.virtualAddress - originalBase),
     fileSize: segment.fileSize,
     memorySize: segment.memorySize,
     permissions: permissionsOf(segment.flags),
@@ -162,8 +203,8 @@ export function buildMemoryImage(
   const entrySegment = mapped.find(
     (segment) =>
       segment.permissions.execute &&
-      header.entry >= segment.virtualAddress &&
-      header.entry < segment.virtualAddress + segment.memorySize,
+      header.entry + loadBias >= segment.virtualAddress &&
+      header.entry + loadBias < segment.virtualAddress + segment.memorySize,
   );
   if (entrySegment === undefined) {
     throw new ElfFormatError(
@@ -173,17 +214,19 @@ export function buildMemoryImage(
 
   return {
     baseAddress,
+    loadBias,
     wasmBytes,
     pages: wasmBytes / WASM_PAGE_SIZE,
-    entryAddress: Number(header.entry - baseAddress),
+    // the entry's offset in the buffer is the same wherever the image lands, which is what makes a rebase a rebase
+    entryAddress: Number(header.entry - originalBase),
     segments: mapped,
   };
 }
 
 /** Parse an ELF buffer and produce its image description in one step, for callers that only have bytes. */
-export function imageOf(bytes: Uint8Array): MemoryImage {
+export function imageOf(bytes: Uint8Array, options: ImageOptions = {}): MemoryImage {
   const header = parseElfHeader(bytes);
-  return buildMemoryImage(bytes, header, parseProgramHeaders(bytes, header));
+  return buildMemoryImage(bytes, header, parseProgramHeaders(bytes, header), options);
 }
 
 /** Reserve the WASM memory the image needs. Uninitialised pages read as zero, which is what a BSS wants. */

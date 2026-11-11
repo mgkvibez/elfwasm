@@ -44,7 +44,8 @@ Relocations (`RELA`) parse too, with their symbol resolved by name and the adden
 in memory rather than in the file, is refused by name, because reading it as `RELA` would relocate to the wrong address
 instead of failing.
 
-Segment mapping produces a `MemoryImage`: the base is the lowest segment address rounded down to a WASM page, each
+Segment mapping produces a `MemoryImage`: the base is the lowest segment address rounded down to a WASM page unless the caller
+chooses one (`base`, which is how a position-independent file gets moved off address zero), each
 segment records both its virtual address and its byte offset in the buffer, and `loadImage` copies file bytes then
 zero-fills every `p_memsz` tail. That zero-fill is explicit rather than assumed, because a fresh `WebAssembly.Memory`
 starts zeroed and hides the bug on the first run. Mappings are checked first: overlapping segments, `p_filesz` greater
@@ -53,15 +54,17 @@ outside every executable segment are all refused by name. `toWasmAddress` refuse
 than returning whatever byte happens to live at that offset.
 
 Verified against `/bin/ls` on the host: 4 segments, 3 WASM pages (192 KiB), 143,353 bytes copied, 4,840 bytes of BSS
-zero-filled, entry `0x61d0` translated to WASM offset `0x61d0` holding `0x31`, the first byte of real x86-64 code.
+zero-filled, entry `0x61d0` translated to WASM offset `0x61d0` holding `0x31`, the first byte of real x86-64 code. That
+binary is position-independent and its 212 relative relocations are the ones a loader applies; its other 117 name symbols a
+dynamic linker would resolve, so it is refused rather than half-loaded. See [The loader](#the-loader).
 
 What does **not** work yet: `REL` relocations, extended section numbering (`e_shnum == 0` with the real count in the first
-section's `sh_size`), SSE and `x87`, libc (a `call` into it needs relocations this loader does not do), and every syscall but
-`write`, `exit` and `exit_group`. Two honest limits of the mapping:
+section's `sh_size`), SSE and `x87`, a `call` into libc (its code needs a dynamic linker's symbol resolution, not just
+relocations), and every syscall but `write`, `exit` and `exit_group`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 155
+**Tests:** 175
 
 ```bash
 npm ci && npm run verify
@@ -235,6 +238,50 @@ An imported function occupies index 0 of the WASM function index space, which sh
 That is the kind of arithmetic that produces a module that validates and calls the wrong function, so it is pinned by a test
 that calls a callee in a module that also has the import, and that ends with the callee's own exit status.
 
+### The loader
+
+`loadExecutable` is the whole of a load in one call: choose a base, place the image, copy the segments, then write the
+relocations. The order is the part that matters. Relocations overwrite bytes the file supplied, so they go after the copy; and
+they go before anything executes, because a program that starts with a half-fixed-up image is a program whose first indirect
+reference goes wherever the zeroes point.
+
+A position-independent executable is linked at address zero and holds offsets where a non-PIE executable holds addresses, so
+the load base is a decision rather than a detail. It defaults to `0x400000`, and `0` is refused by name: loading a PIE where it
+says it wants to be would map the null page, so a translated program that dereferences a null pointer would read the ELF
+header and keep going instead of trapping, and every "is this pointer valid" check downstream would answer yes. Moving the
+image shifts every segment by the same amount, which leaves each segment's offset in the buffer, the entry's offset, and the
+page count exactly where they were; the amount is kept as `loadBias`, because that is what the relocation table is measured
+from.
+
+One relocation type is applied: `R_X86_64_RELATIVE`, whose slot becomes `loadBias + addend`. Both halves of the entry are in
+the file's address space, not the loaded one, so the slot is written at `loadBias + r_offset` holding `loadBias + r_addend`.
+Reading the offset as a load-time address is the mistake that puts every write `0x400000` bytes below where it belongs, which
+lands inside some other segment often enough to look like a wrong value rather than a missed rebase; there is a test that
+rebases a slot to the last eight bytes of a segment for exactly that reason.
+
+Everything else is refused by name: `IRELATIVE`, which names a resolver the loader would have to *call* before the program
+starts; `GLOB_DAT` and `JUMP_SLOT`, which need a symbol a dynamic linker would resolve; `COPY`; and the symbol-address forms.
+A slot outside every mapped segment, a slot whose eight bytes run off the end of its segment, and a slot in a segment the file
+marks read-only are each refused rather than written: a loader that wrote into a read-only page would produce a program whose
+constants had been quietly overwritten by its own relocations, and the flag is the check that the mapping is the one the
+linker had in mind.
+
+`Machine` takes the memory to run in rather than always building one, and that seam is what makes any of this observable: the
+image the loader produced, with its relocations written into it, is the buffer the program reads. A machine that allocated its
+own would run a copy taken before any relocation was applied, and the differential below would report 1 in both directions for
+a reason that has nothing to do with the loader.
+
+The evidence is a differential, not a reference number. `tests/loader.test.ts` links a small PIE by hand whose `.data` holds a
+relocated address of `_start`, and whose `_start` compares that pointer with its own runtime address: it exits 0 if they match
+and 1 if they do not. The same bytes, translated and run twice, exit 0 with the relocation applied and 1 without it. That
+second run is the one that makes the first meaningful, because a test that only ever sees 0 would pass on a program that
+compares nothing.
+
+A real libc static PIE is where the subset shows its edge: this loader applies all 1,305 of its relative relocations, checked
+slot by slot against `readelf`'s own table, and then refuses the 24 `IRELATIVE` entries that follow. So the image is
+relocatable and still not runnable, and the reason is not relocation: ifuncs have to be *called*, and a `static-pie` glibc
+binary also wants `arch_prctl` for its thread pointer. Both are named next steps rather than hidden limitations.
+
 ## Checked against the processor, not against itself
 
 `tests/native-agreement.test.ts` is the one check here that does not compare the translator with something this repository
@@ -263,8 +310,9 @@ choose every address, so no part of that test hardcodes one.
 
 ## Roadmap
 
-1. **ELF loading** (done): ELF64 headers, `PT_LOAD` segments mapped into a WASM `MemoryImage`, `RELA` relocations, and
-   explicit refusals for 32-bit, big-endian and relocatable objects.
+1. **ELF loading** (done): ELF64 headers, `PT_LOAD` segments mapped into a WASM `MemoryImage`, `RELA` relocations parsed and
+   `R_X86_64_RELATIVE` applied against a chosen load base, and explicit refusals for 32-bit, big-endian and relocatable
+   objects.
 2. **Decoder** (done for the hello-world subset): ModRM, SIB, REX, RIP-relative addressing, and named refusals. SSE,
    `x87`, the string instructions and 16-bit operands are outside it, and an `objdump`-driven fixture keeps the boundaries
    honest.

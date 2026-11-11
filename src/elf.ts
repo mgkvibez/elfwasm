@@ -308,8 +308,9 @@ export interface Relocation {
   readonly addend: bigint;
 }
 
-const SHT_RELA = 4;
-const SHT_REL = 9;
+/** Section types a relocation table can have, exported because the loader asks which kind it found. */
+export const SHT_RELA = 4;
+export const SHT_REL = 9;
 const RELA_SIZE = 24;
 
 export function parseRelocations(

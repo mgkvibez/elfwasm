@@ -30,6 +30,7 @@ const runtime = (
 function imageOf(bytes = 0x200): MemoryImage {
   return {
     baseAddress: 0x400000n,
+    loadBias: 0n,
     wasmBytes: 0x10000,
     pages: 1,
     entryAddress: 0,
