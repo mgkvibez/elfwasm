@@ -143,3 +143,44 @@ describe("the vector register file", () => {
     expect(run(hex("b8 78 56 34 12 66 0f 6e c0 b8 00 00 00 00 66 0f 7e c0 c3"))).toBe(0x12345678n);
   });
 });
+
+describe("the accumulator instructions", () => {
+  it("divides a signed dividend, keeping the remainder's sign", () => {
+    // `mov $-7,%rax ; cqto ; mov $2,%rsi ; idiv %rsi ; ret` answers -3, and the remainder in %rdx is -1
+    expect(run(hex("48 c7 c0 f9 ff ff ff 48 99 48 c7 c6 02 00 00 00 48 f7 fe c3"))).toBe(-3n);
+  });
+
+  it("divides unsigned, where 0xffffffffffffffff by 2 is a quotient and a remainder", () => {
+    // `mov $-1,%rax ; xor %edx,%edx ; mov $2,%rsi ; div %rsi ; ret` answers 0x7fffffffffffffff
+    expect(run(hex("48 c7 c0 ff ff ff ff 31 d2 48 c7 c6 02 00 00 00 48 f7 f6 c3"))).toBe(0x7fffffffffffffffn);
+  });
+
+  it("multiplies into a 128-bit product, so a high half that overflows %rax is not lost", () => {
+    // `mov $1,%rdx ; mov $-1,%rax ; mul %rdx` leaves the product in %rax and %rdx: 2^64-1 * 1 needs no high half
+    expect(run(hex("48 c7 c2 01 00 00 00 48 c7 c0 ff ff ff ff 48 f7 e2 c3"))).toBe(-1n);
+  });
+
+  it("keeps the high half of a product that does not fit in 64 bits", () => {
+    // `mov $-1,%rax ; mul %rax`: (2^64-1)^2 = 2^128 - 2^65 + 1, whose high half is 0xfffffffffffffffe and low half 1 -> %rdx
+    expect(run(hex("48 c7 c0 ff ff ff ff 48 f7 e0 48 89 d0 c3"))).toBe(-2n);
+  });
+
+  it("traps on a division by zero rather than answering", () => {
+    expect(() => run(hex("48 c7 c0 07 00 00 00 31 d2 31 f6 48 f7 f6 c3"))).toThrow();
+  });
+
+  it("traps when the quotient would not fit in %rax, which is the processor's #DE", () => {
+    // 2^127 / 1: the quotient needs 128 bits
+    expect(() => run(hex("31 c0 48 c7 c2 01 00 00 00 48 c7 c6 01 00 00 00 48 f7 f6 c3"))).toThrow();
+  });
+});
+
+describe("the vector load", () => {
+  it("loads a vector register's low half from another and clears the half above it", () => {
+    /*
+     * `mov $0x11223344,%eax ; movd %eax,%xmm1 ; movq %xmm1,%xmm0 ; mov $0,%eax ; movd %xmm0,%eax ; ret`. The movq is a copy of the
+     * low half, and the answer is the value that went in.
+     */
+    expect(run(hex("b8 44 33 22 11 66 0f 6e c8 f3 0f 7e c1 b8 00 00 00 00 66 0f 7e c8 c3"))).toBe(0x11223344n);
+  });
+});

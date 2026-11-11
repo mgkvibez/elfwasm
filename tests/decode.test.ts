@@ -82,6 +82,22 @@ describe("the vector encodings a startup uses", () => {
     expect(instruction?.operands[1]).toMatchObject({ name: "xmm0.lo", bits: 64 });
   });
 
+  it("reads movq into a vector register from memory, which the f3 prefix makes a load", () => {
+    // `f3 0f 7e 44 24 08`: movq 0x8(%rsp),%xmm0, the load that mirrors the `66 0f d6` store
+    const [instruction] = decode(hex("f3 0f 7e 44 24 08"));
+    expect(instruction?.op).toBe("movq");
+    expect(instruction?.operands[0]).toMatchObject({ name: "xmm0.lo", bits: 64 });
+    expect(instruction?.operands[1]).toMatchObject({ kind: "memory", bits: 64, displacement: 8n });
+    expect(instruction?.length).toBe(6);
+  });
+
+  it("reads the same opcode bytes under 0x66 as the other direction, not as a load", () => {
+    // `66 0f 7e c8` is movd out of a vector register; `f3 0f 7e c8` is movq into one. Same two bytes after the prefix.
+    expect(decode(hex("66 0f 7e c8"))[0]?.operands[0]).toMatchObject({ name: "rax" });
+    // with f3 the register field is the destination, so `c8` names %xmm1 as the one being written
+    expect(decode(hex("f3 0f 7e c8"))[0]?.operands[0]).toMatchObject({ name: "xmm1.lo" });
+  });
+
   it("still refuses an SSE encoding it does not implement", () => {
     expect(() => decode(hex("66 0f 10 c1"))).toThrow(/SSE is not in the decoded subset/);
   });
@@ -250,8 +266,14 @@ describe("the pieces a compiler leans on", () => {
     expect(refuseBytes(hex("0f 57 c0")).message).toContain("SSE");
   });
 
-  it("refuses mul, div and the rotates by name rather than pretending they are in the subset", () => {
-    expect(refuseBytes(hex("f7 f1")).message).toContain("implicit registers");
+  it("reads the four accumulator instructions and still refuses the rotates by name", () => {
+    // `f7 f1` is div %rcx: an opcode whose registers the encoding does not name, which the decoder now reports as such
+    expect(decode(hex("f7 f1"))[0]).toMatchObject({ op: "div" });
+    expect(decode(hex("f7 e1"))[0]).toMatchObject({ op: "mul" });
+    expect(decode(hex("f7 e9"))[0]).toMatchObject({ op: "imul1" });
+    expect(decode(hex("f7 f9"))[0]).toMatchObject({ op: "idiv" });
+    // the byte form is still refused, because its dividend is `%ax` rather than `%rdx:%rax`
+    expect(refuseBytes(hex("f6 f1")).message).toContain("implicit registers");
     expect(refuseBytes(hex("d1 c0")).message).toContain("rotate");
   });
 

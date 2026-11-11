@@ -73,13 +73,31 @@ const ADDR = 2;
 const SSE_A = 4;
 const SSE_B = 5;
 /**
+ * Where a division keeps its long-division state.
+ *
+ * `%rdx:%rax` is a 128-bit dividend and WASM has no divide at that width, so `div` and `idiv` are a bit at a time: the remaining
+ * remainder, the quotient being assembled, the bit a shift would drop, and whether the trial subtraction happened. `mul` borrows
+ * the same slots for the four partial products a 64-by-64 widening multiply is made of.
+ */
+const DIV_DIVISOR = 6;
+const DIV_LO = 7;
+const DIV_HI = 8;
+const DIV_REM = 9;
+const DIV_Q = 10;
+const DIV_CARRY = 11;
+const DIV_TAKE = 12;
+const DIV_SIGN_Q = 13;
+const DIV_SIGN_HI = 14;
+const DIV_FLAG = 15;
+const DIV_FLAG2 = 16;
+/**
  * Where the block a body is executing is recorded, for a body whose control flow is not a tree.
  *
  * Registers are globals and a comparison's operands are locals, so a block of instructions that begins anywhere needs no state of
  * its own beyond which block to run next. This local is that.
  */
 const PC = 3;
-const LOCAL_COUNT = 6;
+const LOCAL_COUNT = 17;
 
 /** The imported syscall's function index, which is 0: an import comes before every function the module defines. */
 const SYSCALL_INDEX = 0;
@@ -644,6 +662,113 @@ function loadByteFromMemory(operand: Operand, instruction: Instruction): number[
 function storeToMemory(operand: Operand, value: readonly number[], width: 8 | 16 | 32 | 64, instruction: Instruction): number[] {
   const code = { 8: OP.i32Store8, 16: OP.i32Store16, 32: OP.i32Store, 64: OP.i64Store }[width];
   return [...addressOf(operand, instruction), ...value, code, ...memarg(0)];
+}
+
+/**
+ * The 64 bits of a multiplier, split into halves, as the four partial products a widening multiply is built from.
+ *
+ * WASM has no 64-by-64 multiply that yields 128 bits, and the product does not fit in an `i64`: so both operands are taken as two
+ * 32-bit halves, the four products of those halves are computed (each of which does fit), and the middle column is summed
+ * separately because it is the one that carries into both output halves.
+ */
+function multiplyWide(a: number, b: number): number[] {
+  const mask = 0xffffffffn;
+  const half = (local: number, shift: bigint): number[] => [
+    ...localGet(local),
+    ...(shift === 0n ? [] : [...i64Const(shift), OP.i64ShrU]),
+    ...i64Const(mask),
+    OP.i64And,
+  ];
+  return [
+    // the four partial products: low*low, low*high, high*low, high*high
+    ...half(a, 0n), ...half(b, 0n), OP.i64Mul, ...localSet(DIV_REM),
+    ...half(a, 0n), ...half(b, 32n), OP.i64Mul, ...localSet(DIV_TAKE),
+    ...half(a, 32n), ...half(b, 0n), OP.i64Mul, ...localSet(DIV_CARRY),
+    ...half(a, 32n), ...half(b, 32n), OP.i64Mul, ...localSet(DIV_SIGN_Q),
+    // the middle column: what the low halves carry into the top half, which is where the product's high 64 bits come from
+    ...localGet(DIV_REM), ...i64Const(32n), OP.i64ShrU,
+    ...half(DIV_TAKE, 0n), OP.i64Add,
+    ...half(DIV_CARRY, 0n), OP.i64Add,
+    ...localSet(DIV_HI),
+    // the low half is the low dwords, plus the middle column slid up
+    ...half(DIV_REM, 0n),
+    ...localGet(DIV_HI), ...i64Const(32n), OP.i64Shl, OP.i64Or,
+    ...localSet(DIV_Q),
+    // and the high half is high*high plus the high dwords of the two mixed products plus the middle column's own carry
+    ...localGet(DIV_SIGN_Q),
+    ...localGet(DIV_TAKE), ...i64Const(32n), OP.i64ShrU, OP.i64Add,
+    ...localGet(DIV_CARRY), ...i64Const(32n), OP.i64ShrU, OP.i64Add,
+    ...localGet(DIV_HI), ...i64Const(32n), OP.i64ShrU, OP.i64Add,
+    ...localSet(DIV_SIGN_HI),
+  ];
+}
+
+/** `target = 0 - target` when `condition` holds a non-zero value, which is the wrapping negation an `i64` gives. */
+function negateIf(target: number, condition: number[]): number[] {
+  return [
+    ...condition, OP.i32WrapI64,
+    OP.ifEmpty, OP.emptyBlockType,
+    ...i64Const(0n), ...localGet(target), OP.i64Sub, ...localSet(target),
+    OP.end,
+  ];
+}
+
+/**
+ * Negate the 128-bit value in `hi:lo` when `condition` holds.
+ *
+ * Two's complement negation of a pair is not two negations: the low half borrows from the high half when it had anything in it, so
+ * the high half is `-hi - (lo == 0 ? 1 : 0)` and the low half is `-lo`.
+ */
+function negateWideIf(hi: number, lo: number, condition: number[]): number[] {
+  return [
+    ...condition, OP.i32WrapI64,
+    OP.ifEmpty,
+    OP.emptyBlockType,
+    // the high half is its complement plus the carry out of the low half, which is one exactly when the low half was zero
+    ...i64Const(0n), ...localGet(hi), OP.i64Sub, ...i64Const(1n), OP.i64Sub,
+    ...i64Const(1n), ...i64Const(0n), ...localGet(lo), OP.i64Eqz, OP.select,
+    OP.i64Add,
+    ...localSet(hi),
+    ...i64Const(0n), ...localGet(lo), OP.i64Sub, ...localSet(lo),
+    OP.end,
+  ];
+}
+
+/** A divide error, which the processor raises as a trap rather than as a wrong answer. */
+function trapUnless(condition: number[]): number[] {
+  return [...condition, OP.ifEmpty, OP.emptyBlockType, OP.unreachable, OP.end];
+}
+
+/**
+ * The unsigned 128-by-64 division the two divide instructions are built on: a bit at a time, 128 times.
+ *
+ * The processor answers with a quotient that fits in 64 bits and raises #DE otherwise, which is the check that the dividend's high
+ * half is smaller than the divisor. What is left is long division: shift the remainder up, bring in the dividend's next bit, and
+ * subtract the divisor when it fits. `take` is computed before the subtraction because it is also the quotient's next bit.
+ *
+ * The loop is unrolled because 128 is not a variable: a WASM loop would need labels inside whatever blocks the surrounding
+ * instruction sits in, and a translation that can nest incorrectly is worse than one that is long.
+ */
+function divideUnsigned(): number[] {
+  const code = trapUnless([...localGet(DIV_HI), ...localGet(DIV_DIVISOR), OP.i64GeU]);
+  code.push(...i64Const(0n), ...localSet(DIV_REM), ...i64Const(0n), ...localSet(DIV_Q));
+  for (let bit = 127; bit >= 0; bit -= 1) {
+    const from = bit >= 64 ? DIV_HI : DIV_LO;
+    code.push(
+      // the bit the shift drops is the one that makes the remainder exceed 64 bits, and the subtraction still works when it is set
+      ...localGet(DIV_REM), ...i64Const(63n), OP.i64ShrU, ...localSet(DIV_CARRY),
+      ...localGet(DIV_REM), ...i64Const(1n), OP.i64Shl,
+      ...localGet(from), ...i64Const(BigInt(bit % 64)), OP.i64ShrU, ...i64Const(1n), OP.i64And,
+      OP.i64Or, ...localSet(DIV_REM),
+      // `take` is a 0 or a 1: the comparison is widened, and the carry is already one because a shift of a 64-bit value by 63 is
+      ...localGet(DIV_REM), ...localGet(DIV_DIVISOR), OP.i64GeU, OP.i64ExtendI32U, ...localGet(DIV_CARRY), OP.i64Or,
+      ...localSet(DIV_TAKE),
+      // subtracting `divisor * take` is the trial subtraction: the divisor, or nothing at all
+      ...localGet(DIV_REM), ...localGet(DIV_DIVISOR), ...localGet(DIV_TAKE), OP.i64Mul, OP.i64Sub, ...localSet(DIV_REM),
+      ...localGet(DIV_Q), ...i64Const(1n), OP.i64Shl, ...localGet(DIV_TAKE), OP.i64Or, ...localSet(DIV_Q),
+    );
+  }
+  return code;
 }
 
 /** True for a register name that is one half of a vector register, as opposed to a general or byte register. */
@@ -1489,6 +1614,96 @@ function translateRange(
       index += 1;
       continue;
     }
+    if (instruction.op === "cwde" || instruction.op === "cdqe" || instruction.op === "cdq" || instruction.op === "cqo") {
+      /*
+       * The four instructions that widen a value's sign, which a division needs before it can read `%rdx:%rax` as one signed
+       * number. `cwde` and `cdqe` write `%rax` from its own low 32 bits, and `cdq` and `cqo` write `%rdx` as all ones or all
+       * zeroes from the sign of `%rax`.
+       */
+      const rax = REGISTERS.indexOf("rax");
+      if (instruction.op === "cwde" || instruction.op === "cdqe") {
+        // the low 32 bits shifted up and back down arithmetically, which is the sign extension itself
+        out.push(...globalGet(rax), ...i64Const(32n), OP.i64Shl, ...i64Const(32n), OP.i64ShrS, ...globalSet(rax));
+      } else {
+        const shift = instruction.op === "cqo" ? 63n : 31n;
+        out.push(...globalGet(rax), ...i64Const(shift), OP.i64ShrS, ...globalSet(REGISTERS.indexOf("rdx")));
+      }
+      index += 1;
+      continue;
+    }
+    if (instruction.op === "mul" || instruction.op === "imul1" || instruction.op === "div" || instruction.op === "idiv") {
+      /*
+       * The four instructions that read and write registers the encoding does not name. `%rax` is the accumulator and `%rdx` the
+       * high half of a product or the remainder, so the translation loads them into locals, does the arithmetic, and writes both
+       * back: nothing else in the instruction list can observe a half-written register file.
+       */
+      const [source] = instruction.operands;
+      if (source === undefined) throw new TranslateError(instruction.offset, `${instruction.op} needs an operand`);
+      if (source.kind === "reg" && source.bits !== 64) {
+        throw new TranslateError(
+          instruction.offset,
+          `a ${source.bits}-bit ${instruction.op} is not translated: its dividend would be %edx:%eax, which is not modelled`,
+        );
+      }
+      out.push(
+        ...(source.kind === "memory" ? loadFromMemory(source, 64, instruction) : read(source, instruction)),
+        ...localSet(DIV_DIVISOR),
+        ...globalGet(REGISTERS.indexOf("rax")), ...localSet(DIV_LO),
+        ...globalGet(REGISTERS.indexOf("rdx")), ...localSet(DIV_HI),
+      );
+      if (instruction.op === "mul") {
+        // `%rdx:%rax = %rax * source`, unsigned: the product is wider than either operand
+        out.push(
+          ...multiplyWide(DIV_LO, DIV_DIVISOR),
+          ...localGet(DIV_Q), ...globalSet(REGISTERS.indexOf("rax")),
+          ...localGet(DIV_SIGN_HI), ...globalSet(REGISTERS.indexOf("rdx")),
+        );
+      } else if (instruction.op === "imul1") {
+        // the same, on magnitudes, with the product negated when the operands' signs differed
+        out.push(
+          ...localGet(DIV_DIVISOR), ...i64Const(0n), OP.i64LtS, OP.i64ExtendI32U, ...localSet(DIV_FLAG),
+          ...localGet(DIV_LO), ...i64Const(0n), OP.i64LtS, OP.i64ExtendI32U, ...localSet(DIV_FLAG2),
+          ...negateIf(DIV_DIVISOR, [...localGet(DIV_FLAG)]),
+          ...negateIf(DIV_LO, [...localGet(DIV_FLAG2)]),
+          ...localGet(DIV_FLAG), ...localGet(DIV_FLAG2), OP.i64Xor, ...localSet(DIV_FLAG),
+          ...multiplyWide(DIV_LO, DIV_DIVISOR),
+          ...negateWideIf(DIV_SIGN_HI, DIV_Q, [...localGet(DIV_FLAG)]),
+          ...localGet(DIV_Q), ...globalSet(REGISTERS.indexOf("rax")),
+          ...localGet(DIV_SIGN_HI), ...globalSet(REGISTERS.indexOf("rdx")),
+        );
+      } else if (instruction.op === "div") {
+        // a zero divisor is #DE rather than a quotient, and the trap happens before anything is written
+        out.push(
+          ...trapUnless([...localGet(DIV_DIVISOR), OP.i64Eqz]),
+          ...divideUnsigned(),
+          ...localGet(DIV_Q), ...globalSet(REGISTERS.indexOf("rax")),
+          ...localGet(DIV_REM), ...globalSet(REGISTERS.indexOf("rdx")),
+        );
+      } else {
+        /*
+         * `idiv`: both operands are negated to magnitudes first, because the long division is unsigned. The dividend's sign is the
+         * top bit of `%rdx`, the quotient's is the two signs differing, and the remainder's is the dividend's own, since the
+         * processor rounds the quotient toward zero.
+         */
+        out.push(
+          ...trapUnless([...localGet(DIV_DIVISOR), OP.i64Eqz]),
+          ...localGet(DIV_DIVISOR), ...i64Const(0n), OP.i64LtS, OP.i64ExtendI32U, ...localSet(DIV_FLAG),
+          ...localGet(DIV_HI), ...i64Const(0n), OP.i64LtS, OP.i64ExtendI32U, ...localSet(DIV_FLAG2),
+          ...localGet(DIV_FLAG), ...localGet(DIV_FLAG2), OP.i64Xor, ...localSet(DIV_SIGN_Q),
+          ...negateIf(DIV_DIVISOR, [...localGet(DIV_FLAG)]),
+          ...negateWideIf(DIV_HI, DIV_LO, [...localGet(DIV_FLAG2)]),
+          ...divideUnsigned(),
+          ...negateIf(DIV_Q, [...localGet(DIV_SIGN_Q)]),
+          ...negateIf(DIV_REM, [...localGet(DIV_FLAG2)]),
+          ...localGet(DIV_Q), ...globalSet(REGISTERS.indexOf("rax")),
+          ...localGet(DIV_REM), ...globalSet(REGISTERS.indexOf("rdx")),
+        );
+      }
+      // `mul` and `imul` define the carry and overflow flags from the high half, and neither flag is computed here
+      flags.set = false;
+      index += 1;
+      continue;
+    }
     if (instruction.op === "movd" || instruction.op === "movq") {
       /*
        * The two directions of a vector move are different instructions: into a vector register the whole 128 bits are written,
@@ -1498,6 +1713,18 @@ function translateRange(
       const [destination, source] = instruction.operands;
       if (destination === undefined || source === undefined) {
         throw new TranslateError(instruction.offset, `${instruction.op} needs two operands`);
+      }
+      if (instruction.op === "movq" && destination.kind === "reg" && isVectorHalf(destination)) {
+        // into a vector register from memory or from another one: the upper half is cleared, as `movd` clears everything above
+        const value = source.kind === "memory" ? loadFromMemory(source, 64, instruction) : read(source, instruction);
+        out.push(
+          ...value,
+          ...write(destination, instruction),
+          ...i64Const(0n),
+          ...globalSet(slotOf(otherHalf(destination, instruction), instruction).local),
+        );
+        index += 1;
+        continue;
       }
       if (instruction.op === "movq") {
         if (destination.kind !== "memory" || source.kind !== "reg") {

@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 228
+**Tests:** 237
 
 ```bash
 npm ci && npm run verify
@@ -401,9 +401,28 @@ Four encodings are in the subset, and they are the ones a startup uses:
    destination's low half is written after its high half has been computed from it.
 4. `66 0f d6`, `movq` out to memory: the low 64 bits of a vector register.
 
-Where it stops now: `+0x32e` into `__libc_start_main`, on `0xf7 /7`, which is `idiv`. That is a division whose dividend is `%rdx:%rax`
-and whose quotient and remainder are `%rax` and `%rdx`: a 128-bit dividend, which is not expressible with one 64-bit value, so it is
-refused by name. It and `mul` are the next piece.
+`f3 0f 7e` is the load that mirrors it: `movq` into a vector register from memory or from another one, with the upper half cleared.
+The same two opcode bytes under `0x66` are the store, so the prefix is what decides which direction is meant.
+
+### The accumulator instructions
+
+`idiv`, `div`, `mul` and `imul` in their one-operand forms read and write registers the encoding does not name: `%rax` is the
+accumulator and `%rdx` is the high half of a product or the remainder, so `%rdx:%rax` is a 128-bit dividend or a 128-bit product.
+WASM has neither a widening multiply nor a 128-bit divide, so both are built out of 64-bit arithmetic:
+
+1. *The widening multiply* is the four partial products of the two 32-bit halves of each operand, with the middle column summed
+   out of both halves' carries, which is where the product's high 64 bits come from.
+2. *The division* is long division, a bit at a time, 128 times: shift the remainder up, bring in the dividend's next bit, and subtract
+   the divisor when it fits. The trial subtraction is `rem - divisor * take` rather than a pick between two remainders, because the
+   condition is an `i32` and the operands are `i64`, and multiplying by a 0 or a 1 is the same choice without a conversion.
+3. *The processor's `#DE`* is a trap here too: a zero divisor, and a quotient that would not fit in `%rax` (which is the check that
+   the dividend's high half is smaller than the divisor). `idiv` works on magnitudes, negates the quotient when the signs differed
+   and the remainder when the dividend was negative, since the processor rounds toward zero.
+4. *`cwde`, `cdqe`, `cdq` and `cqo`* now translate, because `cqo` is how a compiler makes `%rdx:%rax` one signed number before
+   dividing it. Both halves of the widening are a shift out and back: `%rdx` is `%rax` shifted down arithmetically by 63.
+
+Where it stops now: `+0x4b4` into `__libc_start_main`, on `0f 16`, which is `movhps`: a 64-bit load into the *upper* half of a vector
+register. The half is modelled, so that is a decoder and translation case rather than a new concept.
 
 The cost of the dispatcher is worth stating: a body with any backward branch takes that path, so even a clean loop is expressed by
 naming blocks rather than as a WASM `loop`. The structured path is kept for the bodies that are trees, which is most of the small

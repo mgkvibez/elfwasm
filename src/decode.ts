@@ -357,6 +357,8 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
   let segment: "fs" | "gs" | "cs" | "ss" | "ds" | "es" | undefined;
   // set by the 0x66 prefix in front of 0x0f, which is what makes the four vector encodings vector instructions
   let vector = false;
+  // set by 0xf3 instead, which turns `0f 7e` from `movd` into a vector register out to a general one into `movq` into a vector one
+  let mandatoryF3 = false;
 
   for (;;) {
     const next = bytes[cursor.index];
@@ -447,7 +449,24 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
       if (bytes[cursor.index - 1] !== 0xfa) throw new DecodeError(offset, "f3 0f 1e is not followed by fa: not endbr64");
       return { offset, length: 4, op: "endbr64", operands: [] };
     }
-    if (next === 0xf0 || next === 0xf2 || next === 0xf3) {
+    if (next === 0xf3) {
+      /*
+       * `0xf3 0f 7e` is `movq` into a vector register, the mirror of the `66 0f d6` store: a mandatory prefix rather than a repeat,
+       * and the same two opcode bytes mean a different instruction under `0x66`. Everything else the prefix could introduce is
+       * still refused, including the string instructions it really does repeat.
+       */
+      let afterPrefix = cursor.index + 1;
+      const maybeRex = bytes[afterPrefix] ?? 0;
+      if (maybeRex >= 0x40 && maybeRex <= 0x4f) afterPrefix += 1;
+      if (bytes[afterPrefix] === 0x0f && bytes[afterPrefix + 1] === 0x7e) {
+        cursor.index += 1;
+        vector = true;
+        mandatoryF3 = true;
+        continue;
+      }
+      throw new DecodeError(offset, "a lock or repeat prefix is not in the decoded subset");
+    }
+    if (next === 0xf0 || next === 0xf2) {
       throw new DecodeError(offset, "a lock or repeat prefix is not in the decoded subset");
     }
     if (next >= 0x40 && next <= 0x4f) {
@@ -541,6 +560,16 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
       return finish("movd", [
         vectorOperand(modrm.regField, rex.r, "lo", bits),
         modrm.rm.kind === "memory" ? { ...modrm.rm, bits } : modrm.rm,
+      ]);
+    }
+    if (mandatoryF3 && second === 0x7e) {
+      // `f3 0f 7e`: movq into a vector register from memory or from another vector register, and the upper half is cleared
+      const modrm = decodeModRm(cursor, rex, 64, segment);
+      return finish("movq", [
+        vectorOperand(modrm.regField, rex.r, "lo", 64),
+        modrm.rm.kind === "memory"
+          ? { ...modrm.rm, bits: 64 }
+          : vectorOperand(modrm.rmField ?? 0, rex.b, "lo", 64),
       ]);
     }
     if (vector && second === 0x7e) {
@@ -771,6 +800,15 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
     }
     if (modrm.regField === 2) return finish("not", [modrm.rm]);
     if (modrm.regField === 3) return finish("neg", [modrm.rm]);
+    /*
+     * The four accumulator instructions: `mul` and `imul` write `%rdx:%rax`, and `div` and `idiv` read it as their dividend and
+     * write the quotient to `%rax` and the remainder to `%rdx`. `imul` is named apart because the two-operand form already uses
+     * that name for a multiplication that writes one register.
+     */
+    if (modrm.regField === 4) return finish("mul", [modrm.rm]);
+    if (modrm.regField === 5) return finish("imul1", [modrm.rm]);
+    if (modrm.regField === 6) return finish("div", [modrm.rm]);
+    if (modrm.regField === 7) return finish("idiv", [modrm.rm]);
     throw new DecodeError(
       offset,
       `0xf7 /${modrm.regField} is mul, imul, div or idiv, which read and write implicit registers, and those are not in ` +

@@ -236,6 +236,9 @@ export const OP = {
   i64Shl: 0x86,
   i64ShrU: 0x88,
   i64ShrS: 0x87,
+  // a conditional pick that is not a branch: `select` takes two values and a condition, and there is no division trap in it
+  select: 0x1b,
+  i64Eqz: 0x50,
   i32WrapI64: 0xa7,
   i64ExtendI32U: 0xad,
   // a trap, which is what an address outside the image becomes: a wild read is worse than a stopped program
