@@ -292,7 +292,7 @@ describe("the extent a resolver is translated from", () => {
   it("refuses a resolver with no ret in reach, by name and with the limit it searched", () => {
     // mov $1, %rax and nothing else, padded so the decoder has bytes to walk
     const code = [0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, ...Array.from({ length: 32 }, () => 0x90)];
-    expect(() => resolve(code, 32)).toThrow(/has no ret in its first 32 bytes/);
+    expect(() => resolve(code, 32)).toThrow(/has no ret or hlt in its first 32 bytes/);
   });
 
   it("follows a jump out of the resolver's own bytes to the ret that ends the answer", () => {
@@ -383,6 +383,37 @@ describe("the extent a resolver is translated from", () => {
     ];
     expect(resolve(body(1))).toBe(7n);
     expect(resolve(body(0))).toBe(5n);
+  });
+
+  it("translates the entry point of a real static PIE, or names what inside libc stops it", () => {
+    /*
+     * `_start` in a static PIE is twelve instructions: `xor %ebp,%ebp`, `mov %rdx,%r9`, `pop %rsi`, `mov %rsp,%rdx`, `and
+     * $-16,%rsp`, two pushes, two zeroing xors, `lea main(%rip),%rdi`, the `addr32 call` into `__libc_start_main`, and `hlt`.
+     * They all translate now, so the frontier is inside libc rather than in the entry itself, and where inside depends on the
+     * machine's glibc; what is pinned is that a refusal is a named one carrying a location.
+     */
+    const directory = mkdtempSync(join(tmpdir(), "elfwasm-entry-"));
+    try {
+      const source = join(directory, "main.c");
+      const executable = join(directory, "pie");
+      writeFileSync(source, "int main(void) { return 7; }\n");
+      execFileSync("gcc", ["-static-pie", "-o", executable, source], { stdio: "ignore" });
+      const bytes = readFileSync(executable) as Uint8Array;
+      const loaded = loadResolved(bytes, { base: 0x400000n, stackPages: 8 });
+      const entry = BigInt(loaded.image.entryAddress) + loaded.image.baseAddress;
+      let refusal: unknown;
+      try {
+        translatedResolver({ bytes, image: loaded.image, memory: loaded.memory, stackPages: 8 })(entry);
+      } catch (error) {
+        refusal = error;
+      }
+      if (refusal !== undefined) {
+        expect(refusal).toBeInstanceOf(Error);
+        expect((refusal as Error).message).toMatch(/offset 0x[0-9a-f]+/);
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it("refuses an address that is not in an executable file-backed segment", () => {

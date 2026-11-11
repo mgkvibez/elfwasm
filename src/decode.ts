@@ -370,6 +370,32 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
       }
       throw new DecodeError(offset, "a 16-bit operand size prefix (0x66) is not in the decoded subset");
     }
+    if (next === 0x67) {
+      /*
+       * The 32-bit address-size prefix, which a static PIE carries in front of its `call` into `__libc_start_main`: `67 e8`.
+       * A call's displacement is not an address, so the prefix changes nothing about a call or a jump and is dropped there. A
+       * memory operand is the case it does change, and that is refused by name rather than reading a 64-bit address while the
+       * instruction asked for a 32-bit one.
+       */
+      const following = bytes[cursor.index + 1];
+      const shortJump = following === 0xe8 || following === 0xe9 || following === 0xeb;
+      const longJump = following === 0x0f && ((bytes[cursor.index + 2] ?? 0) & 0xf0) === 0x80;
+      if (shortJump || longJump) {
+        cursor.index += 1;
+        continue;
+      }
+      throw new DecodeError(
+        offset,
+        "the 32-bit address size prefix (0x67) is only in the decoded subset in front of a call or a jump, where it changes " +
+          "nothing: in front of a memory operand it asks for a 32-bit address",
+      );
+    }
+    if (next === 0xf4) {
+      // `hlt`, which ends the entry point after its call into `__libc_start_main`: a privileged instruction, so a machine that
+      // reaches it traps
+      cursor.index += 1;
+      return { offset, length: 1, op: "hlt", operands: [] };
+    }
     if (next === 0x2e || next === 0x36 || next === 0x3e || next === 0x26 || next === 0x64 || next === 0x65) {
       // cs, ss, ds, es, fs, gs in that order. The prefix is carried into the operand, not dropped: dropping `fs` would
       // turn a thread-local read into a read of the absolute address in the displacement
@@ -475,6 +501,10 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
     if (second === 0xaf) {
       const modrm = decodeModRm(cursor, rex, bits, segment);
       return finish("imul", [registerOperand(modrm.regField, rex.r, bits), modrm.rm]);
+    }
+    if (second === 0xa2) {
+      // `cpuid`: which CPU this is, and what it can do, answered into four fixed registers from the leaf in %eax
+      return finish("cpuid", []);
     }
     if (isSseOpcode(second)) {
       throw new DecodeError(

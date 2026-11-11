@@ -47,6 +47,36 @@ const asBytes = async (): Promise<Uint8Array> => {
 
 const operandsOf = (instruction: Instruction): readonly Operand[] => instruction.operands;
 
+describe("the two instructions an entry point ends with", () => {
+  it("reads hlt as its own instruction of one byte", () => {
+    const [instruction] = decode(hex("f4"));
+    expect(instruction?.op).toBe("hlt");
+    expect(instruction?.length).toBe(1);
+  });
+
+  it("reads cpuid, which a program uses to ask what the machine can do", () => {
+    const [instruction] = decode(hex("0f a2"));
+    expect(instruction?.op).toBe("cpuid");
+    expect(instruction?.length).toBe(2);
+  });
+});
+
+describe("the prefixes an entry point carries", () => {
+  it("reads the 32-bit address size prefix in front of a call as changing nothing about the call", () => {
+    // `67 e8 5f 12 00 00`: the addr32 call a static PIE makes into `__libc_start_main`. A call's displacement is not an
+    // address, so the prefix is dropped and the instruction is a five-byte displacement after a one-byte prefix.
+    const [instruction] = decode(hex("67 e8 5f 12 00 00"));
+    expect(instruction?.op).toBe("call");
+    expect(instruction?.length).toBe(6);
+    expect(instruction?.operands[0]).toEqual({ kind: "immediate", value: 0x125fn });
+  });
+
+  it("refuses the same prefix in front of a memory operand, which is the case it does change", () => {
+    // `67 f6 05 00 00 00 00 02`: an addr32 `testb $2, (%rip)`, whose address would be 32 bits wide rather than 64
+    expect(() => decode(hex("67 f6 05 00 00 00 00 02"))).toThrow(/32-bit address size prefix/);
+  });
+});
+
 describe("decoding assembler output", () => {
   it("finds every instruction at the offset objdump found it, and none in between", async () => {
     const instructions = decode(await asBytes());

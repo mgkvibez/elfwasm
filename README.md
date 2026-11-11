@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 214
+**Tests:** 221
 
 ```bash
 npm ci && npm run verify
@@ -362,8 +362,27 @@ number in a local, dispatched from a WASM `loop`: a branch sets the number and r
 the number names. Registers are globals and a comparison's operands are locals, so a block carries no state of its own and one
 copy of each block is enough. Dispatch is a linear scan of the block numbers, which is correct rather than fast.
 
-It does not *run* yet: nothing calls `main`. Everything below the entry point works on this binary, and the entry point is the
-frontier.
+It does not *run* yet: nothing calls `main`, and the entry point is the frontier.
+
+### The entry point
+
+`_start` in a static PIE is twelve instructions: `xor %ebp,%ebp`, `mov %rdx,%r9`, `pop %rsi`, `mov %rsp,%rdx`, `and $-16,%rsp`,
+two pushes, two zeroing xors, `lea main(%rip),%rdi`, the `addr32 call` into `__libc_start_main`, and `hlt`. Three of those needed
+something new, and none of them was arithmetic:
+
+1. *`67 e8`, the 32-bit address size prefix in front of a call.* A call's displacement is not an address, so the prefix changes
+   nothing about a call or a jump and is dropped there. Before a memory operand it is exactly the case it changes, and that is
+   refused by name rather than reading a 64-bit address while the instruction asked for a 32-bit one.
+2. *`hlt`, which ends an entry point the way `ret` ends a function.* It is decoded as its own instruction and translated to
+   `unreachable`, because in user mode it traps: that is the trap, and it also says the bytes after it are dead. The extent walk
+   stops at it, so an entry point needs no `ret` for its extent to be knowable.
+3. *`cpuid`, which a program uses to ask what the machine can do.* This machine's answer is zero for every leaf: no vendor is
+   reported and nothing beyond the base leaf is offered, so a program that asks takes the path for an x86-64 without any optional
+   feature. That is a real machine, and inventing feature bits would send a program down a path this translator cannot run.
+
+The twelve instructions all translate now, so the frontier is inside libc rather than in the entry itself. Translating the `call`
+means finding the callee's extent, and walking `__libc_start_main` stops at `+0x1dc` on a 16-bit operand size prefix: an
+instruction whose operand is 16 bits wide, which is the next piece.
 
 The cost of the dispatcher is worth stating: a body with any backward branch takes that path, so even a clean loop is expressed by
 naming blocks rather than as a WASM `loop`. The structured path is kept for the bodies that are trees, which is most of the small

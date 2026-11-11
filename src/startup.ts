@@ -88,7 +88,7 @@ function instructionsOf(
     if (decoded.has(cursor)) continue;
     if (cursor >= bound) {
       throw new ElfFormatError(
-        `a resolver at ${hex(address)} has no ret in its first ${limit} bytes, so where it ends is not knowable: without an ` +
+        `a resolver at ${hex(address)} has no ret or hlt in its first ${limit} bytes, so where it ends is not knowable: without an ` +
           "extent the translator would either stop inside it or run on into whatever follows",
       );
     }
@@ -103,7 +103,9 @@ function instructionsOf(
       );
     }
     decoded.set(cursor, instruction);
-    if (instruction.op === "ret") {
+    // a `ret` is where a function's answer is, and a `hlt` is where an entry point's is: both end a path, and neither has a
+    // successor, so the walk stops rather than reading whatever follows the function
+    if (instruction.op === "ret" || instruction.op === "hlt") {
       returned = true;
       continue;
     }

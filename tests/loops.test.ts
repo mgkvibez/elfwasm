@@ -112,3 +112,19 @@ describe("the 32-bit narrowing bug a loop found", () => {
     expect(run(hex("b9 ff ff ff ff 01 c8 c3"))).toBe(0xffffffffn);
   });
 });
+
+describe("an entry point", () => {
+  it("ends in hlt, which traps rather than returning a value", () => {
+    // `mov $7,%eax ; hlt`: %eax is written and then the machine traps, which is what `hlt` does in user mode
+    expect(() => run(hex("b8 07 00 00 00 f4"))).toThrow();
+  });
+
+  it("asks the machine what it can do and is told nothing optional", () => {
+    /*
+     * `cpuid` answers into four registers from the leaf in %eax, and this machine's answer is zero for every leaf: no vendor is
+     * reported and nothing beyond the base leaf is offered, which is a real x86-64 without the optional features. A leaf of 1 is
+     * requested here and %edx is copied out to show the answer is zero rather than whatever the request put in the register.
+     */
+    expect(run(hex("b8 01 00 00 00 0f a2 48 89 d0 c3"))).toBe(0n);
+  });
+});

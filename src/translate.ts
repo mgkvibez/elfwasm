@@ -1194,6 +1194,32 @@ function translateRange(
       flags.set = false;
       continue;
     }
+    if (instruction.op === "cpuid") {
+      /*
+       * `cpuid` asks what this machine can do, and this machine's answer is nothing optional: the leaf in `%eax` is a question
+       * about a CPU that does not exist here, so every answer is zero, which says "no vendor reported, no features beyond the
+       * base leaf". A program that asks takes the path for a machine without them, which is a real x86-64 and not a fiction
+       * about one. Answering with invented feature bits would send a program down a path this translator cannot run.
+       */
+      out.push(
+        ...i64Const(0n), ...globalSet(REGISTERS.indexOf("rax")),
+        ...i64Const(0n), ...globalSet(REGISTERS.indexOf("rbx")),
+        ...i64Const(0n), ...globalSet(REGISTERS.indexOf("rcx")),
+        ...i64Const(0n), ...globalSet(REGISTERS.indexOf("rdx")),
+      );
+      flags.set = false;
+      index += 1;
+      continue;
+    }
+    if (instruction.op === "hlt") {
+      /*
+       * `hlt` is privileged: in user mode it traps, and the bytes after it are the entry point's padding. `unreachable` is that
+       * trap, and it also says the rest of the path is dead rather than leaving a value on the stack that nothing asked for.
+       */
+      out.push(OP.unreachable);
+      index += 1;
+      continue;
+    }
     if (instruction.op === "nop" || instruction.op === "endbr64" || instruction.op === "prefetch") {
       // nothing observable: no register, no flag, and no memory is read even when the operand names an address, which is why a
       // nop inside a function whose image was not supplied still translates
