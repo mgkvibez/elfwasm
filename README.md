@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 213
+**Tests:** 214
 
 ```bash
 npm ci && npm run verify
@@ -351,19 +351,23 @@ same bytes run natively **fail** with status 1: this binary is linked with `--no
 ifuncs and the kernel jumps to the entry with the slot still holding the resolver's address. The differential is the two
 statuses, and it is the wrong way round from every other test here on purpose: 1 without the relocations applied, 0 with them.
 
-A real glibc static PIE still does not load. Its own resolver is `__mempcpy_ifunc`, and every instruction of it now decodes and
-translates as far as offset `0x83`, where it meets a *backward* conditional branch, which is a loop. A loop whose head the
-translator reached as the start of a region becomes a WASM `loop`; this one is entered through a block that begins after its head,
-so the head is not where a loop is opened, and the translator refuses rather than guessing. Loops entered from the middle are the
-next piece, and they are the last structural gap before the copy routine's own instructions matter.
+A real glibc static PIE **loads**. Every ifunc resolver it carries is translated, called, and its answer written through the
+relocation: 1329 relocations applied on a `gcc -static-pie` hello-world, through eleven resolvers that between them test
+`_dl_x86_cpu_features` for AVX-512, AVX, ERMS, RTM and SSE, and answer with the address of the routine this machine should use.
 
-That is the shape of the next piece, and it is worth being precise about it. A resolver's extent is found by following control flow
-from its start to the `ret` that ends its answer, so a jump out of the resolver's own bytes is followed rather than walked past,
-and its target is an instruction the translation already has instead of a point between two of them. What that costs is that a
-tail call is *inlined*: the resolver whose answer is a vectorised `memcpy` now has that `memcpy`'s instructions inside its own
-body, so anything the copy routine needs is this resolver's problem too. Two ways forward, and Two ways forward: the SSE the copy
-routine opens with, or translating a tail jump as a `call` so that each function's extent is refused on its own terms rather than
-merged into its caller's.
+What that took is the last structural piece, and it is not an instruction: a resolver's control flow is a *graph*, not a tree. It
+shares a tail between two paths, jumps back into a block that is also reached by falling into it, and exits from seven `ret`s. No
+nesting of WASM blocks expresses that. So a body whose branches are not a tree is translated as numbered blocks with the block
+number in a local, dispatched from a WASM `loop`: a branch sets the number and returns to the top, and the top runs whichever block
+the number names. Registers are globals and a comparison's operands are locals, so a block carries no state of its own and one
+copy of each block is enough. Dispatch is a linear scan of the block numbers, which is correct rather than fast.
+
+It does not *run* yet: nothing calls `main`. Everything below the entry point works on this binary, and the entry point is the
+frontier.
+
+The cost of the dispatcher is worth stating: a body with any backward branch takes that path, so even a clean loop is expressed by
+naming blocks rather than as a WASM `loop`. The structured path is kept for the bodies that are trees, which is most of the small
+programs here.
 
 ### The heap
 

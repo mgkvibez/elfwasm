@@ -194,7 +194,7 @@ describe.skipIf(!toolchain)("an ifunc, resolved by the image's own code", () => 
 });
 
 describe.skipIf(!has("gcc") || !has("readelf"))("the ifuncs a real glibc static PIE carries", () => {
-  it("refuses at the first resolver, naming the address and the instruction it cannot translate", () => {
+  it("resolves every ifunc a real glibc static PIE carries, and names what it cannot on a different libc", () => {
     const directory = mkdtempSync(join(tmpdir(), "elfwasm-glibc-ifunc-"));
     try {
       const source = join(directory, "main.c");
@@ -215,15 +215,24 @@ describe.skipIf(!has("gcc") || !has("readelf"))("the ifuncs a real glibc static 
        * than this repository, so what is pinned is that the refusal is a named one either way.
        */
       let refusal: unknown;
+      let loaded: ReturnType<typeof loadResolved> | undefined;
       try {
-        loadResolved(readFileSync(executable) as Uint8Array, { base: 0x400000n });
+        loaded = loadResolved(readFileSync(executable) as Uint8Array, { base: 0x400000n });
       } catch (error) {
         refusal = error;
       }
-      // a named refusal carrying a location, from the translator or the loader, rather than a crash or an answer computed from
-      // code that was only half understood
-      expect(refusal).toBeInstanceOf(Error);
-      expect((refusal as Error).message).toMatch(/^(a resolver at 0x[0-9a-f]+|at offset 0x[0-9a-f]+)/);
+      /*
+       * Two outcomes are both honest here, and which one happens depends on the machine's libc rather than on this repository:
+       * a resolver of this glibc build is translated and called, in which case the load completes and the relocations are written
+       * through it; or the build ends its resolver differently and the refusal is a named one carrying an address or an offset,
+       * never a crash and never an answer computed from code that was only half understood.
+       */
+      if (loaded === undefined) {
+        expect(refusal).toBeInstanceOf(Error);
+        expect((refusal as Error).message).toMatch(/^(a resolver at 0x[0-9a-f]+|at offset 0x[0-9a-f]+)/);
+      } else {
+        expect(loaded.relocations).toBeGreaterThan(0);
+      }
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

@@ -54,7 +54,14 @@ const CMP_B = 1;
  * loaded, and an address check that wrote `CMP_A` there would silently compare the address against the value.
  */
 const ADDR = 2;
-const LOCAL_COUNT = 3;
+/**
+ * Where the block a body is executing is recorded, for a body whose control flow is not a tree.
+ *
+ * Registers are globals and a comparison's operands are locals, so a block of instructions that begins anywhere needs no state of
+ * its own beyond which block to run next. This local is that.
+ */
+const PC = 3;
+const LOCAL_COUNT = 4;
 
 /** The imported syscall's function index, which is 0: an import comes before every function the module defines. */
 const SYSCALL_INDEX = 0;
@@ -1586,6 +1593,108 @@ function functionExtent(bytes: Uint8Array, address: bigint): readonly Instructio
   return ordered;
 }
 
+/** True when a branch in the list goes to itself or backwards, which no nesting of blocks can express. */
+function needsDispatcher(instructions: readonly Instruction[]): boolean {
+  return instructions.some((instruction, index) => {
+    if (!instruction.op.startsWith("j")) return false;
+    const target = indexOfOffset(instructions, branchTarget(instruction));
+    return target >= 0 && target <= index;
+  });
+}
+
+/**
+ * Where each block of straight-line code starts: the body's first instruction, every branch target, and the instruction after a
+ * branch or a `ret`, since control can arrive there without the bytes before it having run.
+ */
+function blockStarts(instructions: readonly Instruction[]): number[] {
+  const starts = new Set<number>([0]);
+  for (const [index, instruction] of instructions.entries()) {
+    if (instruction.op === "ret") {
+      starts.add(index + 1);
+      continue;
+    }
+    if (!instruction.op.startsWith("j")) continue;
+    const target = indexOfOffset(instructions, branchTarget(instruction));
+    if (target >= 0) starts.add(target);
+    starts.add(index + 1);
+  }
+  return [...starts].filter((index) => index < instructions.length).sort((lower, higher) => lower - higher);
+}
+
+/**
+ * Translates a body whose control flow is a graph rather than a tree, by naming its blocks and running whichever block a branch
+ * chose.
+ *
+ * A compiled resolver is the reason this exists: it shares a tail between two paths, jumps back into a block that is also
+ * reached by falling into it, and does both inside the same function. WASM cannot jump into the middle of a block, so the graph is
+ * flattened: each block is guarded by a comparison against the block number kept in a local, and a branch sets that local and
+ * returns to the top. Registers are globals and a comparison's operands are locals, so a block carries no state of its own.
+ */
+function translateAsBlocks(instructions: readonly Instruction[], options: TranslateOptions): number[] {
+  const starts = blockStarts(instructions);
+  const numbers = new Map<number, number>(starts.map((start, number) => [start, number]));
+  const blockAt = (index: number): number => {
+    const number = numbers.get(index);
+    if (number === undefined) {
+      throw new TranslateError(
+        instructions[Math.min(index, instructions.length - 1)]?.offset ?? 0,
+        "a branch lands between blocks, which is not where an instruction starts",
+      );
+    }
+    return number;
+  };
+  const out: number[] = [];
+  out.push(...i64Const(0n), ...localSet(PC), OP.loop, OP.emptyBlockType);
+  for (const [number, start] of starts.entries()) {
+    const end = number + 1 < starts.length ? starts[number + 1]! : instructions.length;
+    out.push(...localGet(PC), ...i64Const(BigInt(number)), OP.i64Eq, OP.ifEmpty, OP.emptyBlockType);
+    const terminal = end - 1;
+    const last = instructions[terminal]!;
+    const flags: Flags = { set: false, width: 64 };
+    // everything before the block's last instruction is straight-line code, and the empty scope is what says so
+    translateRange(instructions, start, terminal, new Map(), out, flags, new Map(), options);
+    if (last.op === "ret") {
+      out.push(...globalGet(REGISTERS.indexOf("rax")), OP.returnOp);
+    } else if (last.op === "jmp") {
+      out.push(...i64Const(BigInt(blockAt(indexOfOffset(instructions, branchTarget(last))))), ...localSet(PC));
+    } else if (last.op.startsWith("j")) {
+      const suffix = last.op.slice(1);
+      if (suffix === "o" || suffix === "no" || suffix === "p" || suffix === "np") {
+        throw new TranslateError(last.offset, `j${suffix} reads the overflow or parity flag, which this does not compute`);
+      }
+      if (!flags.set) {
+        throw new TranslateError(last.offset, `${last.op} needs a cmp or test that every path reaching it goes through`);
+      }
+      const taken = blockAt(indexOfOffset(instructions, branchTarget(last)));
+      if (end >= instructions.length) {
+        throw new TranslateError(last.offset, `${last.op} falls off the end of the function, which has no value to return`);
+      }
+      out.push(
+        ...conditionCode(suffix, flags.width),
+        OP.ifEmpty,
+        OP.emptyBlockType,
+        ...i64Const(BigInt(taken)),
+        ...localSet(PC),
+        OP.elseOp,
+        ...i64Const(BigInt(blockAt(end))),
+        ...localSet(PC),
+        OP.end,
+      );
+    } else {
+      // the block ends because a branch somewhere else lands on the next instruction, so this one runs and the next is chosen
+      translateRange(instructions, terminal, end, new Map(), out, flags, new Map(), options);
+      if (end >= instructions.length) {
+        throw new TranslateError(last.offset, "the last block runs off the end of the function, which has no value to return");
+      }
+      out.push(...i64Const(BigInt(blockAt(end))), ...localSet(PC));
+    }
+    out.push(OP.end);
+  }
+  // the dispatch loop is only left by a `return`, so what follows it is unreachable and says so
+  out.push(OP.br, ...unsigned(0), OP.end, OP.unreachable);
+  return out;
+}
+
 /**
  * Translates one function's instructions into a WASM body.
  *
@@ -1616,6 +1725,11 @@ function bodyOf(
       );
     }
 
+  }
+  if (needsDispatcher(resolved)) {
+    // a graph rather than a tree: blocks and a block number, not nesting. That body ends in `unreachable`, so it is complete.
+    body.push(...translateAsBlocks(resolved, options));
+    return body;
   }
   translateRange(resolved, 0, resolved.length, new Map(), body, flags, loops, options);
   /*

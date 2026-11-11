@@ -75,10 +75,20 @@ describe("a counted loop", () => {
 });
 
 describe("what a loop refuses", () => {
-  it("refuses a jump into the middle of a loop from outside it, which no nesting expresses", () => {
-    // cmp $1,%eax ; jne +0 (forward, no join) ; jmp -3 : a backward jmp with no loop head before it
+  it("expresses a jump into the middle of a loop, by naming blocks rather than nesting them", () => {
+    /*
+     * `cmp $1,%eax; jne +0; jmp -2; ret`: a `jmp` back into the middle of the bytes above it, which no nesting of blocks can
+     * express, and which used to be refused. It is translated as a block number now, and the jump this program takes is the one
+     * back to itself, so it is only translated here and never run: an unbounded loop is a program that does not stop, and the
+     * point of the assertion is that the translator no longer has an opinion about that.
+     */
     const program = hex("83 f8 01 75 00 eb fe c3");
-    expect(refuse(program).message).toContain("backward jmp needs a loop");
+    expect(translateBytes(program).length).toBeGreaterThan(0);
+  });
+
+  it("runs a loop, with the branch taken back to the block that counts", () => {
+    // mov $0,%eax ; add $1,%eax ; cmp $3,%eax ; jne -8 ; ret, which counts to three and answers 3
+    expect(run(hex("b8 00 00 00 00 83 c0 01 83 f8 03 75 f8 c3"))).toBe(3n);
   });
 
   it("refuses a branch whose target is not an instruction boundary at all", () => {
