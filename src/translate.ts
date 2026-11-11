@@ -1221,7 +1221,7 @@ function translateRange(
         );
       }
       if (!flags.set) {
-        throw new TranslateError(instruction.offset, `${instruction.op} needs a cmp or test before it in the same block`);
+        throw new TranslateError(instruction.offset, `${instruction.op} needs a cmp or test that every path reaching it goes through`);
       }
       const target = indexOfOffset(instructions, branchTarget(instruction));
       const condition = conditionCode(suffix, flags.width);
@@ -1253,12 +1253,23 @@ function translateRange(
          */
         const shared: Scope = new Map([...scope].map(([key, value]) => [key, value + 1] as const));
         shared.set(join.join, 0);
+        /*
+         * Both arms inherit the flags as they stand at the branch, because a `jcc` does not change them: a comparison made
+         * before the branch is still there to be read in either arm. What the join then holds depends on what each arm did, so
+         * each arm reports its own state and the flags survive the join only if they survived both. That is what a conditional
+         * move after an if/else needs, and it is a fact about the paths rather than about the instruction alone.
+         */
+        const entered: Flags = { set: flags.set, width: flags.width };
+        const then: Flags = { ...entered };
         out.push(...condition, OP.ifEmpty, OP.emptyBlockType);
-        translateRange(instructions, target, join.join, new Map(shared), out, { set: false, width: 64 }, loops, options);
+        translateRange(instructions, target, join.join, new Map(shared), out, then, loops, options);
         out.push(OP.elseOp);
-        translateRange(instructions, index + 1, join.jmp, new Map(shared), out, { set: false, width: 64 }, loops, options);
+        const otherwise: Flags = { ...entered };
+        translateRange(instructions, index + 1, join.jmp, new Map(shared), out, otherwise, loops, options);
         out.push(OP.end);
-        flags.set = false;
+        // two arms that compared at different widths leave the join with an answer only one of them can read
+        flags.set = then.set && otherwise.set && then.width === otherwise.width;
+        flags.width = then.width;
         index = join.join;
         continue;
       }
@@ -1291,7 +1302,7 @@ function translateRange(
         );
       }
       if (!flags.set) {
-        throw new TranslateError(instruction.offset, `${instruction.op} needs a cmp or test before it in the same block`);
+        throw new TranslateError(instruction.offset, `${instruction.op} needs a cmp or test that every path reaching it goes through`);
       }
       out.push(
         ...conditionCode(suffix, flags.width),
@@ -1310,8 +1321,7 @@ function translateRange(
           ? translatePush(instruction, options)
           : translatePop(instruction, options)),
       );
-      // a push or pop touches memory, so a condition set before it cannot be trusted after it
-      flags.set = false;
+      // `push` and `pop` move memory and touch no flag, so a condition set before one is still readable after it
       index += 1;
       continue;
     }
@@ -1349,8 +1359,8 @@ function translateRange(
       continue;
     }
     if (instruction.op === "leave") {
+      // `leave` moves two registers and no flags
       out.push(...translateLeave(instruction, options));
-      flags.set = false;
       index += 1;
       continue;
     }
@@ -1389,8 +1399,8 @@ function translateRange(
       if (source.kind !== "memory" || source.addressCode === undefined) {
         throw new TranslateError(instruction.offset, "lea needs a memory operand and a resolved address");
       }
+      // `lea` computes an address and writes a register, and the flags it finds are the flags it leaves
       out.push(...source.addressCode, ...write(destination, instruction));
-      flags.set = false;
       index += 1;
       continue;
     }

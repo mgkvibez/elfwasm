@@ -70,6 +70,30 @@ target:
     cmp $0x77, %rax
     jne wrong
 
+    # the flags survive a branch: a comparison made before an if/else is still there after the join, which is what a resolver
+    # does when it compares an address and picks a routine on each side
+    mov $0, %rcx
+    mov $1, %rax
+    mov $0xaa, %rbx
+    cmp $2, %rax              # not equal, so the zero flag is clear going into the branch
+    je other
+    mov $0x11, %rdx
+    jmp after
+other:
+    mov $0x22, %rdx
+after:
+    cmovne %rbx, %rcx         # the comparison from before the branch, still readable: %rcx becomes 0xaa
+    cmp $0xaa, %rcx
+    jne wrong
+
+    mov $0, %rcx
+    mov $0x55, %rbx
+    mov $4, %rax
+    cmp $4, %rax
+    cmove %rbx, %rcx          # equal, so %rcx becomes 0x55
+    cmp $0x55, %rcx
+    jne wrong
+
     mov $7, %rax
     ret
 wrong:

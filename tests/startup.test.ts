@@ -258,12 +258,14 @@ describe("the extent a resolver is translated from", () => {
 
   const resolve = (code: number[], limit?: number): bigint => {
     const bytes = Uint8Array.from(code);
-    const memory = new runtime.Memory({ initial: 1 });
+    // two pages: the image, and the page the stack sits above it
+    const memory = new runtime.Memory({ initial: 2 });
     new Uint8Array(memory.buffer).set(bytes, 0);
     return translatedResolver({
       bytes,
       image: imageOf(bytes.length),
       memory: memory as unknown as { readonly buffer: ArrayBuffer },
+      stackPages: 1,
       ...(limit === undefined ? {} : { limit }),
     })(0x400000n);
   };
@@ -304,6 +306,35 @@ describe("the extent a resolver is translated from", () => {
   it("translates a nop and a prefetch as nothing at all, memory operand or not", () => {
     // `nop (%rax); prefetch (%rax); mov $5, %eax; ret`: padding must not need the image mapped, because it reads no memory
     expect(resolve([0x0f, 0x1f, 0x00, 0x0f, 0x18, 0x08, 0xb8, 0x05, 0x00, 0x00, 0x00, 0xc3])).toBe(5n);
+  });
+
+  it("keeps a comparison readable across a lea, which computes an address and writes no flag", () => {
+    /*
+     * `mov $4,%eax; cmp $4,%eax; lea 4(%rax),%rdx; cmove %rbx,%rax; ret`. glibc's own ifunc resolvers are this shape: a test,
+     * two `lea`s that pick the two candidate routines, and a conditional move between them. Treating `lea` as though it clobbered
+     * the flags is what stopped translation of the real one at its first `cmovne`.
+     */
+    expect(resolve([
+      0xb8, 0x04, 0x00, 0x00, 0x00,
+      0x48, 0xc7, 0xc3, 0x55, 0x00, 0x00, 0x00,
+      0x83, 0xf8, 0x04,
+      0x48, 0x8d, 0x50, 0x04,
+      0x48, 0x0f, 0x44, 0xc3,
+      0xc3,
+    ])).toBe(0x55n);
+  });
+
+  it("keeps a comparison readable across a push and a pop, which move memory and no flag", () => {
+    // `mov $0x55,%rbx; mov $9,%eax; cmp $9,%eax; push %rax; pop %rax; cmove %rbx,%rax; ret`
+    expect(resolve([
+      0x48, 0xc7, 0xc3, 0x55, 0x00, 0x00, 0x00,
+      0xb8, 0x09, 0x00, 0x00, 0x00,
+      0x83, 0xf8, 0x09,
+      0x50,
+      0x58,
+      0x48, 0x0f, 0x44, 0xc3,
+      0xc3,
+    ])).toBe(0x55n);
   });
 
   it("refuses an address that is not in an executable file-backed segment", () => {

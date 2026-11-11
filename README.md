@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 209
+**Tests:** 211
 
 ```bash
 npm ci && npm run verify
@@ -289,6 +289,14 @@ decode and both translate to nothing at all: no register, no flag, and no memory
 which is why a nop is translated by a function whose image was never supplied. The linker's own padding spells the nop with a
 `0x66` prefix and was handled earlier; the bare form is what a compiler emits.
 
+A condition is machine state, not a property of one straight-line run. `cmp` and `test` store their two operands in locals, and
+every flag-writing instruction stores the pair `cmp` would have stored, so a condition stays readable as far as the program is
+concerned for as long as nothing overwrites it. Three consequences, and each one was a refusal before it was a rule. `lea`
+computes an address and writes no flag, and neither do `push` and `pop`, so none of them hides a comparison made before them.
+Both arms of an if/else enter with the flags as the branch left them, because a `jcc` changes no flag, and the join afterwards
+holds them only if the two arms end holding the same width. `cmov` reads them from wherever they were written, which is what one
+sits between a comparison and a branch for.
+
 A conditional move, `0x0f 0x40` to `0x0f 0x4f`, is the other instruction a resolver reaches once it has compared: the
 destination keeps its value unless the condition holds, in which case the source is written into it. It is translated as an `if`
 around a write rather than as a branch around a `mov`, because it leaves the flags exactly as it found them, which is the whole
@@ -343,10 +351,10 @@ same bytes run natively **fail** with status 1: this binary is linked with `--no
 ifuncs and the kernel jumps to the entry with the slot still holding the resolver's address. The differential is the two
 statuses, and it is the wrong way round from every other test here on purpose: 1 without the relocations applied, 0 with them.
 
-A real glibc static PIE still does not load. Its own resolver is `__mempcpy_ifunc`, and every instruction of it now *decodes*,
-including the ones inside the copy routine it tail-calls. Translation stops at offset `0x43`, on a `cmovne` whose comparison was
-made in another block: the flags a conditional move reads are tracked per block, and a value that survives a branch is not
-modelled yet. That is the next piece, and it is a dataflow question rather than another opcode.
+A real glibc static PIE still does not load. Its own resolver is `__mempcpy_ifunc`, and every instruction of it now decodes and
+translates as far as offset `0x60`, where it meets a `test` against a *memory* operand: `testb $0x2, (%rip)`, a byte test against
+a feature flag in the image. A byte test with a register destination is translated; a byte test whose destination is memory is not,
+and that is the next piece.
 
 That is the shape of the next piece, and it is worth being precise about it. A resolver's extent is found by following control flow
 from its start to the `ret` that ends its answer, so a jump out of the resolver's own bytes is followed rather than walked past,
