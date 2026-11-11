@@ -1170,7 +1170,9 @@ function translateRange(
       flags.set = false;
       continue;
     }
-    if (instruction.op === "nop" || instruction.op === "endbr64") {
+    if (instruction.op === "nop" || instruction.op === "endbr64" || instruction.op === "prefetch") {
+      // nothing observable: no register, no flag, and no memory is read even when the operand names an address, which is why a
+      // nop inside a function whose image was not supplied still translates
       index += 1;
       continue;
     }

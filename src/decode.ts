@@ -446,6 +446,27 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
       }
       return finish(second === 0xb7 ? "movzx" : "movsx", [registerOperand(modrm.regField, rex.r, bits), modrm.rm]);
     }
+    if (second === 0x1f) {
+      // the multi-byte nop. The linker's alignment padding spells it with a 0x66 prefix and is handled above; a compiler emits
+      // the bare form between functions, and it takes a ModRM whose only defined register field is /0
+      const modrm = decodeModRm(cursor, rex, 32, segment);
+      if (modrm.regField !== 0) {
+        throw new DecodeError(offset, `0x0f 0x1f with /${modrm.regField} is not an encoding: the multi-byte nop is /0 only`);
+      }
+      return finish("nop", [modrm.rm]);
+    }
+    if (second === 0x18) {
+      // prefetch hints, /0 to /3 for the four caches. The operand is an address to read into a cache and nothing else: no
+      // register and no flag is written, so the translation of one is to do nothing at all
+      const modrm = decodeModRm(cursor, rex, 8, segment);
+      if (modrm.regField > 3) {
+        throw new DecodeError(offset, `0x0f 0x18 with /${modrm.regField} is not an encoding: prefetch is /0 to /3`);
+      }
+      if (modrm.rm.kind === "reg") {
+        throw new DecodeError(offset, "0x0f 0x18 takes a memory operand, and a register here is not an encoding");
+      }
+      return finish("prefetch", [modrm.rm]);
+    }
     if (second >= 0x40 && second <= 0x4f) {
       // a conditional move: the register in the modrm field is written only if the condition holds, and the flags are left alone
       const modrm = decodeModRm(cursor, rex, bits, segment);

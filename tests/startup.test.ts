@@ -301,6 +301,11 @@ describe("the extent a resolver is translated from", () => {
     ])).toBe(7n);
   });
 
+  it("translates a nop and a prefetch as nothing at all, memory operand or not", () => {
+    // `nop (%rax); prefetch (%rax); mov $5, %eax; ret`: padding must not need the image mapped, because it reads no memory
+    expect(resolve([0x0f, 0x1f, 0x00, 0x0f, 0x18, 0x08, 0xb8, 0x05, 0x00, 0x00, 0x00, 0xc3])).toBe(5n);
+  });
+
   it("refuses an address that is not in an executable file-backed segment", () => {
     const bytes = Uint8Array.from([0xc3]);
     const memory = new runtime.Memory({ initial: 1 });

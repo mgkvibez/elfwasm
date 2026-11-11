@@ -360,3 +360,21 @@ describe("a conditional move", () => {
     expect(fromMemory.operands[1]).toMatchObject({ kind: "memory", bits: 32 });
   });
 });
+
+describe("the padding instructions", () => {
+  it("decodes the bare multi-byte nop and refuses a register field other than zero", () => {
+    // 0f 1f 00 is `nop (%rax)`, the form a compiler emits for alignment without the linker's 0x66 prefix
+    const nop = decode(hex("0f 1f 00"))[0]!;
+    expect(nop.op).toBe("nop");
+    expect(nop.operands[0]).toMatchObject({ kind: "memory" });
+    expect(() => decode(hex("0f 1f c8"))).toThrow(/0x0f 0x1f with \/1 is not an encoding/);
+  });
+
+  it("decodes the prefetch hints as an address and nothing else", () => {
+    const prefetch = decode(hex("0f 18 08"))[0]!;
+    expect(prefetch.op).toBe("prefetch");
+    expect(prefetch.operands[0]).toMatchObject({ kind: "memory" });
+    expect(() => decode(hex("0f 18 c8"))).toThrow(/takes a memory operand/);
+    expect(() => decode(hex("0f 18 c0"))).toThrow(/takes a memory operand/);
+  });
+});

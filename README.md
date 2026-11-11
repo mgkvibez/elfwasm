@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 206
+**Tests:** 209
 
 ```bash
 npm ci && npm run verify
@@ -283,6 +283,12 @@ An 8-bit comparison is evaluated at 64 bits on sign-extended bytes. Without that
 than as -128 and every signed branch after a byte comparison goes the wrong way. `cmp %dh, %dl` followed by `jl` reads bit 7 of
 a byte, and it has to mean that.
 
+The multi-byte nop, `0x0f 0x1f`, is the alignment padding a compiler emits between functions, and it takes a ModRM whose only
+defined register field is `/0`; the four `0x0f 0x18` prefetch hints are addresses to read into a cache and nothing else. Both
+decode and both translate to nothing at all: no register, no flag, and no memory read even when the operand names an address,
+which is why a nop is translated by a function whose image was never supplied. The linker's own padding spells the nop with a
+`0x66` prefix and was handled earlier; the bare form is what a compiler emits.
+
 A conditional move, `0x0f 0x40` to `0x0f 0x4f`, is the other instruction a resolver reaches once it has compared: the
 destination keeps its value unless the condition holds, in which case the source is written into it. It is translated as an `if`
 around a write rather than as a branch around a `mov`, because it leaves the flags exactly as it found them, which is the whole
@@ -337,17 +343,18 @@ same bytes run natively **fail** with status 1: this binary is linked with `--no
 ifuncs and the kernel jumps to the entry with the slot still holding the resolver's address. The differential is the two
 statuses, and it is the wrong way round from every other test here on purpose: 1 without the relocations applied, 0 with them.
 
-A real glibc static PIE still does not load. Its own resolver is `__mempcpy_ifunc`, and it now gets through its byte tests, its
-byte comparisons and its conditional moves, past the jump it ends with, and refuses on the first instruction of the *function it
-jumps into* that the subset does not have: the multi-byte nop at `0x420559`, `0x0f 0x1f`.
+A real glibc static PIE still does not load. Its own resolver is `__mempcpy_ifunc`, and every instruction of it now *decodes*,
+including the ones inside the copy routine it tail-calls. Translation stops at offset `0x43`, on a `cmovne` whose comparison was
+made in another block: the flags a conditional move reads are tracked per block, and a value that survives a branch is not
+modelled yet. That is the next piece, and it is a dataflow question rather than another opcode.
 
 That is the shape of the next piece, and it is worth being precise about it. A resolver's extent is found by following control flow
 from its start to the `ret` that ends its answer, so a jump out of the resolver's own bytes is followed rather than walked past,
 and its target is an instruction the translation already has instead of a point between two of them. What that costs is that a
 tail call is *inlined*: the resolver whose answer is a vectorised `memcpy` now has that `memcpy`'s instructions inside its own
-body, so anything the copy routine needs is this resolver's problem too. Two ways forward, and the smaller one first: two-byte
-`0x0f 0x1f` nops and the SSE the copy routine opens with, or translating a tail jump as a `call` so that each function's extent
-is refused on its own terms rather than merged into its caller's.
+body, so anything the copy routine needs is this resolver's problem too. Two ways forward, and Two ways forward: the SSE the copy
+routine opens with, or translating a tail jump as a `call` so that each function's extent is refused on its own terms rather than
+merged into its caller's.
 
 ### The heap
 
