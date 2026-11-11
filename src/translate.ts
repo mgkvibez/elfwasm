@@ -923,6 +923,32 @@ function translateBinary(instruction: Instruction): number[] {
 }
 
 /** `cmp` keeps both operands; `test` keeps the mask, so every condition is one comparison against the other local. */
+/**
+ * A conditional move: the destination keeps its value unless the condition holds, in which case the source is written into it.
+ *
+ * The flags are not touched, which is the point of the instruction and the reason it cannot be translated as a branch around a
+ * `mov`: a `cmov` sits between a comparison and the branch that uses the same flags.
+ */
+function translateConditionalMove(instruction: Instruction): number[] {
+  const [destination, source] = instruction.operands;
+  if (destination === undefined || source === undefined) {
+    throw new TranslateError(instruction.offset, "a conditional move needs a destination and a source");
+  }
+  if (destination.kind !== "reg") {
+    throw new TranslateError(instruction.offset, "a conditional move writes a register, and x86 has no memory destination for it");
+  }
+  const width: 32 | 64 = destination.bits === 32 ? 32 : 64;
+  const value =
+    source.kind === "memory"
+      ? loadFromMemory(source, width, instruction)
+      : width === 32
+        ? [...read(source, instruction), NARROW_32]
+        : read(source, instruction);
+  // a 32-bit write clears the upper half of the register, so the value arrives in the local zero-extended
+  const widened = width === 32 ? [...value, OP.i64ExtendI32U] : value;
+  return [...widened, ...write(destination, instruction)];
+}
+
 function translateFlags(instruction: Instruction): { code: number[]; width: 32 | 64 } {
   const [destination, source] = instruction.operands;
   if (destination === undefined || source === undefined) {
@@ -1251,6 +1277,28 @@ function translateRange(
       out.push(...translated.code);
       flags.set = true;
       flags.width = translated.width;
+      index += 1;
+      continue;
+    }
+    if (instruction.op.startsWith("cmov")) {
+      const suffix = instruction.op.slice(4);
+      if (suffix === "o" || suffix === "no" || suffix === "p" || suffix === "np") {
+        throw new TranslateError(
+          instruction.offset,
+          `cmov${suffix} reads the overflow or parity flag, which this does not compute`,
+        );
+      }
+      if (!flags.set) {
+        throw new TranslateError(instruction.offset, `${instruction.op} needs a cmp or test before it in the same block`);
+      }
+      out.push(
+        ...conditionCode(suffix, flags.width),
+        OP.ifEmpty,
+        OP.emptyBlockType,
+        ...translateConditionalMove(instruction),
+        OP.end,
+      );
+      // the instruction leaves the flags exactly as it found them, so they stay usable after it
       index += 1;
       continue;
     }

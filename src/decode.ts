@@ -446,6 +446,11 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
       }
       return finish(second === 0xb7 ? "movzx" : "movsx", [registerOperand(modrm.regField, rex.r, bits), modrm.rm]);
     }
+    if (second >= 0x40 && second <= 0x4f) {
+      // a conditional move: the register in the modrm field is written only if the condition holds, and the flags are left alone
+      const modrm = decodeModRm(cursor, rex, bits, segment);
+      return finish(`cmov${CONDITIONS[second - 0x40]!}`, [registerOperand(modrm.regField, rex.r, bits), modrm.rm]);
+    }
     if (second === 0xaf) {
       const modrm = decodeModRm(cursor, rex, bits, segment);
       return finish("imul", [registerOperand(modrm.regField, rex.r, bits), modrm.rm]);

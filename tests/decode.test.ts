@@ -341,3 +341,22 @@ describe("group 3 at a byte's width", () => {
     expect(low.operands[0]).toMatchObject({ kind: "reg", name: "sil", bits: 8 });
   });
 });
+
+describe("a conditional move", () => {
+  it("names the condition, keeps the destination in the modrm field and reads the width from REX", () => {
+    // 0f 44 c3 is `cmove %ebx, %eax`: the destination is the register field, the source the r/m field
+    const equal = decode(hex("0f 44 c3"))[0]!;
+    expect(equal.op).toBe("cmove");
+    // a 32-bit register keeps its 64-bit name and carries the width instead, which is how the rest of the IR spells it
+    expect(equal.operands[0]).toMatchObject({ kind: "reg", name: "rax", bits: 32 });
+    expect(equal.operands[1]).toMatchObject({ kind: "reg", name: "rbx", bits: 32 });
+    // 0f 4f with REX.W is `cmovg %rbx, %rax`, and the condition is the low nibble of the opcode
+    const greater = decode(hex("48 0f 4f c3"))[0]!;
+    expect(greater.op).toBe("cmovg");
+    expect(greater.operands[0]).toMatchObject({ kind: "reg", name: "rax", bits: 64 });
+    // the source may be memory, which is loaded at the destination's width
+    const fromMemory = decode(hex("0f 4c 03"))[0]!;
+    expect(fromMemory.op).toBe("cmovl");
+    expect(fromMemory.operands[1]).toMatchObject({ kind: "memory", bits: 32 });
+  });
+});

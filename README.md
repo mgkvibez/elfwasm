@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 204
+**Tests:** 205
 
 ```bash
 npm ci && npm run verify
@@ -283,6 +283,13 @@ An 8-bit comparison is evaluated at 64 bits on sign-extended bytes. Without that
 than as -128 and every signed branch after a byte comparison goes the wrong way. `cmp %dh, %dl` followed by `jl` reads bit 7 of
 a byte, and it has to mean that.
 
+A conditional move, `0x0f 0x40` to `0x0f 0x4f`, is the other instruction a resolver reaches once it has compared: the
+destination keeps its value unless the condition holds, in which case the source is written into it. It is translated as an `if`
+around a write rather than as a branch around a `mov`, because it leaves the flags exactly as it found them, which is the whole
+reason to use it between a comparison and the branch that reads the same flags. The width comes from the destination, and a
+32-bit answer zero-extends, so a `cmove %ebx, %eax` clears the upper half of `%rax` the way the processor does. The overflow
+and parity conditions are refused by name, as they are for `jcc`, because neither flag is computed.
+
 The byte forms have their own opcodes, and the subset now has them: group 3 (`test`, `not`, `neg` at `0xf6`), group 1
 (`0x80`), the register-to-register pairs (`0x00`, `0x08`, `0x20`, `0x28`, `0x30`, `0x38`, `0x84`, `0x88` and their reverse
 directions), the accumulator forms (`0x04`, `0x0c`, `0x24`, `0x2c`, `0x34`, `0x3c`, `0xa8`), and `mov r8, imm8` at `0xb0` to
@@ -328,9 +335,12 @@ same bytes run natively **fail** with status 1: this binary is linked with `--no
 ifuncs and the kernel jumps to the entry with the slot still holding the resolver's address. The differential is the two
 statuses, and it is the wrong way round from every other test here on purpose: 1 without the relocations applied, 0 with them.
 
-A real glibc static PIE still does not load. Its own resolver is `__mempcpy_ifunc`, and the decoder now carries it seventeen
-instructions in, through the byte tests and byte comparisons it opens with, and refuses at `cmovne`. That refusal is pinned by a
-test with its opcode spelled out, so the next piece of decoder work shows up as a changed message rather than as silence.
+A real glibc static PIE still does not load. Its own resolver is `__mempcpy_ifunc`, and the decoder now carries it through the
+byte tests, the byte comparisons and the conditional moves it opens with, and refuses at offset `0x7e` on a jump that lands
+between instructions. That is not a decoder gap but an extent gap, and it is the next piece: the extent is the bytes from the
+resolver's start to its first `ret`, found by decoding *linearly*, and a resolver that ends in a jump to another function has a
+target the linear scan never lands on. Following control flow instead of bytes, and translating the instruction list rather than
+the byte slice, is what it needs.
 
 ### The heap
 
