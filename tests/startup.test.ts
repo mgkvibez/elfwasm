@@ -214,9 +214,16 @@ describe.skipIf(!has("gcc") || !has("readelf"))("the ifuncs a real glibc static 
        * resolver's own bytes into a vectorised copy routine. Pinning that exact instruction would pin the runner's libc rather
        * than this repository, so what is pinned is that the refusal is a named one either way.
        */
-      expect(() => loadResolved(readFileSync(executable) as Uint8Array, { base: 0x400000n })).toThrow(
-        /does not decode: .*not in the decoded subset|a jump targets an offset that is not an instruction boundary/,
-      );
+      let refusal: unknown;
+      try {
+        loadResolved(readFileSync(executable) as Uint8Array, { base: 0x400000n });
+      } catch (error) {
+        refusal = error;
+      }
+      // a named refusal carrying a location, from the translator or the loader, rather than a crash or an answer computed from
+      // code that was only half understood
+      expect(refusal).toBeInstanceOf(Error);
+      expect((refusal as Error).message).toMatch(/^(a resolver at 0x[0-9a-f]+|at offset 0x[0-9a-f]+)/);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
