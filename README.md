@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 195
+**Tests:** 202
 
 ```bash
 npm ci && npm run verify
@@ -270,6 +270,39 @@ than resolved at translation; a base register used as an offset inside the block
 codes; and a trap when `%fs` was never pointed anywhere, where the bound check is the only thing between a thread-local read
 and a read of the image's own first bytes. Then a function compiled by `gcc -fstack-protector-strong` with a real frame,
 whose answer agrees with the processor's.
+
+### The code that runs before the program
+
+A `R_X86_64_IRELATIVE` relocation does not name a value, it names a *function*. The addend is the address of an ifunc resolver,
+the loader calls it, and the address it returns is what goes in the slot. That is how glibc picks a `memcpy` for the machine it
+finds itself on, and it is the last thing a static glibc PIE needs before its own `_start` can run.
+
+So the loader takes a `resolve` callback rather than knowing how to run code: an `IRELATIVE` entry hands it
+`loadBias + addend`, and whatever comes back is written into the slot *unbiased*, because it is already a load-time address.
+Without the callback the relocation is refused by name, since a loader that cannot call the function has nothing to write and
+writing the resolver's address would be a lie the program only discovers when it calls it.
+
+`loadResolved` in `src/startup.ts` is that callback, implemented with the translator. Two things make running a resolver
+different from running a program. There is no symbol table entry to give its length, and what a resolver does have is a `ret`,
+so the extent is decoded from its address to the first one, instruction by instruction: a `mov $0xc3, %eax` holds that byte
+inside its immediate, and a scan that stopped there would translate a third of a function and then run it. And it is *called*
+rather than entered, which is `Machine.call`: the translator's module returns `%rax`, so calling the module and taking its return
+value is calling the function.
+
+Refused by name: a resolver with no `ret` within the walk limit, one that will not decode, one whose address is not in an
+executable file-backed segment, and one whose `call` reaches outside its extent. Each is a limit of this layer rather than of the
+instruction set, and each says so at the address it happened.
+
+`tests/startup.test.ts` builds a PIE by hand whose `.data` holds an ifunc: the linker turns `slot: .quad resolver` into an
+`IRELATIVE` entry, and the resolver returns a marker's address computed with `lea marker(%rip)`, which only it knows. The slot
+then holds exactly that, at two different load bases, so the answer cannot be a link-time constant that happened to match. The
+same bytes run natively **fail** with status 1: this binary is linked with `--no-dynamic-linker`, so nothing resolves its
+ifuncs and the kernel jumps to the entry with the slot still holding the resolver's address. The differential is the two
+statuses, and it is the wrong way round from every other test here on purpose: 1 without the relocations applied, 0 with them.
+
+A real glibc static PIE still does not load. Its own resolvers are longer than these, and the first one is refused by the
+*decoder*: `opcode 0xf6 is not in the decoded subset`, at the address it happens. That is pinned by a test, so the next piece of
+decoder work shows up as a changed message rather than as silence.
 
 ### The heap
 

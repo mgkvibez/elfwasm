@@ -378,7 +378,7 @@ describe("a real libc static PIE", () => {
     loadImage(bytes, image, memory);
     const table = parseRelocations(bytes, parseSectionHeaders(bytes, parseElfHeader(bytes)));
     expect(table.some((relocation) => relocation.type === 37)).toBe(true);
-    expect(() => applyRelocations(table, { image, memory })).toThrow(/R_X86_64_IRELATIVE .* runs no code while loading/);
+    expect(() => applyRelocations(table, { image, memory })).toThrow(/R_X86_64_IRELATIVE .* names a resolver at 0x[0-9a-f]+, and running it is what decides the value/);
   });
 
   it("refuses a file whose section headers were stripped, because its relocations are then unreadable", () => {

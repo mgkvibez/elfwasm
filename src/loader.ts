@@ -34,6 +34,7 @@ export const DEFAULT_LOAD_BASE = 0x400000n;
 
 const R_X86_64_NONE = 0;
 const R_X86_64_RELATIVE = 8;
+const R_X86_64_IRELATIVE = 37;
 
 /** The types this loader gives a name to, so a refusal says which relocation it is rather than which number. */
 const RELOCATION_NAMES: Readonly<Record<number, string>> = {
@@ -94,7 +95,24 @@ function segmentFor(image: MemoryImage, address: bigint, width: number): MappedS
 export interface ApplyOptions {
   readonly image: MemoryImage;
   readonly memory: LinearMemory;
+  /**
+   * Runs an ifunc resolver and answers with the address it chose.
+   *
+   * The context is the image and the memory the slot is being written into, because the resolver has to run against the same
+   * bytes the rest of the relocation table is being applied to.
+   *
+   * `R_X86_64_IRELATIVE` names a *function* rather than a value: the addend is the address of a resolver, the loader calls it,
+   * and whatever it returns is what goes in the slot. A resolver is ordinary machine code in the image, so running it is a
+   * translator's job and not a loader's; without this callback the relocation is refused by name rather than guessed at.
+   */
+  readonly resolve?: Resolution;
 }
+
+/** How a resolver is called: with the address to run, and the load it is running against. */
+export type Resolution = (
+  target: bigint,
+  context: { readonly image: MemoryImage; readonly memory: LinearMemory },
+) => bigint;
 
 /**
  * Write the relocations into the loaded image, and say how many were applied.
@@ -123,11 +141,11 @@ export function applyRelocations(relocations: readonly Relocation[], options: Ap
     // the offset is in the file's own address space, like the addend, so both move with the image
     const target = image.loadBias + relocation.offset;
     const at = hex(target);
-    if (relocation.type !== R_X86_64_RELATIVE) {
+    if (relocation.type !== R_X86_64_RELATIVE && relocation.type !== R_X86_64_IRELATIVE) {
       const reason = UNSUPPORTED_REASONS[relocation.type];
       throw new ElfFormatError(
         `${nameOf(relocation.type)} at ${at} is not applied` +
-          (reason === undefined ? ": this loader implements R_X86_64_RELATIVE only" : `: ${reason}`),
+          (reason === undefined ? ": this loader implements R_X86_64_RELATIVE and R_X86_64_IRELATIVE only" : `: ${reason}`),
       );
     }
 
@@ -145,6 +163,23 @@ export function applyRelocations(relocations: readonly Relocation[], options: Ap
         `a relocation at ${at} maps to buffer offset ${offset}, past the ${buffer.length} bytes of memory`,
       );
     }
+    if (relocation.type === R_X86_64_IRELATIVE) {
+      const resolve = options.resolve;
+      if (resolve === undefined) {
+        throw new ElfFormatError(
+          `R_X86_64_IRELATIVE at ${at} names a resolver at ${hex(image.loadBias + relocation.addend)}, and running it is ` +
+            "what decides the value, so this cannot be applied without a resolver: the addend is a function, not an address",
+        );
+      }
+      /*
+       * The resolver runs *at* the biased address, and what it returns is already a load-time address: it is code that computed
+       * where things are, so it must not be biased a second time.
+       */
+      view.setBigUint64(offset, resolve(image.loadBias + relocation.addend, { image, memory }), true);
+      applied += 1;
+      continue;
+    }
+
     view.setBigUint64(offset, image.loadBias + relocation.addend, true);
     applied += 1;
   }
@@ -155,6 +190,13 @@ export function applyRelocations(relocations: readonly Relocation[], options: Ap
 export interface LoadOptions {
   /** Where to put virtual address zero. Defaults to {@link DEFAULT_LOAD_BASE}. */
   readonly base?: bigint;
+  /**
+   * Runs an `IRELATIVE` resolver, for a caller that can execute the image's own code.
+   *
+   * Without it those relocations are refused by name: the value in the slot is whatever a function returns, so a loader that
+   * cannot call it has nothing to write and says so instead of writing the resolver's address.
+   */
+  readonly resolve?: Resolution;
 }
 
 export interface LoadedExecutable {
@@ -205,6 +247,9 @@ export function loadExecutable(bytes: Uint8Array, options: LoadOptions = {}): Lo
   const image = imageOf(bytes, { base });
   const memory = createMemory(image);
   loadImage(bytes, image, memory);
-  const relocations = applyRelocations(relocationsOf(bytes), { image, memory });
+  const relocations = applyRelocations(
+    relocationsOf(bytes),
+    options.resolve === undefined ? { image, memory } : { image, memory, resolve: options.resolve },
+  );
   return { image, memory, relocations };
 }

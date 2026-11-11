@@ -179,8 +179,13 @@ export class Machine {
     };
   }
 
-  /** Runs a translated module and reports what it produced. */
-  run(module: Uint8Array): Outcome {
+  /**
+   * Runs a translated module and answers with the value its entry returns.
+   *
+   * This is how anything other than the program's own entry gets run: a translated function is a WASM module whose entry
+   * returns `%rax`, so calling it and taking the return value is calling the function. An `exit` still throws out of it.
+   */
+  call(module: Uint8Array): bigint {
     const instance = new WebAssembly.Instance(new WebAssembly.Module(module), this.imports);
     const entry = Object.values(instance.exports).find((exported) => typeof exported === "function");
     if (typeof entry !== "function") {
@@ -190,8 +195,13 @@ export class Machine {
     const thread = instance.exports.fs;
     this.#thread =
       typeof thread === "object" && thread !== null && "value" in thread ? (thread as ThreadPointer) : undefined;
+    return (entry as () => bigint)();
+  }
+
+  /** Runs a translated module and reports what it produced. */
+  run(module: Uint8Array): Outcome {
     try {
-      entry();
+      this.call(module);
     } catch (error) {
       // an exit is not an error, it is the program finishing the only way this layer knows how
       if (!(error instanceof Exit)) throw error;
