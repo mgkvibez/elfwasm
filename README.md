@@ -60,11 +60,13 @@ dynamic linker would resolve, so it is refused rather than half-loaded. See [The
 
 What does **not** work yet: `REL` relocations, extended section numbering (`e_shnum == 0` with the real count in the first
 section's `sh_size`), SSE and `x87`, a `call` into libc (its code needs a dynamic linker's symbol resolution, not just
-relocations), `%gs` and every segment base but `%fs`, and every syscall but `write`, `exit`, `exit_group` and `arch_prctl`. Two honest limits of the mapping:
+relocations), `%gs` and every segment base but `%fs`, `munmap` and `mprotect`, file-backed `mmap`, a heap that cannot grow
+past the pages the machine was created with, and every syscall but `write`, `exit`, `exit_group`, `arch_prctl`, `brk`
+and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 184
+**Tests:** 195
 
 ```bash
 npm ci && npm run verify
@@ -223,8 +225,8 @@ call: `%rax` holds the number and `%rdi`, `%rsi`, `%rdx`, `%r10`, `%r8`, `%r9` h
 instruction itself puts them, so the shim reads the registers the kernel reads. `%rcx` and `%r11` are clobbered, as the
 real instruction clobbers them, and flags are not trusted afterwards.
 
-Four calls are implemented, and that is the whole claim: `write`, `exit`, `exit_group`, and `arch_prctl` for the thread
-pointer. Everything else returns
+Six calls are implemented, and that is the whole claim: `write`, `exit`, `exit_group`, `arch_prctl` for the thread pointer,
+and `brk` and `mmap` for allocation. Everything else returns
 `-ENOSYS`, which is what a kernel returns for a call it does not have, so a program that needs one fails the way it would
 on a machine without it rather than silently reading zeroes. A `write` whose buffer is not entirely inside the image returns
 `-EFAULT` instead of copying whatever follows it. An `exit` does not return, so it throws out of the module and the machine
@@ -268,6 +270,36 @@ than resolved at translation; a base register used as an offset inside the block
 codes; and a trap when `%fs` was never pointed anywhere, where the bound check is the only thing between a thread-local read
 and a read of the image's own first bytes. Then a function compiled by `gcc -fstack-protector-strong` with a real frame,
 whose answer agrees with the processor's.
+
+### The heap
+
+The heap starts where the image's own pages end. That placement is the whole design: a virtual address and a WASM offset stay
+one addition apart from the image's base all the way to the top of the memory, so a heap address needs no second mapping table
+and `write` reads it with the same arithmetic it reads the image with. `brk` grows upward from there and `mmap` grows downward
+from the top of the free region, which is the direction Linux grows its own mappings, and neither may cross the other. `brk`
+answers with the break's new value on success and its old one on failure, as Linux does, which is how a caller tells them apart.
+A `brk` below the image, past the memory, or into a mapping is a failure that moves nothing.
+
+The stack is the caller's to declare. `%rsp` starts at the top of the memory, so a break that grew that far would hand a program
+the pages its own frame is on: `new Machine({ image, pages, stackPages })` says how much of the top is the stack, and the heap
+stops short of it. Without `stackPages` the heap may use the whole memory, which is right for a program translated without a
+stack and wrong for one with a frame.
+
+`mmap` serves one kind of mapping: private, anonymous, page-rounded, zero-filled. A file mapping is refused with `-ENOSYS` rather
+than served as anonymous memory, because a program that maps a file and finds zeroes has a working address containing the wrong
+bytes, which is worse than a failure; and `MAP_FIXED` is refused for the same reason, since the address it names may be the
+image. A zero length is `-EINVAL` and a mapping that does not fit is `-ENOMEM`. `munmap` and `mprotect` are not implemented and
+return `-ENOSYS`: WASM has no page protections to change, and claiming a mapping was released while its bytes stay readable is
+a claim this layer cannot keep.
+
+What it hands out is zeroed explicitly, because a new `WebAssembly.Memory` starts zeroed and hides the bug on the first run: the
+kernel zero-fills the pages it gives away, and a range that was written before it was given back is not zero by accident.
+
+`tests/heap.test.ts` is the evidence. Unit tests pin the initial break, growth, refusal at the limit, the stack reservation, and
+the zero-fill across a shrink and a grow; then `mmap`'s alignment, its page rounding, the two refusals, and the collision where
+mappings reach the break. The end-to-end test is a program that asks `brk` for a page, copies eight bytes off the image into it,
+and writes six of them to stdout: the address comes back from the kernel, the program writes through it, and `write` reads it
+back out of the same memory. Linux prints `heap!` and exits 0, and so does the translated run.
 
 ### The loader
 

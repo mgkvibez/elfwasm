@@ -6,9 +6,9 @@
  * address space: a `write` whose buffer is outside the image is `-EFAULT` rather than a read of something that happens to be
  * there.
  *
- * Four calls are implemented, and that is the whole claim: `write`, `exit`, `exit_group`, and `arch_prctl` for the thread
- * pointer. Everything else returns `-ENOSYS`, which is what a real kernel returns for a call it does not have, so a program that
- * needs one fails the way it would on a machine without it instead of silently reading zeroes.
+ * Six calls are implemented, and that is the whole claim: `write`, `exit`, `exit_group`, `arch_prctl` for the thread pointer,
+ * and `brk` and `mmap` for allocation. Everything else returns `-ENOSYS`, which is what a real kernel returns for a call it does
+ * not have, so a program that needs one fails the way it would on a machine without it instead of silently reading zeroes.
  */
 
 import { addressSpaceOf } from "./image.js";
@@ -38,6 +38,7 @@ interface ThreadPointer {
 
 /** The errno values this layer can return, in their negative form, which is how a syscall reports failure. */
 export const ERRNO = {
+  ENOMEM: -12n,
   EFAULT: -14n,
   EINVAL: -22n,
   ENOSYS: -38n,
@@ -48,6 +49,8 @@ export const ERRNO = {
 /** Linux's x86-64 call numbers, named so the shim does not carry bare integers. */
 export const SYSCALLS = {
   write: 1n,
+  mmap: 9n,
+  brk: 12n,
   archPrctl: 158n,
   exit: 60n,
   exitGroup: 231n,
@@ -64,6 +67,22 @@ export const ARCH_PRCTL = {
   setFs: 0x1002n,
   getFs: 0x1003n,
 } as const;
+
+/**
+ * The `mmap` flags this layer reads.
+ *
+ * A private anonymous mapping is the one kind it can serve: there is no file behind the address space, so a mapping of a file
+ * has nothing to map, and `MAP_FIXED` asks for an address that would land on the image.
+ */
+export const MMAP = {
+  fixed: 0x10n,
+  anonymous: 0x20n,
+} as const;
+
+/** Linux's page size, which is the granularity `mmap` and `munmap` work in, and is not a WASM page. */
+export const PAGE_SIZE = 0x1000n;
+/** A WASM page, which is what the memory is measured in. */
+const WASM_PAGE = 0x10000n;
 
 /** Thrown when the program exits, because an exit never returns: the kernel replaces the process, so this throws instead. */
 export class Exit extends Error {
@@ -89,6 +108,13 @@ export interface MachineOptions {
    * all zero.
    */
   readonly memory?: LinearMemory;
+  /**
+   * Pages at the top of the memory that hold the stack, which the heap may not grow into.
+   *
+   * It has to be said rather than guessed: `%rsp` starts at the top of memory, so a break that grew to the top would hand a
+   * program the pages its own frame is on. Defaults to zero, which is right for a program that was translated without a stack.
+   */
+  readonly stackPages?: number;
 }
 
 /** What a finished program produced: its status and the bytes it wrote to each standard descriptor. */
@@ -118,15 +144,37 @@ export class Machine {
    * to live where `global.get` can reach it. This layer only keeps a handle to write it, which is what `arch_prctl` does.
    */
   #thread: ThreadPointer | undefined;
+  /** The program break: where `brk` hands out memory from, growing upward, and the byte after what it has given away. */
+  #break: bigint;
+  /** Where the next `mmap` goes, growing downward from the top of the free region, which is the direction Linux grows them. */
+  #mappings: bigint;
+  /** One past the last byte the heap may use: the top of the memory, less the pages the stack is sitting in. */
+  readonly #heapLimit: bigint;
 
   constructor(options: MachineOptions) {
     this.addresses = addressSpaceOf(options.image);
     this.memory = options.memory ?? new WebAssembly.Memory({ initial: options.pages ?? options.image.pages });
+    /*
+     * The heap starts where the image's own pages end, so a virtual address and a WASM offset stay one addition apart all the
+     * way up: `%fs` needed the same thing, and a heap that began at 0 would need its own mapping table for no benefit.
+     */
+    this.#break = this.addresses.baseAddress + BigInt(this.addresses.pages) * WASM_PAGE;
+    this.#heapLimit =
+      this.addresses.baseAddress + BigInt(this.memory.buffer.byteLength) - BigInt(options.stackPages ?? 0) * WASM_PAGE;
+    // mappings grow down from the top, so the first one starts at the limit the break may not pass
+    this.#mappings = this.#heapLimit;
     this.imports = {
       env: {
         memory: this.memory,
-        syscall: (number: bigint, a1: bigint, a2: bigint, a3: bigint): bigint =>
-          this.#syscall(number, a1, a2, a3),
+        syscall: (
+          number: bigint,
+          a1: bigint,
+          a2: bigint,
+          a3: bigint,
+          a4: bigint,
+          a5: bigint,
+          a6: bigint,
+        ): bigint => this.#syscall(number, a1, a2, a3, a4, a5, a6),
       },
     };
   }
@@ -156,9 +204,11 @@ export class Machine {
     };
   }
 
-  #syscall(number: bigint, a1: bigint, a2: bigint, a3: bigint): bigint {
+  #syscall(number: bigint, a1: bigint, a2: bigint, a3: bigint, a4: bigint, a5: bigint, _a6: bigint): bigint {
     if (number === SYSCALLS.write) return this.#write(Number(a1), a2, Number(a3));
     if (number === SYSCALLS.archPrctl) return this.#archPrctl(a1, a2);
+    if (number === SYSCALLS.brk) return this.#brk(a1);
+    if (number === SYSCALLS.mmap) return this.#mmap(a1, a2, a3, a4, a5);
     if (number === SYSCALLS.exit || number === SYSCALLS.exitGroup) {
       const code = Number(a1) & 0xff;
       this.#exitCode = code;
@@ -199,11 +249,90 @@ export class Machine {
     return BigInt(count);
   }
 
-  /** The bytes at a virtual address, or `undefined` when the range is not entirely inside the image. */
+  /** Where the next byte `brk` hands out is, which a program can also read with `brk(0)`. */
+  get breakAddress(): bigint {
+    return this.#break;
+  }
+
+  /** The first page after the heap, which is either the top of the memory or the bottom of the stack. */
+  get heapLimit(): bigint {
+    return this.#heapLimit;
+  }
+
+  /**
+   * `brk`: move the program break, and answer with where it is now.
+   *
+   * Linux answers with the break's *new* value on success and its *old* one on failure, which is how a caller tells them apart:
+   * a failed `brk` returns what the previous `brk(0)` said. Shrinking is allowed, and so is a `brk` to exactly where it already
+   * is. Growing into the stack or past the memory is not, and neither is a break below the image.
+   */
+  #brk(address: bigint): bigint {
+    if (address === 0n) return this.#break;
+    if (address < this.heapStart || address > this.#heapLimit || address > this.#mappings) return this.#break;
+    if (address > this.#break) this.#zero(this.#break, address);
+    this.#break = address;
+    return this.#break;
+  }
+
+  /** The first byte after the image, which is where the heap begins. */
+  get heapStart(): bigint {
+    return this.addresses.baseAddress + BigInt(this.addresses.pages) * WASM_PAGE;
+  }
+
+  /**
+   * `mmap`: a private anonymous mapping, growing down from the top of the free region.
+   *
+   * The address asked for is a hint and is ignored, which the interface allows. A file mapping has nothing to map here, and
+   * `MAP_FIXED` names an address that may be the image, so both are refused rather than served as anonymous memory: a program
+   * that maps a file and finds zeroes reads a working address containing the wrong bytes, which is worse than a failure.
+   */
+  #mmap(
+    _address: bigint,
+    length: bigint,
+    _protection: bigint,
+    flags: bigint,
+    _descriptor: bigint,
+  ): bigint {
+    if ((flags & MMAP.fixed) !== 0n) return ERRNO.ENOSYS;
+    if ((flags & MMAP.anonymous) === 0n) return ERRNO.ENOSYS;
+    if (length === 0n) return ERRNO.EINVAL;
+    // the address is a hint the kernel may ignore, the protection is a page bit WASM has not got, and an anonymous mapping
+    // has no file behind it for the descriptor to name
+    const rounded = (length + PAGE_SIZE - 1n) / PAGE_SIZE * PAGE_SIZE;
+    const start = this.#mappings - rounded;
+    if (start < this.#break) return ERRNO.ENOMEM;
+    this.#mappings = start;
+    this.#zero(start, start + rounded);
+    return start;
+  }
+
+  /** Writes zeroes over a range, which is what a fresh page looks like: a new memory is zeroed, but a reused range is not. */
+  #zero(from: bigint, to: bigint): void {
+    const bytes = this.#linear(from, Number(to - from));
+    bytes?.fill(0);
+  }
+
+  /**
+   * The bytes at a virtual address, or `undefined` when the range is not entirely inside the memory.
+   *
+   * Inside the image the segments decide, because they are what a loader placed. Above it the addresses are the heap's, and
+   * those are one addition apart from their WASM offsets all the way to the top.
+   */
   bytesAt(address: bigint, count: number): Uint8Array | undefined {
     if (count === 0) return new Uint8Array(0);
-    const offset = this.addresses.offsetOf(address);
-    if (offset === undefined || offset + count > this.memory.buffer.byteLength) return undefined;
+    const inside = this.addresses.offsetOf(address);
+    if (inside !== undefined) {
+      return inside + count > this.memory.buffer.byteLength
+        ? undefined
+        : new Uint8Array(this.memory.buffer, inside, count);
+    }
+    return this.#linear(address, count);
+  }
+
+  #linear(address: bigint, count: number): Uint8Array | undefined {
+    if (address < this.addresses.baseAddress) return undefined;
+    const offset = Number(address - this.addresses.baseAddress);
+    if (offset < 0 || offset + count > this.memory.buffer.byteLength) return undefined;
     return new Uint8Array(this.memory.buffer, offset, count);
   }
 }
