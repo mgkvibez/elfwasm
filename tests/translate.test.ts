@@ -128,8 +128,12 @@ describe("refusals", () => {
     expect(refuse(hex("48 c7 c0 01 00 00 00")).message).toContain("does not end in ret");
   });
 
-  it("refuses code after ret instead of translating bytes nothing will reach", () => {
-    expect(refuse(hex("48 c7 c0 01 00 00 00 c3 c3")).message).toContain("code after ret");
+  it("translates the bytes after a ret, which a branch elsewhere may reach", () => {
+    /*
+     * `mov $1,%rax; ret; ret`. The second ret is unreachable along this path and is translated in place rather than refused: a body
+     * with more than one exit has blocks after a ret in it, and a branch into one of them is what a compiled resolver looks like.
+     */
+    expect(translate(decode(hex("48 c7 c0 01 00 00 00 c3 c3"))).length).toBeGreaterThan(0);
   });
 
   it("reports the offset of the instruction it refused, so a failure is locatable in the binary", () => {

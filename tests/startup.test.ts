@@ -357,6 +357,25 @@ describe("the extent a resolver is translated from", () => {
     expect(resolve([...code.slice(0, 0x17), 0x01])).toBe(1n);
   });
 
+  it("runs a body with two exits, where a branch lands in a block after a ret", () => {
+    /*
+     * `mov $1,%eax; test %eax,%eax; jne L; mov $5,%eax; ret; nop; nop; L: mov $7,%eax; ret`. With %eax at 1 the condition holds,
+     * so control skips the first exit and lands in the block after it, which is what glibc's resolver does at offset 0x80.
+     */
+    const body = (value: number): number[] => [
+      0xb8, value, 0x00, 0x00, 0x00, // mov $value, %eax
+      0x85, 0xc0, // test %eax, %eax
+      0x75, 0x08, // jne +8, which lands on the second block
+      0xb8, 0x05, 0x00, 0x00, 0x00, // mov $5, %eax
+      0xc3, // ret
+      0x90, 0x90, // padding the jump steps over
+      0xb8, 0x07, 0x00, 0x00, 0x00, // mov $7, %eax
+      0xc3, // ret
+    ];
+    expect(resolve(body(1))).toBe(7n);
+    expect(resolve(body(0))).toBe(5n);
+  });
+
   it("refuses an address that is not in an executable file-backed segment", () => {
     const bytes = Uint8Array.from([0xc3]);
     const memory = new runtime.Memory({ initial: 1 });

@@ -1199,11 +1199,14 @@ function translateRange(
       }
       // `return` rather than a value left on the stack: a ret inside a branch cannot leave the function's result there
       out.push(...globalGet(REGISTERS.indexOf("rax")), OP.returnOp);
+      /*
+       * A body can have more than one exit, and a `ret` in the middle of one is ordinary when a branch lands in a block after it:
+       * `jne L; ret; L: ...`. The bytes after the `return` are unreachable along this path and reachable from elsewhere, so they
+       * are translated in place. Instructions after a `return` are valid WASM, and the block a jump lands in is the guard the
+       * jump itself opens around the bytes it skips.
+       */
       index += 1;
-      if (index < to) {
-        throw new TranslateError(instructions[index]!.offset, "there is code after ret, which is dead and not translated");
-      }
-      return index;
+      continue;
     }
     if (instruction.op === "jmp") {
       const target = indexOfOffset(instructions, branchTarget(instruction));
