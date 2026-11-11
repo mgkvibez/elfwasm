@@ -17,12 +17,13 @@
  */
 
 import { DecodeError, decodeInstruction } from "./decode.js";
+import type { Instruction } from "./decode.js";
 import { ElfFormatError } from "./elf.js";
 import { loadExecutable } from "./loader.js";
 import type { LoadedExecutable, LoadOptions, Resolution } from "./loader.js";
 import { Machine } from "./syscalls.js";
 import type { LinearMemory, MemoryImage } from "./image.js";
-import { translateProgram } from "./translate.js";
+import { translate } from "./translate.js";
 
 /** How far to walk looking for a resolver's `ret`, in bytes. A resolver that is longer than this is not one. */
 const DEFAULT_LIMIT = 512;
@@ -61,22 +62,39 @@ function fileOffsetOf(image: MemoryImage, address: bigint): { index: number; end
 }
 
 /**
- * The bytes from an address to the `ret` that ends it.
+ * A resolver's instructions, from its address to the `ret` that ends its answer.
  *
- * Instruction by instruction, not by scanning for `0xc3`: a `mov $0xc3, %eax` holds that byte inside its immediate, and a
- * scan that stopped there would translate a third of a function and then run it.
+ * Control flow, not bytes. A linear scan from the start would stop at the first `ret` it *reads*, which is not the same as the
+ * first one the resolver can *reach*: a resolver is allowed to end in a jump into another function, and a tail call like that
+ * has a target the scan walks straight past. Decoding one instruction at a time and following the jumps instead means the body
+ * is exactly the code reachable from the resolver's start, and a jump out of its own bytes lands on an instruction the
+ * translation already has rather than between two of them.
+ *
+ * Offsets come back relative to the resolver's start, because that is what the translator measures a call or a jump against.
  */
-function extentOf(bytes: Uint8Array, image: MemoryImage, address: bigint, limit: number): Uint8Array {
+function instructionsOf(
+  bytes: Uint8Array,
+  image: MemoryImage,
+  address: bigint,
+  limit: number,
+): readonly Instruction[] {
   const { index, end } = fileOffsetOf(image, address);
-  let cursor = index;
   const bound = Math.min(end, index + limit);
-  while (cursor < bound) {
-    let length: number;
-    let op: string;
+  const decoded = new Map<number, Instruction>();
+  const work: number[] = [index];
+  let returned = false;
+  while (work.length > 0) {
+    const cursor = work.pop()!;
+    if (decoded.has(cursor)) continue;
+    if (cursor >= bound) {
+      throw new ElfFormatError(
+        `a resolver at ${hex(address)} has no ret in its first ${limit} bytes, so where it ends is not knowable: without an ` +
+          "extent the translator would either stop inside it or run on into whatever follows",
+      );
+    }
+    let instruction: Instruction;
     try {
-      const instruction = decodeInstruction(bytes, cursor);
-      length = instruction.length;
-      op = instruction.op;
+      instruction = decodeInstruction(bytes, cursor);
     } catch (error) {
       if (!(error instanceof DecodeError)) throw error;
       throw new ElfFormatError(
@@ -84,13 +102,27 @@ function extentOf(bytes: Uint8Array, image: MemoryImage, address: bigint, limit:
           "instruction outside the subset stops it here rather than halfway through its own work",
       );
     }
-    cursor += length;
-    if (op === "ret") return bytes.subarray(index, cursor);
+    decoded.set(cursor, instruction);
+    if (instruction.op === "ret") {
+      returned = true;
+      continue;
+    }
+    // every instruction after a jump has a successor except the jump itself, which has only its target
+    const displacement = instruction.operands[0];
+    if (instruction.op.startsWith("j") && displacement !== undefined && displacement.kind === "immediate") {
+      work.push(cursor + instruction.length + Number(displacement.value));
+    }
+    if (instruction.op !== "jmp") work.push(cursor + instruction.length);
   }
-  throw new ElfFormatError(
-    `a resolver at ${hex(address)} has no ret in its first ${limit} bytes, so where it ends is not knowable: without an ` +
-      "extent the translator would either stop inside it or run on into whatever follows",
-  );
+  if (!returned) {
+    throw new ElfFormatError(
+      `a resolver at ${hex(address)} has no ret in its first ${limit} bytes, so where it ends is not knowable: without an ` +
+        "extent the translator would either stop inside it or run on into whatever follows",
+    );
+  }
+  return [...decoded.values()]
+    .sort((left, right) => left.offset - right.offset)
+    .map((instruction) => ({ ...instruction, offset: instruction.offset - index }));
 }
 
 /**
@@ -112,7 +144,7 @@ export function translatedResolver(
   return (target: bigint): bigint => {
     let module = modules.get(target);
     if (module === undefined) {
-      module = translateProgram(extentOf(bytes, image, target, options.limit ?? DEFAULT_LIMIT), "resolver", {
+      module = translate(instructionsOf(bytes, image, target, options.limit ?? DEFAULT_LIMIT), "resolver", {
         addresses: machine.addresses,
         codeAddress: target,
         code: { bytes, virtualAddress: image.baseAddress },

@@ -277,6 +277,23 @@ describe("the extent a resolver is translated from", () => {
     expect(() => resolve(code, 32)).toThrow(/has no ret in its first 32 bytes/);
   });
 
+  it("follows a jump out of the resolver's own bytes to the ret that ends the answer", () => {
+    /*
+     * A resolver is allowed to end in a tail call: the function it jumps into returns the address the resolver would have
+     * returned, so its `ret` is the resolver's ret. A linear scan for `ret` would take the bytes between the two as the
+     * body and then find the jump's target between two instructions; following the jump decodes exactly what is reachable.
+     *
+     * `mov $0x2a, %eax; jmp +5` lands on `mov $7, %eax` at offset 12, five bytes past the padding the jump skips.
+     */
+    expect(resolve([
+      0xb8, 0x2a, 0x00, 0x00, 0x00,
+      0xeb, 0x05,
+      0x90, 0x90, 0x90, 0x90, 0x90,
+      0xb8, 0x07, 0x00, 0x00, 0x00,
+      0xc3,
+    ])).toBe(7n);
+  });
+
   it("refuses an address that is not in an executable file-backed segment", () => {
     const bytes = Uint8Array.from([0xc3]);
     const memory = new runtime.Memory({ initial: 1 });

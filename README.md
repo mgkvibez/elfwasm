@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 205
+**Tests:** 206
 
 ```bash
 npm ci && npm run verify
@@ -319,10 +319,12 @@ writing the resolver's address would be a lie the program only discovers when it
 
 `loadResolved` in `src/startup.ts` is that callback, implemented with the translator. Two things make running a resolver
 different from running a program. There is no symbol table entry to give its length, and what a resolver does have is a `ret`,
-so the extent is decoded from its address to the first one, instruction by instruction: a `mov $0xc3, %eax` holds that byte
-inside its immediate, and a scan that stopped there would translate a third of a function and then run it. And it is *called*
-rather than entered, which is `Machine.call`: the translator's module returns `%rax`, so calling the module and taking its return
-value is calling the function.
+so the extent is found by decoding from its address to the one it can *reach*, instruction by instruction: a `mov $0xc3, %eax`
+holds that byte inside its immediate and a scan that stopped there would translate a third of a function, while a linear scan
+would also walk straight past a jump into another function, because the first `ret` it reads is not the first one the resolver
+can arrive at. So the walk follows the jumps it decodes, and the translator is handed the instructions rather than a byte slice.
+And it is *called* rather than entered, which is `Machine.call`: the translator's module returns `%rax`, so calling the module and
+taking its return value is calling the function.
 
 Refused by name: a resolver with no `ret` within the walk limit, one that will not decode, one whose address is not in an
 executable file-backed segment, and one whose `call` reaches outside its extent. Each is a limit of this layer rather than of the
@@ -335,12 +337,17 @@ same bytes run natively **fail** with status 1: this binary is linked with `--no
 ifuncs and the kernel jumps to the entry with the slot still holding the resolver's address. The differential is the two
 statuses, and it is the wrong way round from every other test here on purpose: 1 without the relocations applied, 0 with them.
 
-A real glibc static PIE still does not load. Its own resolver is `__mempcpy_ifunc`, and the decoder now carries it through the
-byte tests, the byte comparisons and the conditional moves it opens with, and refuses at offset `0x7e` on a jump that lands
-between instructions. That is not a decoder gap but an extent gap, and it is the next piece: the extent is the bytes from the
-resolver's start to its first `ret`, found by decoding *linearly*, and a resolver that ends in a jump to another function has a
-target the linear scan never lands on. Following control flow instead of bytes, and translating the instruction list rather than
-the byte slice, is what it needs.
+A real glibc static PIE still does not load. Its own resolver is `__mempcpy_ifunc`, and it now gets through its byte tests, its
+byte comparisons and its conditional moves, past the jump it ends with, and refuses on the first instruction of the *function it
+jumps into* that the subset does not have: the multi-byte nop at `0x420559`, `0x0f 0x1f`.
+
+That is the shape of the next piece, and it is worth being precise about it. A resolver's extent is found by following control flow
+from its start to the `ret` that ends its answer, so a jump out of the resolver's own bytes is followed rather than walked past,
+and its target is an instruction the translation already has instead of a point between two of them. What that costs is that a
+tail call is *inlined*: the resolver whose answer is a vectorised `memcpy` now has that `memcpy`'s instructions inside its own
+body, so anything the copy routine needs is this resolver's problem too. Two ways forward, and the smaller one first: two-byte
+`0x0f 0x1f` nops and the SSE the copy routine opens with, or translating a tail jump as a `call` so that each function's extent
+is refused on its own terms rather than merged into its caller's.
 
 ### The heap
 

@@ -1765,5 +1765,8 @@ export function translate(
   name = "main",
   options: TranslateOptions = {},
 ): Uint8Array {
+  // the same refusal a decoded byte slice gets, because a list of instructions can be walked into the middle of one too
+  const length = instructions.reduce((furthest, instruction) => Math.max(furthest, instruction.offset + instruction.length), 0);
+  refuseCallInsideBody(instructions, length, options.codeAddress ?? 0n);
   return programOf(instructions, name, options);
 }
