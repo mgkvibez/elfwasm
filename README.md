@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 202
+**Tests:** 204
 
 ```bash
 npm ci && npm run verify
@@ -271,6 +271,34 @@ codes; and a trap when `%fs` was never pointed anywhere, where the bound check i
 and a read of the image's own first bytes. Then a function compiled by `gcc -fstack-protector-strong` with a real frame,
 whose answer agrees with the processor's.
 
+### Bytes, and the registers that are inside other registers
+
+An 8-bit register is not a variable of its own, it is a byte of a 64-bit one. `%al` is bits 0 to 7 of `%rax`, and `%ah` is bits
+8 to 15 of the same register, which is why `mov $0xff, %dh` must leave `%dl` alone and `mov %dh, %al` must leave `%rdx` alone.
+The translator keeps the 64-bit local and reads and writes the byte through it: a read shifts and masks, and a write reads the
+bits around the target back, masks them, and ors the new byte in. There is no second local for a byte, so the two names cannot
+disagree.
+
+An 8-bit comparison is evaluated at 64 bits on sign-extended bytes. Without that, a byte holding 0x80 compares as 128 rather
+than as -128 and every signed branch after a byte comparison goes the wrong way. `cmp %dh, %dl` followed by `jl` reads bit 7 of
+a byte, and it has to mean that.
+
+The byte forms have their own opcodes, and the subset now has them: group 3 (`test`, `not`, `neg` at `0xf6`), group 1
+(`0x80`), the register-to-register pairs (`0x00`, `0x08`, `0x20`, `0x28`, `0x30`, `0x38`, `0x84`, `0x88` and their reverse
+directions), the accumulator forms (`0x04`, `0x0c`, `0x24`, `0x2c`, `0x34`, `0x3c`, `0xa8`), and `mov r8, imm8` at `0xb0` to
+`0xb7`, where codes 4 to 7 are the high bytes without REX and `spl` to `dil` with one.
+
+Two facts about functions came out of the same work, and both are refusals rather than translations.
+
+A call whose target is inside the body being translated, and is not one of that body's instruction starts, is refused: the
+decoder will decode from the middle of an instruction and the bits it produces are a program that runs and computes something
+the source never said. Decoding is not the same as being a function's start.
+
+A call followed by a zero byte does not return. The linker pads with zeros, and a zero byte cannot start an instruction a
+compiler would emit, so the call is to something that never returns, which is the shape `call __stack_chk_fail` has at the end
+of a stack-protected function. This is tested *before* decodability, because a zero byte does decode (`add %al,(%rax)`) and a
+rule that leaned on the decode failing would depend on which instructions the subset happened to have.
+
 ### The code that runs before the program
 
 A `R_X86_64_IRELATIVE` relocation does not name a value, it names a *function*. The addend is the address of an ifunc resolver,
@@ -300,9 +328,9 @@ same bytes run natively **fail** with status 1: this binary is linked with `--no
 ifuncs and the kernel jumps to the entry with the slot still holding the resolver's address. The differential is the two
 statuses, and it is the wrong way round from every other test here on purpose: 1 without the relocations applied, 0 with them.
 
-A real glibc static PIE still does not load. Its own resolvers are longer than these, and the first one is refused by the
-*decoder*: `opcode 0xf6 is not in the decoded subset`, at the address it happens. That is pinned by a test, so the next piece of
-decoder work shows up as a changed message rather than as silence.
+A real glibc static PIE still does not load. Its own resolver is `__mempcpy_ifunc`, and the decoder now carries it seventeen
+instructions in, through the byte tests and byte comparisons it opens with, and refuses at `cmovne`. That refusal is pinned by a
+test with its opcode spelled out, so the next piece of decoder work shows up as a changed message rather than as silence.
 
 ### The heap
 

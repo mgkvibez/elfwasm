@@ -234,6 +234,8 @@ export const OP = {
   i64And: 0x83,
   i64Or: 0x84,
   i64Shl: 0x86,
+  i64ShrU: 0x88,
+  i64ShrS: 0x87,
   i32WrapI64: 0xa7,
   i64ExtendI32U: 0xad,
   // a trap, which is what an address outside the image becomes: a wild read is worse than a stopped program
@@ -286,7 +288,9 @@ export function globalSet(index: number): number[] {
 }
 
 export function i64Const(value: bigint): number[] {
-  return [OP.i64Const, ...signed64(value)];
+  // the immediate is a *signed* LEB, so a value thought of as unsigned has to be folded before it is encoded: 0xffffffffffffff00
+  // is -256, and encoding it as the unsigned number needs ten bytes with bits above 64 set, which the engine refuses
+  return [OP.i64Const, ...signed64(BigInt.asIntN(64, value))];
 }
 
 /**

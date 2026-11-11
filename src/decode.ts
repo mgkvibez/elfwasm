@@ -307,6 +307,36 @@ const CONDITIONS = [
   "s", "ns", "p", "np", "l", "ge", "le", "g",
 ] as const;
 /** The shift group's `/reg` field: only the three that discard bits are in the subset. */
+/** The accumulator forms with a byte immediate: `al` against a constant, one opcode per operation. */
+const ACCUMULATOR_BYTE_OPS: Readonly<Record<number, string>> = {
+  0x04: "add",
+  0x0c: "or",
+  0x24: "and",
+  0x2c: "sub",
+  0x34: "xor",
+  0x3c: "cmp",
+  0xa8: "test",
+};
+
+/** The even opcode of each register-to-register pair: the byte form, where the width comes from the opcode itself. */
+const BYTE_REGISTER_OPS: Readonly<Record<number, { op: string; intoRegister: boolean }>> = {
+  0x00: { op: "add", intoRegister: false },
+  0x02: { op: "add", intoRegister: true },
+  0x08: { op: "or", intoRegister: false },
+  0x0a: { op: "or", intoRegister: true },
+  0x20: { op: "and", intoRegister: false },
+  0x22: { op: "and", intoRegister: true },
+  0x28: { op: "sub", intoRegister: false },
+  0x2a: { op: "sub", intoRegister: true },
+  0x30: { op: "xor", intoRegister: false },
+  0x32: { op: "xor", intoRegister: true },
+  0x38: { op: "cmp", intoRegister: false },
+  0x3a: { op: "cmp", intoRegister: true },
+  0x84: { op: "test", intoRegister: false },
+  0x88: { op: "mov", intoRegister: false },
+  0x8a: { op: "mov", intoRegister: true },
+};
+
 const SHIFTS: readonly (string | undefined)[] = [undefined, undefined, undefined, undefined, "shl", "shr", undefined, "sar"];
 
 function decodeOne(bytes: Uint8Array, offset: number): Instruction {
@@ -430,6 +460,14 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
   }
   if (opcode >= 0x50 && opcode <= 0x57) return finish("push", [registerOperand(opcode - 0x50, rex.b, 64)]);
   if (opcode >= 0x58 && opcode <= 0x5f) return finish("pop", [registerOperand(opcode - 0x58, rex.b, 64)]);
+  if (opcode >= 0xb0 && opcode <= 0xb7) {
+    // mov r8, imm8: codes 4 to 7 are the high bytes without REX and `spl` to `dil` with one, which the operand reads for
+    // itself so the same byte decodes to `%dh` or `%sil` depending on the prefix it arrived with
+    return finish("mov", [
+      byteRegisterOperand(opcode - 0xb0, rex.b, rex.present),
+      { kind: "immediate", value: readImmediate(cursor, 1) },
+    ]);
+  }
   if (opcode >= 0xb8 && opcode <= 0xbf) {
     // 0x48 B8+rd carries a full 64-bit immediate; without REX.W the immediate is 32 bits and zero-extends
     return finish("mov", [
@@ -500,6 +538,15 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
     }
     return finish("mov", [modrm.rm, { kind: "immediate", value: readImmediate(cursor, 4) }]);
   }
+  if (opcode === 0x80) {
+    // group 1 at a byte's width: the same eight operations, with an imm8 that is a byte rather than a sign-extended one
+    const modrm = decodeModRm(cursor, rex, 8, segment);
+    const mnemonic = ARITHMETIC[modrm.regField];
+    if (mnemonic === undefined) {
+      throw new DecodeError(offset, `arithmetic /${modrm.regField} (0x80) is not in the decoded subset`);
+    }
+    return finish(mnemonic, [modrm.rm, { kind: "immediate", value: readImmediate(cursor, 1) }]);
+  }
   if (opcode === 0x83 || opcode === 0x81) {
     const modrm = decodeModRm(cursor, rex, bits, segment);
     const mnemonic = ARITHMETIC[modrm.regField];
@@ -526,6 +573,19 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
     const immediate = readImmediate(cursor, opcode === 0x69 ? 4 : 1);
     return finish("imul", [registerOperand(modrm.regField, rex.r, bits), modrm.rm, { kind: "immediate", value: immediate }]);
   }
+  /*
+   * The byte forms of the register-to-register group: one opcode per operation per direction, and the even one of each pair is
+   * the byte form. `cmp %dh, %dl` is 0x38, and a resolver that opens by comparing two halves of the same register needs it
+   * before anything else it does.
+   */
+  const byteOperation = BYTE_REGISTER_OPS[opcode];
+  if (byteOperation !== undefined) {
+    const modrm = decodeModRm(cursor, rex, 8, segment);
+    const register = registerOperand(modrm.regField, rex.r, 8, rex.present);
+    return byteOperation.intoRegister
+      ? finish(byteOperation.op, [register, modrm.rm])
+      : finish(byteOperation.op, [modrm.rm, register]);
+  }
   if (opcode === 0x39 || opcode === 0x3b) {
     const modrm = decodeModRm(cursor, rex, bits, segment);
     const register = registerOperand(modrm.regField, rex.r, bits);
@@ -541,6 +601,15 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
     const register = registerOperand(modrm.regField, rex.r, bits);
     return opcode === 0x21 ? finish("and", [modrm.rm, register]) : finish("or", [modrm.rm, register]);
   }
+  const accumulatorByte = ACCUMULATOR_BYTE_OPS[opcode];
+  if (accumulatorByte !== undefined) {
+    // the accumulator forms at a byte's width: `cmp $0xff, %al` and its siblings, which is what a byte comparison against a
+    // constant assembles to
+    return finish(accumulatorByte, [
+      byteRegisterOperand(0, false, false),
+      { kind: "immediate", value: readImmediate(cursor, 1) },
+    ]);
+  }
   if (opcode === 0xa9) {
     // test between the accumulator and an immediate: `test eax, imm32`, which is what `testl $255, %eax` assembles to
     return finish("test", [registerOperand(0, false, bits), { kind: "immediate", value: readImmediate(cursor, 4) }]);
@@ -552,6 +621,24 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
         : opcode === 0x05 ? "add" : opcode === 0x2d ? "sub" : "cmp";
     const accumulator = registerOperand(0, false, bits);
     return finish(mnemonic, [accumulator, { kind: "immediate", value: readImmediate(cursor, 4) }]);
+  }
+  if (opcode === 0xf6) {
+    // group 3 at a byte's width. The register field picks the operation, not an operand, which is why /1 and /4 to /7 are
+    // named rather than read as something
+    const modrm = decodeModRm(cursor, rex, 8, segment);
+    if (modrm.regField === 0) {
+      return finish("test", [modrm.rm, { kind: "immediate", value: readImmediate(cursor, 1) }]);
+    }
+    if (modrm.regField === 2) return finish("not", [modrm.rm]);
+    if (modrm.regField === 3) return finish("neg", [modrm.rm]);
+    if (modrm.regField === 1) {
+      throw new DecodeError(offset, "0xf6 /1 is undefined: the byte form of group 3 has /0 test and nothing at /1");
+    }
+    throw new DecodeError(
+      offset,
+      `0xf6 /${modrm.regField} is mul, imul, div or idiv, which read and write implicit registers, and those are not in ` +
+        "the decoded subset yet",
+    );
   }
   if (opcode === 0xf7) {
     const modrm = decodeModRm(cursor, rex, bits, segment);

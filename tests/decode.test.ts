@@ -317,3 +317,27 @@ describe("a real ELF64 binary from the host", () => {
     expect(segments.length).toBeGreaterThan(0);
   });
 });
+
+describe("group 3 at a byte's width", () => {
+  it("reads test, not and neg, and names the encodings it does not have", () => {
+    // f6 c6 48 is `test $0x48, %dh`, which is what the second instruction of a glibc ifunc resolver is
+    const test = decode(hex("f6 c6 48"))[0]!;
+    expect(test.op).toBe("test");
+    expect(test.operands[0]).toMatchObject({ kind: "reg", name: "dh", bits: 8 });
+    expect(test.operands[1]).toMatchObject({ kind: "immediate", value: 0x48n });
+    expect(decode(hex("f6 d6"))[0]!.op).toBe("not");
+    expect(decode(hex("f6 da"))[0]!.op).toBe("neg");
+    // the register field selects the operation, so an undefined one is refused rather than read as an operand
+    expect(() => decode(hex("f6 c8"))).toThrow(/0xf6 \/1 is undefined/);
+    expect(() => decode(hex("f6 e0"))).toThrow(/mul, imul, div or idiv/);
+  });
+
+  it("reads mov r8, imm8 into a high byte, and into a low byte from the same code under REX", () => {
+    // b6 is code 6 of 0xb0: `%dh` without REX, and `%sil` with one, because the four high bytes cannot be named under REX
+    const high = decode(hex("b6 48"))[0]!;
+    expect(high.op).toBe("mov");
+    expect(high.operands[0]).toMatchObject({ kind: "reg", name: "dh", bits: 8 });
+    const low = decode(hex("40 b6 48"))[0]!;
+    expect(low.operands[0]).toMatchObject({ kind: "reg", name: "sil", bits: 8 });
+  });
+});

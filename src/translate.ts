@@ -131,19 +131,112 @@ function localOfRegister(name: string, instruction: Instruction): number {
   return index;
 }
 
-function localOf(operand: Operand, instruction: Instruction): number {
+/**
+ * Where a narrow register sits inside its 64-bit local.
+ *
+ * A byte register is not a second variable, it is a byte of one: `%al` is bits 0 to 7 of `%rax`, and `%ah` is bits 8 to 15
+ * of the same register. A write to either leaves the rest of `%rax` alone, which is only true if the write merges rather than
+ * replaces. That is why this is a shift and a mask rather than a second local.
+ */
+interface RegisterSlot {
+  readonly local: number;
+  /** How far up the 64-bit local this register starts: 0 for `al`, 8 for `ah`. */
+  readonly shift: number;
+  /** The width of the register named, which is the width of the access, not of the local behind it. */
+  readonly bits: 8 | 16 | 32 | 64;
+}
+
+/** The eight bit registers of the legacy registers, and the eight above `bl` that REX adds. */
+const BYTE_TO_FULL: Readonly<Record<string, string>> = {
+  al: "rax",
+  cl: "rcx",
+  dl: "rdx",
+  bl: "rbx",
+  spl: "rsp",
+  bpl: "rbp",
+  sil: "rsi",
+  dil: "rdi",
+  ...Object.fromEntries(Array.from({ length: 8 }, (_unused, index) => [`r${index + 8}b`, `r${index + 8}`])),
+};
+
+/** `ah`, `ch`, `dh` and `bh`: the second byte of four registers, which no REX prefix can name. */
+const HIGH_BYTES: Readonly<Record<string, string>> = { ah: "rax", ch: "rcx", dh: "rdx", bh: "rbx" };
+
+function slotOf(operand: Operand, instruction: Instruction): RegisterSlot {
   if (operand.kind !== "reg") {
     throw new TranslateError(instruction.offset, `expected a register operand, found ${operand.kind}`);
   }
-  return localOfRegister(operand.name, instruction);
+  const { name, bits } = operand;
+  if (bits === 8) {
+    const high = HIGH_BYTES[name];
+    if (high !== undefined) return { local: localOfRegister(high, instruction), shift: 8, bits };
+    const full = BYTE_TO_FULL[name];
+    if (full === undefined) {
+      throw new TranslateError(instruction.offset, `${name} is not an 8-bit register this translator knows`);
+    }
+    return { local: localOfRegister(full, instruction), shift: 0, bits };
+  }
+  return { local: localOfRegister(name, instruction), shift: 0, bits };
 }
 
+/** The eight bits a narrow register owns, as an i64 in the range a byte holds. */
 function read(operand: Operand, instruction: Instruction): number[] {
-  return globalGet(localOf(operand, instruction));
+  const slot = slotOf(operand, instruction);
+  if (slot.bits !== 8) return globalGet(slot.local);
+  const code = globalGet(slot.local);
+  const placed = slot.shift === 0 ? code : [...code, ...i64Const(BigInt(slot.shift)), OP.i64ShrU];
+  return [...placed, ...i64Const(0xffn), OP.i64And];
 }
 
+/**
+ * Writes a register, leaving the operand stack as it found it.
+ *
+ * A byte write cannot replace its local, because seven eighths of it belong to something else: `mov %al, %dh` must leave
+ * `%rdx`'s other bytes alone, and `mov %dh, %al` must not disturb `%rax`'s. So the bits around the target are read back,
+ * masked out, and put back with the new byte or'd in.
+ */
 function write(operand: Operand, instruction: Instruction): number[] {
-  return globalSet(localOf(operand, instruction));
+  const slot = slotOf(operand, instruction);
+  if (slot.bits !== 8) return globalSet(slot.local);
+  const placed = slot.shift === 0 ? [] : [...i64Const(BigInt(slot.shift)), OP.i64Shl];
+  const keep = BigInt.asUintN(64, ~(0xffn << BigInt(slot.shift)));
+  return [
+    ...i64Const(0xffn),
+    OP.i64And,
+    ...placed,
+    ...globalGet(slot.local),
+    ...i64Const(keep),
+    OP.i64And,
+    OP.i64Or,
+    ...globalSet(slot.local),
+  ];
+}
+
+/**
+ * Sign-extends the low byte of an i64.
+ *
+ * An 8-bit comparison is a comparison of the byte's own bits: after `cmp %dh, %dl`, `jl` reads bit 7 of the result and `jb`
+ * reads the borrow, so the operand has to arrive sign-extended. Without this a byte holding 0x80 compares as 128 rather than
+ * as -128 and every signed branch after a byte comparison goes the wrong way.
+ */
+function signExtend8(code: number[]): number[] {
+  return [
+    ...code,
+    ...i64Const(0xffn),
+    OP.i64And,
+    ...i64Const(24n),
+    OP.i64Shl,
+    ...i64Const(24n),
+    OP.i64ShrS,
+  ];
+}
+
+/** An 8-bit memory operand, which is a byte load this translator does not do yet, refused where it is reached. */
+function refuseByteMemory(operand: Operand, instruction: Instruction): void {
+  if (operand.kind === "memory" && operand.bits === 8) {
+    throw new TranslateError(instruction.offset, "an 8-bit memory operand is not translated yet: the byte load is a width " +
+      "the address arithmetic does not yet carry");
+  }
 }
 
 /**
@@ -532,17 +625,22 @@ function translateMov(instruction: Instruction): number[] {
     throw new TranslateError(instruction.offset, `a mov into a ${destination.kind} is not translated`);
   }
   const width = destination.bits;
-  if (width !== 32 && width !== 64) {
+  if (width !== 8 && width !== 32 && width !== 64) {
     throw new TranslateError(instruction.offset, `a ${width}-bit mov is not translated yet`);
   }
+  refuseByteMemory(source, instruction);
   if (source.kind === "immediate") {
-    // a 32-bit destination zero-extends, so this masks rather than sign-extends: `mov $-1, %eax` leaves 0xffffffff
-    const value = width === 32 ? BigInt.asUintN(32, source.value) : source.value;
+    // a narrow destination keeps only its own bits, so this masks rather than sign-extends: `mov $-1, %eax` leaves
+    // 0xffffffff, and `mov $-1, %dh` leaves 0xff in the second byte of `%rdx`
+    const value = width === 64 ? source.value : BigInt.asUintN(width, source.value);
     return [...i64Const(value), ...write(destination, instruction)];
   }
   if (source.kind === "memory") {
+    if (source.bits !== 32 && source.bits !== 64) {
+      throw new TranslateError(instruction.offset, `a ${source.bits}-bit memory load is not translated yet`);
+    }
     // the load already yields the destination's width, so no narrowing of a register is involved
-    return [...loadFromMemory(source, width, instruction), ...write(destination, instruction)];
+    return [...loadFromMemory(source, source.bits, instruction), ...write(destination, instruction)];
   }
   const code = read(source, instruction);
   if (width === 32) return [...code, NARROW_32, WIDEN_32, ...write(destination, instruction)];
@@ -656,6 +754,49 @@ function operandCode64(operand: Operand, instruction: Instruction): number[] {
  */
 const FLAG_SETTING: ReadonlySet<string> = new Set(["add", "sub", "and", "or", "xor"]);
 
+/**
+ * `not` and `neg`, whose operand is both source and destination.
+ *
+ * `not` leaves the flags alone, which is not the same as clearing them: a branch after it reads what the previous
+ * instruction set. `neg` reports its result, so only the zero and sign flags are modelled, and its borrow is not.
+ */
+function translateUnary(instruction: Instruction): { code: number[]; width?: 32 | 64 } {
+  const [destination] = instruction.operands;
+  if (destination === undefined) {
+    throw new TranslateError(instruction.offset, `${instruction.op} needs an operand`);
+  }
+  if (destination.kind !== "reg") {
+    throw new TranslateError(instruction.offset, `a ${instruction.op} in memory is not translated yet`);
+  }
+  const width = destination.bits;
+  if (width !== 8 && width !== 32 && width !== 64) {
+    throw new TranslateError(instruction.offset, `a ${width}-bit ${instruction.op} is not translated yet`);
+  }
+  const ones = width === 8 ? 0xffn : width === 32 ? 0xffffffffn : 0xffffffffffffffffn;
+  // a 32-bit result is zero-extended as it is written, so the value that goes into the local and the value that is reported
+  // to the flags are the same one
+  const narrowed = (code: number[]): number[] => (width === 32 ? [...code, NARROW_32, WIDEN_32] : code);
+  if (instruction.op === "not") {
+    return { code: [...narrowed([...read(destination, instruction), ...i64Const(ones), OP.i64Xor]), ...write(destination, instruction)] };
+  }
+  // neg is 0 - value, and its flags describe that difference: `neg %eax` with a zero operand sets ZF
+  const byte = width === 8
+    ? signExtend8([...i64Const(0n), ...read(destination, instruction), OP.i64Sub, ...i64Const(0xffn), OP.i64And])
+    : narrowed([...i64Const(0n), ...read(destination, instruction), OP.i64Sub]);
+  return {
+    code: [
+      ...byte,
+      OP.localTee,
+      ...unsigned(CMP_A),
+      ...i64Const(0n),
+      OP.localSet,
+      ...unsigned(CMP_B),
+      ...write(destination, instruction),
+    ],
+    width: width === 8 ? 64 : width,
+  };
+}
+
 function translateBinary(instruction: Instruction): number[] {
   const op = instruction.op as BinaryOp;
   const [destination, source] = instruction.operands;
@@ -666,10 +807,47 @@ function translateBinary(instruction: Instruction): number[] {
     throw new TranslateError(instruction.offset, `a ${instruction.op} into memory is not translated yet`);
   }
   const width = destination.bits;
-  if (width !== 32 && width !== 64) {
+  if (width !== 8 && width !== 32 && width !== 64) {
     throw new TranslateError(instruction.offset, `a ${width}-bit ${instruction.op} is not translated yet`);
   }
+  refuseByteMemory(source, instruction);
   const opcodes = BINARY[op];
+  if (width === 8) {
+    /*
+     * A byte operation is done at 64 bits and masked back to eight, which wraps exactly where the processor wraps. The flags
+     * are shaped the same way a byte comparison's are, sign-extended, because a byte result of 0x80 is -128 to every branch
+     * that reads it.
+     */
+    const value = [...read(destination, instruction), ...operandCode64(source, instruction), opcodes.bits64];
+    const byte = [...value, ...i64Const(0xffn), OP.i64And];
+    if (!FLAG_SETTING.has(op)) {
+      return [...byte, ...write(destination, instruction)];
+    }
+    if (op === "sub") {
+      const operand = operandCode64(source, instruction);
+      return [
+        ...signExtend8(read(destination, instruction)),
+        ...localSet(CMP_A),
+        ...signExtend8(operand),
+        ...localSet(CMP_B),
+        ...i64Const(0n),
+        ...localGet(CMP_A),
+        ...localGet(CMP_B),
+        OP.i64Sub,
+        ...i64Const(0xffn),
+        OP.i64And,
+        ...write(destination, instruction),
+      ];
+    }
+    return [
+      ...signExtend8(byte),
+      OP.localTee,
+      ...unsigned(CMP_A),
+      ...i64Const(0n),
+      ...localSet(CMP_B),
+      ...write(destination, instruction),
+    ];
+  }
   if (FLAG_SETTING.has(op)) {
     /*
      * Both operands are kept in the comparison locals before the result overwrites the destination, so a branch after the
@@ -754,22 +932,30 @@ function translateFlags(instruction: Instruction): { code: number[]; width: 32 |
     throw new TranslateError(instruction.offset, `${instruction.op} into memory is not translated yet`);
   }
   const width = destination.bits;
-  if (width !== 32 && width !== 64) {
+  if (width !== 8 && width !== 32 && width !== 64) {
     throw new TranslateError(instruction.offset, `a ${width}-bit ${instruction.op} is not translated yet`);
   }
+  refuseByteMemory(source, instruction);
+  /*
+   * A byte comparison is evaluated at 64 bits on sign-extended bytes, so `width` is reported as the width the comparison is
+   * *done* at rather than the width the instruction names. That is the same convention a 32-bit comparison already uses: its
+   * operands are kept as i64 and narrowed when the condition is evaluated, and here the narrowing happens on the way in
+   * because a byte's sign lives at bit 7 and not at bit 31.
+   */
+  const shape = (code: number[]): number[] => (width === 8 ? signExtend8(code) : code);
   const left = read(destination, instruction);
   if (instruction.op === "test") {
     // `test a, b` is `and` with the result discarded: the flags come from a & b, and comparing the mask against zero
     // reproduces every condition a compiler emits after it, jl and js included
-    const mask = [...left, ...operandCode64(source, instruction), OP.i64And];
+    const mask = shape([...left, ...operandCode64(source, instruction), OP.i64And]);
     return {
       code: [...mask, ...localSet(CMP_A), ...i64Const(0n), ...localSet(CMP_B)],
-      width,
+      width: width === 8 ? 64 : width,
     };
   }
   return {
-    code: [...left, ...localSet(CMP_A), ...operandCode64(source, instruction), ...localSet(CMP_B)],
-    width,
+    code: [...shape(left), ...localSet(CMP_A), ...shape(operandCode64(source, instruction)), ...localSet(CMP_B)],
+    width: width === 8 ? 64 : width,
   };
 }
 
@@ -1163,6 +1349,16 @@ function translateRange(
       index += 1;
       continue;
     }
+    if (instruction.op === "not" || instruction.op === "neg") {
+      const translated = translateUnary(instruction);
+      out.push(...translated.code);
+      if (translated.width !== undefined) {
+        flags.set = true;
+        flags.width = translated.width;
+      }
+      index += 1;
+      continue;
+    }
     if (instruction.op in BINARY) {
       out.push(...translateBinary(instruction));
       if (FLAG_SETTING.has(instruction.op)) {
@@ -1239,6 +1435,13 @@ function functionExtent(bytes: Uint8Array, address: bigint): readonly Instructio
      */
     const next = offset + instruction.length;
     if (instruction.op === "call" && next < bytes.length) {
+      /*
+       * A zero byte cannot start an instruction a compiler would emit (`add %al,(%rax)` is not something a call is followed
+       * by), and a run of them is the linker's padding, so a call followed by one is a call to something that never returns.
+       * This is tested before decodability because a zero byte *does* decode: relying on the decode to fail made this rule
+       * depend on which instructions the subset happened to have, which is not a property of the program.
+       */
+      if (bytes[next] === 0) continue;
       try {
         decodeAt(next);
       } catch {
@@ -1248,8 +1451,45 @@ function functionExtent(bytes: Uint8Array, address: bigint): readonly Instructio
     work.push(next);
   }
 
-  const ordered: Instruction[] = [];
+  /*
+   * No reachable instruction may start inside another one. A call into the middle of an instruction reaches bytes that decode,
+   * so the walk accepts them, and the function then computes something the source never said. That is the difference between an
+   * address that is a function's start and one that merely decodes, and it is worth naming rather than translating.
+   */
+  const starts = [...reachable].sort((left, right) => left - right);
+  let covered = 0;
+  for (const start of starts) {
+    if (start < covered) {
+      throw new TranslateError(
+        start,
+        `${hex(address + BigInt(start))} is inside the instruction that ends at ${hex(address + BigInt(covered))}, so it is ` +
+          "not where a function starts",
+      );
+    }
+    covered = start + decodeAt(start).length;
+  }
+
+  /*
+   * A call whose target is inside this function but is not one of its instruction starts is a call into the middle of it, which
+   * no compiler emits and which translates to something the source never said. It is caught here rather than left to the
+   * decoder: the bytes at the target may well decode, and decoding is not the same as being a function's start.
+   */
   const end = Math.max(...reachable);
+  const extentEnd = Math.max(...starts.map((start) => start + decodeAt(start).length));
+  for (const start of starts) {
+    const instruction = decodeAt(start);
+    if (instruction.op !== "call") continue;
+    const target = branchTarget(instruction);
+    if (target >= 0 && target < extentEnd && !reachable.has(target)) {
+      throw new TranslateError(
+        start,
+        `the call at ${hex(address + BigInt(start))} targets ${hex(address + BigInt(target))}, which is inside this function ` +
+          "and is not an instruction start, so it is not where a function starts",
+      );
+    }
+  }
+
+  const ordered: Instruction[] = [];
   let offset = 0;
   while (offset <= end) {
     if (!reachable.has(offset)) {
@@ -1426,7 +1666,35 @@ export function translateProgram(
   name = "main",
   options: TranslateOptions = {},
 ): Uint8Array {
-  return programOf(decode(bytes), name, options);
+  const instructions = decode(bytes);
+  refuseCallInsideBody(instructions, bytes.length, options.codeAddress ?? 0n);
+  return programOf(instructions, name, options);
+}
+
+/**
+ * Refuses a call whose target is inside the body being translated but is not one of its instruction starts.
+ *
+ * The decoder will happily decode from the middle of an instruction, and the bits it produces are a program that loads, runs
+ * and computes something else. So the question is not whether the target decodes, it is whether it is where an instruction
+ * begins, which is a property of this body and not of the bytes.
+ */
+function refuseCallInsideBody(
+  instructions: readonly Instruction[],
+  length: number,
+  address: bigint,
+): void {
+  const starts = new Set(instructions.map((instruction) => instruction.offset));
+  for (const instruction of instructions) {
+    if (instruction.op !== "call") continue;
+    const target = branchTarget(instruction);
+    if (target >= 0 && target < length && !starts.has(target)) {
+      throw new TranslateError(
+        instruction.offset,
+        `the call at ${hex(address + BigInt(instruction.offset))} targets ${hex(address + BigInt(target))}, which is inside ` +
+          "this body and is not an instruction start, so it is not where a function starts",
+      );
+    }
+  }
 }
 
 /** The same thing under the name the earlier tests use, which is also the name the README uses. */

@@ -167,6 +167,6 @@ describe("what a call will not do", () => {
         code: { bytes: code, virtualAddress: ORIGIN },
         codeAddress: ORIGIN,
       }),
-    ).toThrow(/nothing reaches|is not an instruction|is not in the/);
+    ).toThrow(/nothing reaches|is not an instruction|is not in the|is not an instruction start/);
   });
 });

@@ -206,9 +206,12 @@ describe.skipIf(!has("gcc") || !has("readelf"))("the ifuncs a real glibc static 
        * glibc's own resolvers are longer than the ones in the subset: the first one is reached at 0x420500 and holds an
        * instruction the decoder does not have yet, so this is a refusal about the *decoder*, not about the mechanism. Pinning
        * the message means the next piece of decoder work shows up here as a change of address rather than as silence.
+       *
+       * It has moved once already: the byte forms of group 3 and of the register comparisons carried it from the resolver's
+       * fourth instruction to its seventeenth, where it now wants `cmovne`, which is a two-byte opcode.
        */
       expect(() => loadResolved(readFileSync(executable) as Uint8Array, { base: 0x400000n })).toThrow(
-        /a resolver at 0x[0-9a-f]+ does not decode: at offset 0x[0-9a-f]+: opcode 0x[0-9a-f]+ is not in the decoded subset/,
+        /a resolver at 0x[0-9a-f]+ does not decode: at offset 0x[0-9a-f]+: two-byte opcode 0x0f 0x45 is not in the decoded subset/,
       );
     } finally {
       rmSync(directory, { recursive: true, force: true });
