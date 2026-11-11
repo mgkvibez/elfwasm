@@ -209,9 +209,13 @@ describe.skipIf(!has("gcc") || !has("readelf"))("the ifuncs a real glibc static 
        *
        * It has moved once already: the byte forms of group 3 and of the register comparisons carried it from the resolver's
        * fourth instruction to its seventeenth, where it now wants `cmovne`, which is a two-byte opcode.
+       *
+       * Where it lands depends on the machine's glibc: the CI image's build ends its resolver earlier, with a jump out of the
+       * resolver's own bytes into a vectorised copy routine. Pinning that exact instruction would pin the runner's libc rather
+       * than this repository, so what is pinned is that the refusal is a named one either way.
        */
       expect(() => loadResolved(readFileSync(executable) as Uint8Array, { base: 0x400000n })).toThrow(
-        /a resolver at 0x[0-9a-f]+ does not decode: at offset 0x[0-9a-f]+: two-byte opcode 0x0f 0x45 is not in the decoded subset/,
+        /does not decode: .*not in the decoded subset|a jump targets an offset that is not an instruction boundary/,
       );
     } finally {
       rmSync(directory, { recursive: true, force: true });
