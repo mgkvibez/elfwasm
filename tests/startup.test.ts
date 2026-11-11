@@ -337,6 +337,26 @@ describe("the extent a resolver is translated from", () => {
     ])).toBe(0x55n);
   });
 
+  it("compares a byte of memory, which is how a resolver reads a feature flag", () => {
+    /*
+     * `testb $0x2, 0x10(%rip)` then `jne`: the byte it reads is at offset 0x17 of the image, and 0x02 & 0x02 is not zero, so the
+     * branch is taken and the answer is 5 rather than 1. glibc's resolvers test `_dl_x86_cpu_features` exactly this way, and a
+     * byte comparison was refused whenever either operand lived in memory.
+     */
+    const code = [
+      0xf6, 0x05, 0x10, 0x00, 0x00, 0x00, 0x02, // testb $0x2, 0x10(%rip)
+      0xb8, 0x05, 0x00, 0x00, 0x00, // mov $5, %eax
+      0x75, 0x05, // jne +5
+      0xb8, 0x01, 0x00, 0x00, 0x00, // mov $1, %eax
+      0xc3, // ret
+      0x00, 0x00, 0x00, // padding up to the flag the test reads
+      0x02,
+    ];
+    expect(resolve(code)).toBe(5n);
+    // with the bit clear the branch is not taken, so the same code answers 1
+    expect(resolve([...code.slice(0, 0x17), 0x01])).toBe(1n);
+  });
+
   it("refuses an address that is not in an executable file-backed segment", () => {
     const bytes = Uint8Array.from([0xc3]);
     const memory = new runtime.Memory({ initial: 1 });

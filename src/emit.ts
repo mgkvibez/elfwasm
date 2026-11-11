@@ -242,6 +242,9 @@ export const OP = {
   unreachable: 0x00,
   // memory access: the address is on the stack and the memarg carries alignment and a constant offset
   i32Load: 0x28,
+  i32Load8S: 0x2c,
+  i32Load8U: 0x2d,
+  i64ExtendI32S: 0xac,
   i64Load: 0x29,
   i32Store: 0x36,
   i64Store: 0x37,

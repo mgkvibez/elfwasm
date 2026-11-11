@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 211
+**Tests:** 212
 
 ```bash
 npm ci && npm run verify
@@ -352,9 +352,9 @@ ifuncs and the kernel jumps to the entry with the slot still holding the resolve
 statuses, and it is the wrong way round from every other test here on purpose: 1 without the relocations applied, 0 with them.
 
 A real glibc static PIE still does not load. Its own resolver is `__mempcpy_ifunc`, and every instruction of it now decodes and
-translates as far as offset `0x60`, where it meets a `test` against a *memory* operand: `testb $0x2, (%rip)`, a byte test against
-a feature flag in the image. A byte test with a register destination is translated; a byte test whose destination is memory is not,
-and that is the next piece.
+translates as far as offset `0x80`, where it meets a branch into a block that follows a `ret`, which is a body with more than one
+exit: the instruction list a walk produces has code after a `ret` in it, and the translator refuses that as dead code rather than
+noticing that a jump reaches it. Multiple exit blocks are the next piece.
 
 That is the shape of the next piece, and it is worth being precise about it. A resolver's extent is found by following control flow
 from its start to the `ret` that ends its answer, so a jump out of the resolver's own bytes is followed rather than walked past,

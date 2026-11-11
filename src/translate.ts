@@ -607,6 +607,14 @@ function loadFromMemory(operand: Operand, width: 32 | 64, instruction: Instructi
   return [...address, OP.i32Load, ...memarg(0), WIDEN_32];
 }
 
+/**
+ * A byte of memory, widened to 64 bits with its sign, which is how every byte operand is treated here: a byte's sign lives at bit
+ * 7 and every condition a compiler emits after comparing one is about that sign.
+ */
+function loadByteFromMemory(operand: Operand, instruction: Instruction): number[] {
+  return [...addressOf(operand, instruction), OP.i32Load8S, ...memarg(0), OP.i64ExtendI32S];
+}
+
 /** A store: the address goes on the stack first, the value on top, which is the order `store` pops them in. */
 function storeToMemory(operand: Operand, value: readonly number[], width: 8 | 16 | 32 | 64, instruction: Instruction): number[] {
   const code = { 8: OP.i32Store8, 16: OP.i32Store16, 32: OP.i32Store, 64: OP.i64Store }[width];
@@ -739,6 +747,7 @@ function operandCode64(operand: Operand, instruction: Instruction): number[] {
   if (operand.kind === "immediate") return i64Const(operand.value);
   if (operand.kind === "memory") {
     // the comparison's own width decides, and a memory operand carries it: a byte of memory is not a 64-bit value
+    if (operand.bits === 8) return loadByteFromMemory(operand, instruction);
     const width = operand.bits === 32 ? 32 : 64;
     return loadFromMemory(operand, width, instruction);
   }
@@ -954,14 +963,17 @@ function translateFlags(instruction: Instruction): { code: number[]; width: 32 |
   if (destination === undefined || source === undefined) {
     throw new TranslateError(instruction.offset, `${instruction.op} needs two operands`);
   }
-  if (destination.kind !== "reg") {
-    throw new TranslateError(instruction.offset, `${instruction.op} into memory is not translated yet`);
+  /*
+   * A comparison against memory is how a compiled program tests a feature flag: `testb $0x2, 0x9...(%rip)`. Nothing is written,
+   * so the operand only has to be read at its own width, and a byte of it is read as signed like every other byte here.
+   */
+  if (destination.kind !== "reg" && destination.kind !== "memory") {
+    throw new TranslateError(instruction.offset, `a ${instruction.op} against a ${destination.kind} is not translated`);
   }
   const width = destination.bits;
   if (width !== 8 && width !== 32 && width !== 64) {
     throw new TranslateError(instruction.offset, `a ${width}-bit ${instruction.op} is not translated yet`);
   }
-  refuseByteMemory(source, instruction);
   /*
    * A byte comparison is evaluated at 64 bits on sign-extended bytes, so `width` is reported as the width the comparison is
    * *done* at rather than the width the instruction names. That is the same convention a 32-bit comparison already uses: its
@@ -969,7 +981,12 @@ function translateFlags(instruction: Instruction): { code: number[]; width: 32 |
    * because a byte's sign lives at bit 7 and not at bit 31.
    */
   const shape = (code: number[]): number[] => (width === 8 ? signExtend8(code) : code);
-  const left = read(destination, instruction);
+  const left =
+    destination.kind === "memory"
+      ? destination.bits === 8
+        ? loadByteFromMemory(destination, instruction)
+        : loadFromMemory(destination, destination.bits === 32 ? 32 : 64, instruction)
+      : read(destination, instruction);
   if (instruction.op === "test") {
     // `test a, b` is `and` with the result discarded: the flags come from a & b, and comparing the mask against zero
     // reproduces every condition a compiler emits after it, jl and js included
