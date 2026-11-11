@@ -217,22 +217,25 @@ function runtimeAddressCode(
       "a memory operand needs the mapped image: pass addresses from image.addressSpaceOf()",
     );
   }
-  if (operand.segment !== undefined) {
+  if (operand.segment !== undefined && operand.segment !== "fs") {
     throw new TranslateError(
       instruction.offset,
-      `a %${operand.segment}: operand needs a segment base, and WASM has no segments: refusing rather than reading the ` +
-        `offset as a plain address`,
+      `a %${operand.segment}: operand needs the %${operand.segment} base, which this translator keeps for %fs only: refusing ` +
+        "rather than reading the offset as a plain address",
     );
   }
+  /*
+   * `%fs:` is thread-relative: the sum starts at the thread pointer and every register is an offset inside that block. Without
+   * it the base register holds a virtual address, so the image's own base is subtracted from that register before anything is
+   * addressed. Either way the result is a virtual address, and the final subtraction is what turns it into an offset.
+   */
+  const threadRelative = operand.segment === "fs";
   // the address is a sum of parts, and each part is pushed before the add that consumes the two before it
   const parts: number[][] = [];
+  if (threadRelative) parts.push([...globalGet(THREAD_GLOBAL)]);
   if (operand.base !== undefined) {
-    // a register's value is a virtual address, so the image's own base is subtracted before anything is addressed
-    parts.push([
-      ...globalGet(localOfRegister(operand.base, instruction)),
-      ...i64Const(addresses.baseAddress),
-      OP.i64Sub,
-    ]);
+    const register = [...globalGet(localOfRegister(operand.base, instruction))];
+    parts.push(threadRelative ? register : [...register, ...i64Const(addresses.baseAddress), OP.i64Sub]);
   }
   if (operand.index !== undefined) {
     const shift = { 1: 0n, 2: 1n, 4: 2n, 8: 3n }[operand.scale];
@@ -243,6 +246,8 @@ function runtimeAddressCode(
   const code = [...parts[0]!];
   for (const part of parts.slice(1)) code.push(...part, OP.i64Add);
   if (operand.displacement !== 0n) code.push(...i64Const(operand.displacement), OP.i64Add);
+  // under %fs: the sum is a virtual address that has not yet been rebased, so it is turned into an offset here once
+  if (threadRelative) code.push(...i64Const(addresses.baseAddress), OP.i64Sub);
 
   const limit = BigInt((options.memoryPages ?? 1) * PAGE_SIZE) - BigInt(width / 8);
   return [
@@ -278,7 +283,8 @@ function resolveAddresses(
         if (operand.kind !== "memory") return operand;
         // a register-relative address is only knowable at run time, so it becomes code rather than a number
         if (instruction.op === "lea") return { ...operand, addressCode: leaAddressCode(operand, instruction, options) };
-        if (operand.base !== undefined || operand.index !== undefined) {
+        // %fs: has no base register in the common case, and a thread-relative address is never knowable at translation time
+        if (operand.segment === "fs" || operand.base !== undefined || operand.index !== undefined) {
           const width = operand.bits ?? 32;
           return { ...operand, addressCode: runtimeAddressCode(operand, instruction, options, width) };
         }
@@ -325,6 +331,15 @@ function stackBounds(options: TranslateOptions): { top: bigint; floor: bigint } 
     floor: base + BigInt((options.addresses?.pages ?? 0) * PAGE_SIZE),
   };
 }
+
+/**
+ * The global index of the thread pointer: the one `i64` global the module declares after the register file.
+ *
+ * `%fs` addressing reads it at run time rather than baking a base into the translation, because `arch_prctl` can point it
+ * somewhere else in the middle of a program, and a translator that resolved it once would keep reading the block the process
+ * started with. That is the difference between thread-local storage and a guess that happens to work in one thread.
+ */
+const THREAD_GLOBAL = REGISTERS.length;
 
 /** True when anything in this function uses the stack: a push, a pop, `leave`, or a stack-relative operand. */
 function usesStack(instructions: readonly Instruction[]): boolean {
@@ -451,7 +466,11 @@ function leaAddressCode(operand: Operand, instruction: Instruction, options: Tra
     throw new TranslateError(instruction.offset, "lea needs the mapped image: pass addresses from image.addressSpaceOf()");
   }
   if (operand.segment !== undefined) {
-    throw new TranslateError(instruction.offset, `lea from a %${operand.segment}: operand is not translated`);
+    throw new TranslateError(
+      instruction.offset,
+      `lea from a %${operand.segment}: operand is not translated, because the processor itself ignores the override there: ` +
+        "`lea %fs:0x10, %rax` loads 0x10, and binutils warns that the segment override is ineffectual",
+    );
   }
   if (operand.base === undefined && operand.index === undefined) {
     return [...i64Const(virtualAddressOf(operand, instruction, options))];
@@ -628,6 +647,15 @@ function operandCode64(operand: Operand, instruction: Instruction): number[] {
   return read(operand, instruction);
 }
 
+/**
+ * The arithmetic instructions whose result also sets the flags a branch reads.
+ *
+ * `cmp` and `test` were the only ways a condition could be set up, which is enough for a hand-written program and not enough
+ * for a compiler's: gcc compares a stack canary with `sub %fs:0x28, %rdx` followed by `jne`, and refuses nothing. `imul` is
+ * left out because its flags are not the same ones: it reports overflow in a carry flag the others set by addition.
+ */
+const FLAG_SETTING: ReadonlySet<string> = new Set(["add", "sub", "and", "or", "xor"]);
+
 function translateBinary(instruction: Instruction): number[] {
   const op = instruction.op as BinaryOp;
   const [destination, source] = instruction.operands;
@@ -641,8 +669,68 @@ function translateBinary(instruction: Instruction): number[] {
   if (width !== 32 && width !== 64) {
     throw new TranslateError(instruction.offset, `a ${width}-bit ${instruction.op} is not translated yet`);
   }
-  const operand = operandCode(source, width, instruction);
   const opcodes = BINARY[op];
+  if (FLAG_SETTING.has(op)) {
+    /*
+     * Both operands are kept in the comparison locals before the result overwrites the destination, so a branch after the
+     * arithmetic reads the same two numbers `cmp` would have kept. Neither is left on the stack for the result to find again:
+     * the sum is rebuilt from the two locals, so the operand stack holds nothing but the result when `write` takes it.
+     */
+    /*
+     * The two halves of this are different questions, and only one of them is a comparison.
+     *
+     * `sub` sets its flags from `destination - source`, which is exactly what `cmp source, destination` computes, so the two
+     * operands are kept and every condition means what it means after a `cmp`. The others set their flags from the *result*:
+     * after `add $6, %rax` the zero and sign flags describe twelve, not the six and six that went in, so what is kept is the
+     * result and a zero to compare it against. Keeping the operands there would answer a question nobody asked, and the wrong
+     * answer is a branch that disagrees with the processor.
+     */
+    const keeps = (code: number[], local: number): number[] => [...code, OP.localSet, ...unsigned(local)];
+    if (op !== "sub") {
+      const result =
+        width === 64
+          ? [
+              ...read(destination, instruction),
+              ...operandCode64(source, instruction),
+              opcodes.bits64,
+            ]
+          : [
+              ...read(destination, instruction),
+              NARROW_32,
+              ...operandCode64(source, instruction),
+              NARROW_32,
+              opcodes.bits32,
+              WIDEN_32,
+            ];
+      return [
+        ...result,
+        OP.localTee,
+        ...unsigned(CMP_A),
+        ...i64Const(0n),
+        OP.localSet,
+        ...unsigned(CMP_B),
+        ...write(destination, instruction),
+      ];
+    }
+    const left = keeps(read(destination, instruction), CMP_A);
+    const right = keeps(operandCode64(source, instruction), CMP_B);
+    if (width === 64) {
+      return [...left, ...right, ...localGet(CMP_A), ...localGet(CMP_B), opcodes.bits64, ...write(destination, instruction)];
+    }
+    // both are kept at 64 bits, so a 32-bit operation narrows them on the way back in, exactly as `cmp` leaves them
+    return [
+      ...left,
+      ...right,
+      ...localGet(CMP_A),
+      NARROW_32,
+      ...localGet(CMP_B),
+      NARROW_32,
+      opcodes.bits32,
+      WIDEN_32,
+      ...write(destination, instruction),
+    ];
+  }
+  const operand = operandCode(source, width, instruction);
   if (width === 64) {
     return [...read(destination, instruction), ...operand, opcodes.bits64, ...write(destination, instruction)];
   }
@@ -1077,6 +1165,15 @@ function translateRange(
     }
     if (instruction.op in BINARY) {
       out.push(...translateBinary(instruction));
+      if (FLAG_SETTING.has(instruction.op)) {
+        // an arithmetic result sets the flags a branch can read
+        flags.set = true;
+        const destination = instruction.operands[0];
+        flags.width = destination !== undefined && destination.kind === "reg" && destination.bits === 32 ? 32 : 64;
+      } else {
+        // a multiplication sets the flags too, to values this does not compute, so what was known before it is gone
+        flags.set = false;
+      }
       index += 1;
       continue;
     }
@@ -1133,8 +1230,22 @@ function functionExtent(bytes: Uint8Array, address: bigint): readonly Instructio
       continue;
     }
     if (instruction.op.startsWith("j")) work.push(branchTarget(instruction));
-    // a call returns to the instruction after it; the function it names is translated separately
-    work.push(offset + instruction.length);
+    /*
+     * A call returns to the instruction after it, and the function it names is translated separately. But a call to one that
+     * never returns has no code after it, and gcc emits exactly that shape: `call __stack_chk_fail` at the end of a
+     * stack-protected function, followed by the linker's zero padding. The two cases are distinguishable: a returning call
+     * must be followed by an instruction, so a byte that cannot start one is not a return address. Off the end of the bytes
+     * is still truncation, and still refused, because there is nothing there to distinguish it from a cut-off function.
+     */
+    const next = offset + instruction.length;
+    if (instruction.op === "call" && next < bytes.length) {
+      try {
+        decodeAt(next);
+      } catch {
+        continue;
+      }
+    }
+    work.push(next);
   }
 
   const ordered: Instruction[] = [];
@@ -1187,16 +1298,29 @@ function bodyOf(
 
   }
   translateRange(resolved, 0, resolved.length, new Map(), body, flags, loops, options);
-  if (!resolved.some((instruction) => instruction.op === "ret")) {
+  /*
+   * The block has to end with a value, because every function here returns `i64`. Three cases leave nothing on the stack: a
+   * `ret`, which returned already; a `jmp`, after which the fall-through is dead code and the validator is satisfied with the
+   * branch; and the two instructions that end a program rather than a block. `syscall` leaves `%rax` holding the call's answer,
+   * and a trailing `call` does too, whether or not it comes back.
+   */
+  if (resolved.at(-1)?.op !== "ret" && resolved.at(-1)?.op !== "jmp") {
     /*
      * A program's entry point usually ends in `exit`, which never comes back, so there is no value to return with. What it
      * leaves is `%rax`, where the call's answer would have gone. Ending in anything else is a truncated function, and that is
      * refused: guessing a value there would hide the truncation behind a plausible number.
      */
-    if (resolved.at(-1)?.op !== "syscall") {
+    // there is nothing else a live fall-through can end with, so anything else is the truncation this refuses
+    /*
+     * A trailing `call` is the other end a block can have: the instruction before the padding is a call to a function that never
+     * returns, so nothing follows it in this function's bytes. Returning `%rax` is right there too, because that is where a
+     * callee's answer would have gone if it came back.
+     */
+    const last = resolved.at(-1)?.op;
+    if (last !== "syscall" && last !== "call") {
       throw new TranslateError(
         resolved.at(-1)?.offset ?? 0,
-        "the block does not end in ret or in a syscall, so it has no value to return",
+        "the block does not end in ret, in a syscall or in a call that never returns, so it has no value to return",
       );
     }
     body.push(...globalGet(REGISTERS.indexOf("rax")));
@@ -1287,6 +1411,8 @@ function programOf(
     name,
     locals: LOCAL_COUNT,
     globals: REGISTERS.length,
+    // the thread pointer sits after the register file and is exported, so the host can point %fs somewhere else at run time
+    threadPointer: { name: "fs" },
     ...(options.syscalls === true ? { importFunction: { module: "env", field: "syscall" } } : {}),
     bodies,
     // the import appears only when something addresses memory, so a module that reads nothing still needs nothing

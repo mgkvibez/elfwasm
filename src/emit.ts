@@ -86,6 +86,15 @@ export interface ModuleOptions {
   /** How many `i64` globals to declare, which is where the register file lives. */
   readonly globals?: number;
   /**
+   * Add one more `i64` global after the registers and export it under this name: the thread pointer, `%fs`'s base.
+   *
+   * It is exported rather than imported on purpose. An imported global takes index 0 of the global index space, which would
+   * renumber all sixteen registers, and that renumbering is invisible at the call site: the module would still load, and
+   * every register would quietly be one slot off. Exported, the registers keep indices 0..15 and the host writes the thread
+   * pointer through the exports object, which is a `WebAssembly.Global` it can assign to.
+   */
+  readonly threadPointer?: { readonly name: string };
+  /**
    * A host function to import as `env.syscall`, taking the call number and six arguments and returning the result.
    *
    * It is a *function* import, so it occupies index 0 of the function index space: every translated function shifts up by one,
@@ -146,12 +155,14 @@ export function module(options: ModuleOptions): Uint8Array {
    * process begins in. They are globals rather than locals because a register outlives a call: a callee that pushes `%rbp`
    * has to push the caller's `%rbp`, and a local per function would push zero instead.
    */
+  const registerGlobals = options.globals ?? 0;
+  const globalCount = registerGlobals + (options.threadPointer === undefined ? 0 : 1);
   const globalSection =
-    options.globals === undefined || options.globals === 0
+    globalCount === 0
       ? []
       : section(6, [
-          ...unsigned(options.globals),
-          ...Array.from({ length: options.globals }, () => [I64, 0x01, 0x42, 0x00, 0x0b]).flat(),
+          ...unsigned(globalCount),
+          ...Array.from({ length: globalCount }, () => [I64, 0x01, 0x42, 0x00, 0x0b]).flat(),
         ]);
 
   /*
@@ -166,7 +177,22 @@ export function module(options: ModuleOptions): Uint8Array {
   const exportName = [...options.name].map((character) => character.charCodeAt(0));
   // the entry is the first *defined* function, so an imported one in front of it moves the export up by one
   const entryIndex = options.importFunction === undefined ? 0 : 1;
-  const exportBody = [0x01, ...unsigned(exportName.length), ...exportName, 0x00, ...unsigned(entryIndex)];
+  const threadName =
+    options.threadPointer === undefined ? [] : [...options.threadPointer.name].map((character) => character.charCodeAt(0));
+  const exportBody = [
+    ...unsigned(options.threadPointer === undefined ? 1 : 2),
+    ...unsigned(exportName.length),
+    ...exportName,
+    0x00,
+    ...unsigned(entryIndex),
+    /*
+     * The thread pointer follows the entry, and its index is the count of registers: the global section wrote them first. A
+     * global export is kind 0x03, and it comes back to the host as a mutable `WebAssembly.Global`.
+     */
+    ...(options.threadPointer === undefined
+      ? []
+      : [...unsigned(threadName.length), ...threadName, 0x03, ...unsigned(registerGlobals)]),
+  ];
 
   /*
    * One local group of the same type, which is all a register file needs, then the body and its `end`. The size that

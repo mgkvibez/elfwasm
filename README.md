@@ -60,11 +60,11 @@ dynamic linker would resolve, so it is refused rather than half-loaded. See [The
 
 What does **not** work yet: `REL` relocations, extended section numbering (`e_shnum == 0` with the real count in the first
 section's `sh_size`), SSE and `x87`, a `call` into libc (its code needs a dynamic linker's symbol resolution, not just
-relocations), and every syscall but `write`, `exit` and `exit_group`. Two honest limits of the mapping:
+relocations), `%gs` and every segment base but `%fs`, and every syscall but `write`, `exit`, `exit_group` and `arch_prctl`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 175
+**Tests:** 184
 
 ```bash
 npm ci && npm run verify
@@ -223,7 +223,8 @@ call: `%rax` holds the number and `%rdi`, `%rsi`, `%rdx`, `%r10`, `%r8`, `%r9` h
 instruction itself puts them, so the shim reads the registers the kernel reads. `%rcx` and `%r11` are clobbered, as the
 real instruction clobbers them, and flags are not trusted afterwards.
 
-Three calls are implemented, and that is the whole claim: `write`, `exit` and `exit_group`. Everything else returns
+Four calls are implemented, and that is the whole claim: `write`, `exit`, `exit_group`, and `arch_prctl` for the thread
+pointer. Everything else returns
 `-ENOSYS`, which is what a kernel returns for a call it does not have, so a program that needs one fails the way it would
 on a machine without it rather than silently reading zeroes. A `write` whose buffer is not entirely inside the image returns
 `-EFAULT` instead of copying whatever follows it. An `exit` does not return, so it throws out of the module and the machine
@@ -237,6 +238,36 @@ caller who does not know about it gets a refusal at translation rather than an i
 An imported function occupies index 0 of the WASM function index space, which shifts every translated function up by one.
 That is the kind of arithmetic that produces a module that validates and calls the wrong function, so it is pinned by a test
 that calls a callee in a module that also has the import, and that ends with the callee's own exit status.
+
+### The thread pointer
+
+`%fs:` addressing is how a compiler reaches thread-local storage, and the one place every libc-linked binary goes first:
+`mov %fs:0x28, %rax` in a function prologue is the stack canary's read. A `%fs:` operand becomes the thread pointer plus its
+displacement, with a base register as an offset inside the block and the image's base subtracted once at the end, so an
+address in thread-local storage goes through the same bound check as every other load.
+
+The thread pointer is a mutable `i64` global the module declares after the register file and *exports*, and the host writes
+it through the exports object when `arch_prctl(ARCH_SET_FS)` runs. Exported rather than imported, because an imported global
+takes index 0 of the global index space and would renumber all sixteen registers: a module with that mistake still loads,
+and every register is quietly one slot off. The four prose registers keep 0 to 15 either way.
+
+`arch_prctl` answers `ARCH_SET_FS` and `ARCH_GET_FS`, `-EINVAL` for an operation it does not have, and `-EFAULT` for a
+`GET_FS` whose result slot is not mapped. `%gs` and the other segment overrides are still refused by name, because their bases
+are not kept.
+
+Two things the processor decided rather than this file. `lea %fs:0x10, %rax` loads `0x10`: the segment override is
+ineffectual on `lea`, binutils warns about it, and the native run confirms it, so `lea` from `%fs:` is refused with that
+reason instead of translated into a disagreement with the hardware. And a stack-protected function compiled by gcc ends with
+`call __stack_chk_fail` followed by the linker's zero padding, so a `call` whose successor cannot be decoded now ends the
+function's extent: a returning call must have an instruction after it, and padding is not one. Off the end of the bytes is
+still truncation, and still refused.
+
+`tests/thread.test.ts` is the evidence, and it is a differential: six programs compared with Linux's answer. A canary written
+and read through `%fs:0x28`; the base moved twice mid-program, which is what proves the pointer is read at run time rather
+than resolved at translation; a base register used as an offset inside the block; the `GET_FS` round trip; the two error
+codes; and a trap when `%fs` was never pointed anywhere, where the bound check is the only thing between a thread-local read
+and a read of the image's own first bytes. Then a function compiled by `gcc -fstack-protector-strong` with a real frame,
+whose answer agrees with the processor's.
 
 ### The loader
 

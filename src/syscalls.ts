@@ -6,9 +6,9 @@
  * address space: a `write` whose buffer is outside the image is `-EFAULT` rather than a read of something that happens to be
  * there.
  *
- * Three calls are implemented, and that is the whole claim: `write`, `exit` and `exit_group`. Everything else returns `-ENOSYS`,
- * which is what a real kernel returns for a call it does not have, so a program that needs one fails the way it would on a
- * machine without it instead of silently reading zeroes.
+ * Four calls are implemented, and that is the whole claim: `write`, `exit`, `exit_group`, and `arch_prctl` for the thread
+ * pointer. Everything else returns `-ENOSYS`, which is what a real kernel returns for a call it does not have, so a program that
+ * needs one fails the way it would on a machine without it instead of silently reading zeroes.
  */
 
 import { addressSpaceOf } from "./image.js";
@@ -25,7 +25,16 @@ declare const WebAssembly: {
     module: unknown,
     imports?: { readonly env: Record<string, unknown> },
   ) => { readonly exports: Record<string, unknown> };
+  /** A mutable `i64` global, which is how a translated module's thread pointer comes back to the host. */
+  readonly Global: new (descriptor: { readonly value: "i64"; readonly mutable: boolean }, initial: bigint) => {
+    value: bigint;
+  };
 };
+
+/** The `WebAssembly.Global` a module exports for its thread pointer, as much of it as this layer writes. */
+interface ThreadPointer {
+  value: bigint;
+}
 
 /** The errno values this layer can return, in their negative form, which is how a syscall reports failure. */
 export const ERRNO = {
@@ -39,8 +48,21 @@ export const ERRNO = {
 /** Linux's x86-64 call numbers, named so the shim does not carry bare integers. */
 export const SYSCALLS = {
   write: 1n,
+  archPrctl: 158n,
   exit: 60n,
   exitGroup: 231n,
+} as const;
+
+/**
+ * The two `arch_prctl` operations that concern the thread pointer.
+ *
+ * `ARCH_SET_FS` points `%fs` at a block, and `ARCH_GET_FS` reports where it points, which is how a program that inherited a
+ * thread pointer finds it again. The GDT-entry forms are the 32-bit interface and are not named here: on x86-64 they are not
+ * how a thread pointer is set, and answering them would be answering a question this kernel cannot have been asked.
+ */
+export const ARCH_PRCTL = {
+  setFs: 0x1002n,
+  getFs: 0x1003n,
 } as const;
 
 /** Thrown when the program exits, because an exit never returns: the kernel replaces the process, so this throws instead. */
@@ -89,6 +111,13 @@ export class Machine {
   readonly #stdout: number[] = [];
   readonly #stderr: number[] = [];
   #exitCode: number | undefined;
+  /**
+   * The module's thread pointer, once it is instantiated.
+   *
+   * It is the module's global rather than a field of this class, and that is deliberate: the translated code reads it, so it has
+   * to live where `global.get` can reach it. This layer only keeps a handle to write it, which is what `arch_prctl` does.
+   */
+  #thread: ThreadPointer | undefined;
 
   constructor(options: MachineOptions) {
     this.addresses = addressSpaceOf(options.image);
@@ -105,10 +134,14 @@ export class Machine {
   /** Runs a translated module and reports what it produced. */
   run(module: Uint8Array): Outcome {
     const instance = new WebAssembly.Instance(new WebAssembly.Module(module), this.imports);
-    const entry = Object.values(instance.exports)[0];
+    const entry = Object.values(instance.exports).find((exported) => typeof exported === "function");
     if (typeof entry !== "function") {
       throw new Error("the module has no exported function to run");
     }
+    // the thread pointer starts at zero, which is what a process with no `%fs` base has, and `arch_prctl` moves it
+    const thread = instance.exports.fs;
+    this.#thread =
+      typeof thread === "object" && thread !== null && "value" in thread ? (thread as ThreadPointer) : undefined;
     try {
       entry();
     } catch (error) {
@@ -125,12 +158,36 @@ export class Machine {
 
   #syscall(number: bigint, a1: bigint, a2: bigint, a3: bigint): bigint {
     if (number === SYSCALLS.write) return this.#write(Number(a1), a2, Number(a3));
+    if (number === SYSCALLS.archPrctl) return this.#archPrctl(a1, a2);
     if (number === SYSCALLS.exit || number === SYSCALLS.exitGroup) {
       const code = Number(a1) & 0xff;
       this.#exitCode = code;
       throw new Exit(code);
     }
     return ERRNO.ENOSYS;
+  }
+
+  /**
+   * `arch_prctl`: point `%fs` somewhere, or report where it points.
+   *
+   * A module that did not export a thread pointer cannot have been translated with `%fs` addressing, so answering `-EINVAL` is
+   * the truthful thing rather than pretending the call worked against a base nothing reads.
+   */
+  #archPrctl(operation: bigint, address: bigint): bigint {
+    const thread = this.#thread;
+    if (thread === undefined) return ERRNO.EINVAL;
+    if (operation === ARCH_PRCTL.setFs) {
+      thread.value = address;
+      return 0n;
+    }
+    if (operation === ARCH_PRCTL.getFs) {
+      const slot = this.bytesAt(address, 8);
+      // a program asking where its thread pointer is has to supply somewhere to put the answer, and it may not be mapped
+      if (slot === undefined) return ERRNO.EFAULT;
+      new DataView(slot.buffer, slot.byteOffset, 8).setBigUint64(0, thread.value, true);
+      return 0n;
+    }
+    return ERRNO.EINVAL;
   }
 
   #write(descriptor: number, address: bigint, count: number): bigint {

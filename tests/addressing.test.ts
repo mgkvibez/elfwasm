@@ -169,12 +169,12 @@ describe("refusals that remain", () => {
     throw new Error("expected a refusal");
   });
 
-  it("still refuses a segment override", () => {
-    // %fs:(%rcx), whose base is not the image's
+  it("still refuses a segment override whose base is not kept", () => {
+    // %gs:(%rcx): the thread pointer is kept for %fs only, and reading the offset as a plain address would be a wrong answer
     try {
-      translateBytes(hex("64 48 8b 01 c3"), "main", { addresses: addressSpaceOf(image()) });
+      translateBytes(hex("65 48 8b 01 c3"), "main", { addresses: addressSpaceOf(image()) });
     } catch (error) {
-      expect((error as Error).message).toContain("a %fs: operand needs a segment base");
+      expect((error as Error).message).toContain("a %gs: operand needs the %gs base");
       return;
     }
     throw new Error("expected a refusal");
