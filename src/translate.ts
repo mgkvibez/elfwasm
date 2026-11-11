@@ -17,7 +17,7 @@
  * 32-bit compare ignores the upper half falls out of it.
  */
 
-import { decode, decodeInstruction, type Instruction, type Operand } from "./decode.js";
+import { decode, decodeInstruction, type Instruction, type Operand, type RegisterName } from "./decode.js";
 import {
   OP,
   globalGet,
@@ -36,6 +36,16 @@ import type { AddressSpace } from "./image.js";
 const REGISTERS = [
   "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
   "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+  /*
+   * The sixteen vector registers, as two 64-bit halves each, which is what an `i64` global can hold. They come after the
+   * general registers because the numbering of the general file is the encoding's, and the thread pointer is the global after
+   * the last of these.
+   *
+   * A half is a register here rather than a pair of locals so that `movq %xmm0, 0x20(%rsp)` is the store it looks like: the
+   * existing `mov`-to-memory path reads a register and writes an address, and the low half of a vector register is a register
+   * that holds 64 bits.
+   */
+  ...Array.from({ length: 16 }, (_, number) => [`xmm${number}.lo`, `xmm${number}.hi`] as const).flat(),
 ] as const;
 
 /** The two locals `cmp` and `test` leave their operands in, so a branch can be the comparison. */
@@ -55,13 +65,21 @@ const CMP_B = 1;
  */
 const ADDR = 2;
 /**
+ * Where a vector instruction keeps the two halves it interleaves.
+ *
+ * Not `CMP_A` and `CMP_B`: those hold a comparison that a later branch reads, and an instruction that writes no flag must leave
+ * them alone, so a `punpckldq` cannot borrow them any more than a byte store can.
+ */
+const SSE_A = 4;
+const SSE_B = 5;
+/**
  * Where the block a body is executing is recorded, for a body whose control flow is not a tree.
  *
  * Registers are globals and a comparison's operands are locals, so a block of instructions that begins anywhere needs no state of
  * its own beyond which block to run next. This local is that.
  */
 const PC = 3;
-const LOCAL_COUNT = 4;
+const LOCAL_COUNT = 6;
 
 /** The imported syscall's function index, which is 0: an import comes before every function the module defines. */
 const SYSCALL_INDEX = 0;
@@ -626,6 +644,20 @@ function loadByteFromMemory(operand: Operand, instruction: Instruction): number[
 function storeToMemory(operand: Operand, value: readonly number[], width: 8 | 16 | 32 | 64, instruction: Instruction): number[] {
   const code = { 8: OP.i32Store8, 16: OP.i32Store16, 32: OP.i32Store, 64: OP.i64Store }[width];
   return [...addressOf(operand, instruction), ...value, code, ...memarg(0)];
+}
+
+/** True for a register name that is one half of a vector register, as opposed to a general or byte register. */
+function isVectorHalf(operand: Operand): boolean {
+  return operand.kind === "reg" && (operand.name.endsWith(".lo") || operand.name.endsWith(".hi"));
+}
+
+/** The other half of a vector register, which is where a write of the whole register puts the bits it did not use. */
+function otherHalf(operand: Operand, instruction: Instruction): Operand {
+  if (operand.kind !== "reg") throw new TranslateError(instruction.offset, "a vector register is a register operand");
+  const { name, bits } = operand;
+  const swapped = name.endsWith(".lo") ? `${name.slice(0, -3)}.hi` : name.endsWith(".hi") ? `${name.slice(0, -3)}.lo` : undefined;
+  if (swapped === undefined) throw new TranslateError(instruction.offset, `${name} is not half of a vector register`);
+  return { kind: "reg", name: swapped as RegisterName, bits };
 }
 
 function translateMov(instruction: Instruction): number[] {
@@ -1454,6 +1486,84 @@ function translateRange(
       }
       // `lea` computes an address and writes a register, and the flags it finds are the flags it leaves
       out.push(...source.addressCode, ...write(destination, instruction));
+      index += 1;
+      continue;
+    }
+    if (instruction.op === "movd" || instruction.op === "movq") {
+      /*
+       * The two directions of a vector move are different instructions: into a vector register the whole 128 bits are written,
+       * because `movd` clears the upper half, and out of one it is an ordinary store of the low 64 bits. The second is what the
+       * `mov`-to-memory path already does, given a register operand that holds those 64 bits, which is how the vector file is modelled.
+       */
+      const [destination, source] = instruction.operands;
+      if (destination === undefined || source === undefined) {
+        throw new TranslateError(instruction.offset, `${instruction.op} needs two operands`);
+      }
+      if (instruction.op === "movq") {
+        if (destination.kind !== "memory" || source.kind !== "reg") {
+          throw new TranslateError(instruction.offset, "movq from a vector register stores its low 64 bits, so it needs memory");
+        }
+        out.push(...translateMovToMemory(destination, source, instruction));
+        index += 1;
+        continue;
+      }
+      if (destination.kind === "reg" && isVectorHalf(destination)) {
+        const value =
+          source.kind === "memory"
+            ? loadFromMemory(source, source.bits === 64 ? 64 : 32, instruction)
+            : read(source, instruction);
+        const zeroExtend = destination.bits === 32 ? [NARROW_32, WIDEN_32] : [];
+        out.push(
+          ...value,
+          ...zeroExtend,
+          ...write(destination, instruction),
+          // the upper half is cleared, which is what makes `movd` a write of the whole register rather than of its low half
+          ...i64Const(0n),
+          ...globalSet(slotOf(otherHalf(destination, instruction), instruction).local),
+        );
+        index += 1;
+        continue;
+      }
+      if (source.kind === "reg" && isVectorHalf(source)) {
+        // out of a vector register: four bytes into a register or into memory, which is an ordinary `mov` at that width
+        out.push(...translateMov({ ...instruction, op: "mov", operands: [destination, source] }));
+        index += 1;
+        continue;
+      }
+      throw new TranslateError(instruction.offset, "movd needs a vector register on exactly one side");
+    }
+    if (instruction.op === "punpckldq") {
+      /*
+       * `punpckldq %xmm2, %xmm0` interleaves the four low dwords: the result is `[dst0, src0, dst1, src1]`, so each half of the
+       * destination is a dword of its own half or'ed with a dword of the source's, shifted up. The two halves are read into
+       * scratch locals first, because the destination's low half is written after its high half has been computed from it.
+       */
+      const [destination, source] = instruction.operands;
+      if (destination === undefined || source === undefined || destination.kind !== "reg" || source.kind !== "reg") {
+        throw new TranslateError(instruction.offset, "punpckldq takes two vector registers");
+      }
+      out.push(...read(destination, instruction), ...localSet(SSE_A));
+      out.push(...read(source, instruction), ...localSet(SSE_B));
+      const dword = (local: number, shift: bigint): number[] => [
+        ...localGet(local),
+        ...(shift === 0n ? [] : [...i64Const(shift), OP.i64ShrU]),
+        ...i64Const(0xffffffffn),
+        OP.i64And,
+      ];
+      out.push(
+        ...dword(SSE_A, 32n),
+        ...dword(SSE_B, 32n),
+        ...i64Const(32n),
+        OP.i64Shl,
+        OP.i64Or,
+        ...globalSet(slotOf(otherHalf(destination, instruction), instruction).local),
+        ...dword(SSE_A, 0n),
+        ...dword(SSE_B, 0n),
+        ...i64Const(32n),
+        OP.i64Shl,
+        OP.i64Or,
+        ...globalSet(slotOf(destination, instruction).local),
+      );
       index += 1;
       continue;
     }

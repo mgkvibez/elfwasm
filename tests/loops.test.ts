@@ -128,3 +128,18 @@ describe("an entry point", () => {
     expect(run(hex("b8 01 00 00 00 0f a2 48 89 d0 c3"))).toBe(0n);
   });
 });
+
+describe("the vector register file", () => {
+  it("moves a value into a vector register and back out", () => {
+    /*
+     * `mov $0x11223344,%eax ; movd %eax,%xmm1 ; mov $0,%eax ; movd %xmm1,%eax ; ret`. The zeroing mov is what makes the second
+     * movd the only possible source of the answer, so a translation that dropped the write would answer 0 instead.
+     */
+    expect(run(hex("b8 44 33 22 11 66 0f 6e c8 b8 00 00 00 00 66 0f 7e c8 c3"))).toBe(0x11223344n);
+  });
+
+  it("puts the value in the register the modrm field names, not the one the r/m field names", () => {
+    // the same program with the vector register moved from %xmm1 to %xmm0 and back, so the two fields cannot be confused
+    expect(run(hex("b8 78 56 34 12 66 0f 6e c0 b8 00 00 00 00 66 0f 7e c0 c3"))).toBe(0x12345678n);
+  });
+});

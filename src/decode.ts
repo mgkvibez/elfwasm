@@ -48,11 +48,21 @@ export type Register =
   | "r14"
   | "r15";
 
+/** The vector file, named by register and half, because a WASM `i64` global holds one half of a 128-bit register. */
+export type VectorRegisterName = `xmm${0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15}.${"lo" | "hi"}`;
+
 export type RegisterName =
   | Register
   | (typeof BYTE_REGISTERS)[number]
   | (typeof HIGH_BYTE_REGISTERS)[number]
-  | (typeof WORD_REGISTERS)[number];
+  | (typeof WORD_REGISTERS)[number]
+  | VectorRegisterName;
+
+/** One half of a vector register as an operand, so a store of its low 64 bits is an ordinary 64-bit store. */
+function vectorOperand(code: number, extended: boolean, half: "lo" | "hi", bits: 32 | 64): Operand {
+  const index = code | (extended ? 8 : 0);
+  return { kind: "reg", name: `xmm${index}.${half}` as VectorRegisterName, bits };
+}
 
 export type Operand =
   | { readonly kind: "reg"; readonly name: RegisterName; readonly bits: 8 | 16 | 32 | 64 }
@@ -240,6 +250,8 @@ function byteRegisterOperand(code: number, extended: boolean, rexPresent: boolea
 interface ModRm {
   readonly mode: number;
   readonly regField: number;
+  /** The register the modrm's r/m field names, when it names one: a vector encoding reads it as a vector register. */
+  readonly rmField?: number;
   readonly rm: Operand;
 }
 
@@ -254,7 +266,7 @@ function decodeModRm(
   const regField = (byte >> 3) & 0x7;
   const rmField = byte & 0x7;
 
-  if (mode === 3) return { mode, regField, rm: registerOperand(rmField, rex.b, bits, rex.present) };
+  if (mode === 3) return { mode, regField, rmField, rm: registerOperand(rmField, rex.b, bits, rex.present) };
 
   let base: Register | undefined;
   let index: Register | undefined;
@@ -343,6 +355,8 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
   const cursor: Cursor = { bytes, start: offset, index: offset };
   let rex: Rex = { w: false, r: false, x: false, b: false, present: false };
   let segment: "fs" | "gs" | "cs" | "ss" | "ds" | "es" | undefined;
+  // set by the 0x66 prefix in front of 0x0f, which is what makes the four vector encodings vector instructions
+  let vector = false;
 
   for (;;) {
     const next = bytes[cursor.index];
@@ -360,12 +374,30 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
         const modrm = decodeModRm(cursor, rex, 32, segment);
         return { offset, length: cursor.index - offset, op: "nop", operands: [modrm.rm] };
       }
-      if (bytes[cursor.index + 1] === 0x0f) {
-        // 0x66 0f is never a 16-bit operand: it is the mandatory prefix of an SSE encoding, and calling it a "16-bit
-        // operand size prefix" in the error would point a reader at the wrong part of the architecture
+      // a REX prefix may sit between the 0x66 and the 0x0f: `66 41 0f 6e` is how a `movd %r8d,%xmm0` is laid out
+      let afterPrefix = cursor.index + 1;
+      const maybeRex = bytes[afterPrefix] ?? 0;
+      if (maybeRex >= 0x40 && maybeRex <= 0x4f) afterPrefix += 1;
+      if (bytes[afterPrefix] === 0x0f) {
+        /*
+         * 0x66 0f is never a 16-bit operand: it is the mandatory prefix of an SSE encoding. calling it a "16-bit operand size
+         * prefix" in the error would point a reader at the wrong part of the architecture.
+         *
+         * Four of those encodings are in the subset, and they are the ones a compiled program's startup uses to move a 32-bit
+         * value into a vector register and interleave it: `movd` in both directions, `punpckldq`, and `movq` back out to
+         * memory. They are decoded here rather than in the two-byte switch because the prefix is what makes them vector
+         * instructions; without it, `0f 62` and `0f d6` are MMX and would write a register file this does not have.
+         */
+        const third = bytes[afterPrefix + 1];
+        if (third === 0x6e || third === 0x7e || third === 0x62 || third === 0xd6) {
+          // only the 0x66 is consumed: the loop reads the REX and the 0x0f itself, in the order the encoding has them
+          cursor.index += 1;
+          vector = true;
+          continue;
+        }
         throw new DecodeError(
           offset,
-          `0x66 0f 0x${(bytes[cursor.index + 2] ?? 0).toString(16)} is an SSE instruction, and SSE is not in the decoded subset`,
+          `0x66 0f 0x${(third ?? 0).toString(16)} is an SSE instruction, and SSE is not in the decoded subset`,
         );
       }
       throw new DecodeError(offset, "a 16-bit operand size prefix (0x66) is not in the decoded subset");
@@ -501,6 +533,42 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
     if (second === 0xaf) {
       const modrm = decodeModRm(cursor, rex, bits, segment);
       return finish("imul", [registerOperand(modrm.regField, rex.r, bits), modrm.rm]);
+    }
+    if (vector && second === 0x6e) {
+      // `movd`/`movq` into a vector register: 32 bits, or 64 with REX.W, from a general register or memory. The whole 128-bit
+      // destination is written, because the upper half is cleared, which the translator does as a second write.
+      const modrm = decodeModRm(cursor, rex, bits, segment);
+      return finish("movd", [
+        vectorOperand(modrm.regField, rex.r, "lo", bits),
+        modrm.rm.kind === "memory" ? { ...modrm.rm, bits } : modrm.rm,
+      ]);
+    }
+    if (vector && second === 0x7e) {
+      // the same in the other direction, four bytes into a general register or into memory
+      const modrm = decodeModRm(cursor, rex, bits, segment);
+      return finish("movd", [
+        modrm.rm.kind === "memory" ? { ...modrm.rm, bits } : modrm.rm,
+        vectorOperand(modrm.regField, rex.r, "lo", bits),
+      ]);
+    }
+    if (vector && second === 0x62) {
+      // `punpckldq`: the four low dwords of the two operands, interleaved
+      const modrm = decodeModRm(cursor, rex, 64, segment);
+      if (modrm.rm.kind === "memory") {
+        throw new DecodeError(offset, "punpckldq from memory is not in the decoded subset: only a vector register source is");
+      }
+      return finish("punpckldq", [
+        vectorOperand(modrm.regField, rex.r, "lo", 64),
+        vectorOperand(modrm.rmField ?? 0, rex.b, "lo", 64),
+      ]);
+    }
+    if (vector && second === 0xd6) {
+      // `movq` out to memory: the low 64 bits of a vector register, which is the store a startup uses to keep a value it built
+      const modrm = decodeModRm(cursor, rex, 64, segment);
+      if (modrm.rm.kind !== "memory") {
+        throw new DecodeError(offset, "movq from a vector register needs a memory destination, which is the only form 66 0f d6 has");
+      }
+      return finish("movq", [{ ...modrm.rm, bits: 64 }, vectorOperand(modrm.regField, rex.r, "lo", 64)]);
     }
     if (second === 0xa2) {
       // `cpuid`: which CPU this is, and what it can do, answered into four fixed registers from the leaf in %eax

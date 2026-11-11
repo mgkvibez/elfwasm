@@ -47,6 +47,46 @@ const asBytes = async (): Promise<Uint8Array> => {
 
 const operandsOf = (instruction: Instruction): readonly Operand[] => instruction.operands;
 
+describe("the vector encodings a startup uses", () => {
+  it("reads movd into a vector register, with the register field naming the vector", () => {
+    // `66 41 0f 6e c0`: movd %r8d,%xmm0, which is how __libc_start_main packs two 32-bit arguments into one xmm
+    const [instruction] = decode(hex("66 41 0f 6e c0"));
+    expect(instruction?.op).toBe("movd");
+    expect(instruction?.operands[0]).toMatchObject({ kind: "reg", name: "xmm0.lo", bits: 32 });
+    expect(instruction?.operands[1]).toMatchObject({ kind: "reg", name: "r8", bits: 32 });
+    expect(instruction?.length).toBe(5);
+  });
+
+  it("reads the same encoding in the other direction with 0x7e", () => {
+    // `66 0f 7e c8`: movd %xmm1,%eax
+    const [instruction] = decode(hex("66 0f 7e c8"));
+    expect(instruction?.op).toBe("movd");
+    expect(instruction?.operands[0]).toMatchObject({ kind: "reg", name: "rax", bits: 32 });
+    expect(instruction?.operands[1]).toMatchObject({ kind: "reg", name: "xmm1.lo" });
+  });
+
+  it("reads punpckldq and refuses its memory form, which is the half that is not implemented", () => {
+    const [instruction] = decode(hex("66 0f 62 c2"));
+    expect(instruction?.op).toBe("punpckldq");
+    expect(instruction?.operands[0]).toMatchObject({ name: "xmm0.lo" });
+    expect(instruction?.operands[1]).toMatchObject({ name: "xmm2.lo" });
+    // `66 0f 62 00`: punpckldq (%rax),%xmm0, whose 128-bit load this does not model
+    expect(() => decode(hex("66 0f 62 00"))).toThrow(/punpckldq from memory/);
+  });
+
+  it("reads movq out to memory, which is a 64-bit store of the low half", () => {
+    // `66 0f d6 05 98 c8 0a 00`: movq %xmm0,0xac898(%rip)
+    const [instruction] = decode(hex("66 0f d6 05 98 c8 0a 00"));
+    expect(instruction?.op).toBe("movq");
+    expect(instruction?.operands[0]).toMatchObject({ kind: "memory", bits: 64 });
+    expect(instruction?.operands[1]).toMatchObject({ name: "xmm0.lo", bits: 64 });
+  });
+
+  it("still refuses an SSE encoding it does not implement", () => {
+    expect(() => decode(hex("66 0f 10 c1"))).toThrow(/SSE is not in the decoded subset/);
+  });
+});
+
 describe("the two instructions an entry point ends with", () => {
   it("reads hlt as its own instruction of one byte", () => {
     const [instruction] = decode(hex("f4"));

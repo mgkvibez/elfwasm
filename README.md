@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 221
+**Tests:** 228
 
 ```bash
 npm ci && npm run verify
@@ -381,8 +381,29 @@ something new, and none of them was arithmetic:
    feature. That is a real machine, and inventing feature bits would send a program down a path this translator cannot run.
 
 The twelve instructions all translate now, so the frontier is inside libc rather than in the entry itself. Translating the `call`
-means finding the callee's extent, and walking `__libc_start_main` stops at `+0x1dc` on a 16-bit operand size prefix: an
-instruction whose operand is 16 bits wide, which is the next piece.
+means finding the callee's extent, and walking `__libc_start_main` gets 0x152 bytes further than it did, to `+0x32e`.
+
+### The vector register file
+
+That 0x152 bytes needed SSE, because glibc packs two 32-bit arguments into one vector register and stores the pair. A vector
+register is 128 bits and a WASM global is 64, so `%xmm0` to `%xmm15` are two `i64` globals each, a low half and a high half, and
+they sit after the general file in the global section. Naming a half is what makes the rest cheap: the low half of a vector
+register is a register that holds 64 bits, so `movq %xmm0, 0x20(%rsp)` is the store it looks like and goes through the existing
+`mov`-to-memory path with no new address arithmetic.
+
+Four encodings are in the subset, and they are the ones a startup uses:
+
+1. `66 0f 6e`, `movd` into a vector register: 32 bits, or 64 with REX.W, from a general register or memory. The whole 128 bits are
+   written, because the upper half is cleared, which is a second write of zero rather than a special case.
+2. `66 0f 7e`, the same in the other direction: four bytes into a general register or into memory.
+3. `66 0f 62`, `punpckldq`: the four low dwords of the two operands, interleaved, so each half of the destination is a dword of its
+   own low half or'ed with a dword of the source's, shifted up. Both halves are read into scratch locals first, because the
+   destination's low half is written after its high half has been computed from it.
+4. `66 0f d6`, `movq` out to memory: the low 64 bits of a vector register.
+
+Where it stops now: `+0x32e` into `__libc_start_main`, on `0xf7 /7`, which is `idiv`. That is a division whose dividend is `%rdx:%rax`
+and whose quotient and remainder are `%rax` and `%rdx`: a 128-bit dividend, which is not expressible with one 64-bit value, so it is
+refused by name. It and `mul` are the next piece.
 
 The cost of the dispatcher is worth stating: a body with any backward branch takes that path, so even a clean loop is expressed by
 naming blocks rather than as a WASM `loop`. The structured path is kept for the bodies that are trees, which is most of the small
