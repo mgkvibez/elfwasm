@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 237
+**Tests:** 245
 
 ```bash
 npm ci && npm run verify
@@ -421,8 +421,25 @@ WASM has neither a widening multiply nor a 128-bit divide, so both are built out
 4. *`cwde`, `cdqe`, `cdq` and `cqo`* now translate, because `cqo` is how a compiler makes `%rdx:%rax` one signed number before
    dividing it. Both halves of the widening are a shift out and back: `%rdx` is `%rax` shifted down arithmetically by 63.
 
-Where it stops now: `+0x4b4` into `__libc_start_main`, on `0f 16`, which is `movhps`: a 64-bit load into the *upper* half of a vector
-register. The half is modelled, so that is a decoder and translation case rather than a new concept.
+### Half-width and whole-register moves
+
+The four half-width moves name one half of a vector register and leave the other one alone, which is why they exist: a routine that
+has packed one half fills the other with one of them. `0f 12` and `0f 13` are the low half and `0f 16` and `0f 17` the high one, with
+`0x12`/`0x16` loading and `0x13`/`0x17` storing. Their register forms are shuffles between two vector registers rather than moves, so
+those are refused by name.
+
+The whole-register moves are `0f 28`/`0f 29` (`movaps`), `0f 10`/`0f 11` (`movups`), `66 0f 6f`/`66 0f 7f` (`movdqa`) and
+`f3 0f 6f`/`f3 0f 7f` (`movdqu`), which differ only in an alignment promise the emulated memory has no way to break. WASM has no
+16-byte load or store, so each is two 64-bit accesses at the same address, eight bytes apart: the low half at the operand's own
+offset and the high half at the memarg's next one. Their register forms are refused for the same reason the shuffles are.
+
+The four integer logical operations are in as well: `pand`, `pandn`, `por` and `pxor`, each bitwise, each applied to both halves
+independently. `pandn` is the one that is not symmetric, computing `~destination & source`.
+
+Where it stops now: `+0x839` into `__libc_start_main`, on `42 ff 54 f5 00`, which is `call *0x0(%rbp,%r14,8)`: an indirect call
+through a function-pointer table. The callee's extent is a runtime value, so translating it ahead of time is not possible and the
+translator would have to translate a target it discovers while running. That is the next piece, and it is a structural one rather
+than an opcode.
 
 The cost of the dispatcher is worth stating: a body with any backward branch takes that path, so even a clean loop is expressed by
 naming blocks rather than as a WASM `loop`. The structured path is kept for the bodies that are trees, which is most of the small

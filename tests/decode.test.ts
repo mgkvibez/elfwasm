@@ -98,6 +98,41 @@ describe("the vector encodings a startup uses", () => {
     expect(decode(hex("f3 0f 7e c8"))[0]?.operands[0]).toMatchObject({ name: "xmm1.lo" });
   });
 
+  it("reads the 16-byte moves between a vector register and memory, in both directions", () => {
+    // `0f 29 44 24 20`: movaps %xmm0,0x20(%rsp), the whole 128 bits, which is two 64-bit stores here
+    const [store] = decode(hex("0f 29 44 24 20"));
+    expect(store?.op).toBe("movaps");
+    expect(store?.operands[0]).toMatchObject({ kind: "memory" });
+    expect(store?.operands[1]).toMatchObject({ name: "xmm0.lo", bits: 64 });
+    expect(decode(hex("0f 28 00"))[0]?.op).toBe("movaps");
+    // `66 0f 6f` is movdqa and `f3 0f 6f` is movdqu, which differ only in an alignment promise
+    expect(decode(hex("66 0f 6f 00"))[0]?.op).toBe("movdqa");
+    expect(decode(hex("f3 0f 6f 00"))[0]?.op).toBe("movdqu");
+    expect(decode(hex("0f 10 00"))[0]?.op).toBe("movups");
+  });
+
+  it("refuses a 16-bit move between two vector registers, whose 128 bits are not one value here", () => {
+    // the register form of the same opcode is a move between two vector registers rather than a load
+    expect(() => decode(hex("66 0f 6f c1"))).toThrow(/not one value here/);
+  });
+
+  it("reads the half-width moves, which name one half and leave the other alone", () => {
+    // `0f 16 44 24 08`: movhps 0x8(%rsp),%xmm0 loads into the upper half; `0f 13` stores the lower one
+    expect(decode(hex("0f 16 44 24 08"))[0]).toMatchObject({ op: "movhps" });
+    expect(decode(hex("0f 16 44 24 08"))[0]?.operands[0]).toMatchObject({ name: "xmm0.hi" });
+    expect(decode(hex("0f 13 44 24 08"))[0]).toMatchObject({ op: "movlps" });
+    expect(decode(hex("0f 13 44 24 08"))[0]?.operands[0]).toMatchObject({ kind: "memory" });
+  });
+
+  it("reads the four integer logical operations on vector registers", () => {
+    expect(decode(hex("66 0f db c1"))[0]?.op).toBe("pand");
+    expect(decode(hex("66 0f df c1"))[0]?.op).toBe("pandn");
+    expect(decode(hex("66 0f eb c1"))[0]?.op).toBe("por");
+    expect(decode(hex("66 0f ef c1"))[0]?.op).toBe("pxor");
+    // a memory source is 128 bits, which this does not carry
+    expect(() => decode(hex("66 0f db 00"))).toThrow(/not one value here/);
+  });
+
   it("still refuses an SSE encoding it does not implement", () => {
     expect(() => decode(hex("66 0f 10 c1"))).toThrow(/SSE is not in the decoded subset/);
   });
@@ -260,8 +295,10 @@ describe("the pieces a compiler leans on", () => {
   });
 
   it("calls an SSE encoding SSE, not a 16-bit operand size, when the 0x66 prefix is the mandatory one", () => {
-    // 66 0f 6f is movdqa: the 0x66 here is part of the SIMD encoding, and saying "16-bit operand" would be wrong
-    expect(refuseBytes(hex("66 0f 6f 05 00 00 00 00")).message).toContain("SSE");
+    // 66 0f 6f is movdqa, which is decoded now: the 0x66 there is part of the encoding, and saying "16-bit operand" would be wrong
+    expect(decode(hex("66 0f 6f 05 00 00 00 00"))[0]?.op).toBe("movdqa");
+    // 66 0f 74 is pcmpeqb, which is still SSE this does not implement, and the prefix is still not an operand size
+    expect(refuseBytes(hex("66 0f 74 c1")).message).toContain("SSE");
     // and the unprefixed form, xorps, is SSE too
     expect(refuseBytes(hex("0f 57 c0")).message).toContain("SSE");
   });

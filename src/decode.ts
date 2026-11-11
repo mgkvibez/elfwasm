@@ -175,13 +175,23 @@ interface Rex {
  * opcodes the subset handles (`0f 05`, `0x0b`, `0x1e`, `0x1f`, `0x80` to `0x9f`, `0xaf`, `0xb6`, `0xb7`, `0xbe`, `0xbf`)
  * are checked before this predicate is reached.
  */
+/**
+ * The two-byte opcodes this decoder reads under a `0x66` prefix.
+ *
+ * The prefix is what makes them vector instructions rather than the MMX or packed-float instructions the same bytes name without
+ * it, so a byte that is not in this set is refused by name rather than read as something it is not.
+ */
+const VECTOR_WITH_66 = new Set([0x62, 0x6e, 0x7e, 0xd6, 0x6f, 0x7f, 0x28, 0x29, 0xdb, 0xdf, 0xeb, 0xef]);
+
 function isSseOpcode(second: number): boolean {
   return (
-    (second >= 0x10 && second <= 0x17) ||
-    (second >= 0x28 && second <= 0x2f) ||
+    false ||
+    (second >= 0x14 && second <= 0x15) ||
+    (second >= 0x2a && second <= 0x2f) ||
     second === 0x6e ||
     second === 0x7e ||
-    (second >= 0x50 && second <= 0x7f) ||
+    (second >= 0x50 && second <= 0x6d) ||
+    (second >= 0x6f && second <= 0x7f) ||
     (second >= 0xc2 && second <= 0xc6) ||
     second >= 0xd0
   );
@@ -390,8 +400,8 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
          * memory. They are decoded here rather than in the two-byte switch because the prefix is what makes them vector
          * instructions; without it, `0f 62` and `0f d6` are MMX and would write a register file this does not have.
          */
-        const third = bytes[afterPrefix + 1];
-        if (third === 0x6e || third === 0x7e || third === 0x62 || third === 0xd6) {
+        const third = bytes[afterPrefix + 1] ?? 0xff;
+        if (VECTOR_WITH_66.has(third)) {
           // only the 0x66 is consumed: the loop reads the REX and the 0x0f itself, in the order the encoding has them
           cursor.index += 1;
           vector = true;
@@ -458,7 +468,7 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
       let afterPrefix = cursor.index + 1;
       const maybeRex = bytes[afterPrefix] ?? 0;
       if (maybeRex >= 0x40 && maybeRex <= 0x4f) afterPrefix += 1;
-      if (bytes[afterPrefix] === 0x0f && bytes[afterPrefix + 1] === 0x7e) {
+      if (bytes[afterPrefix] === 0x0f && (bytes[afterPrefix + 1] === 0x7e || bytes[afterPrefix + 1] === 0x6f || bytes[afterPrefix + 1] === 0x7f)) {
         cursor.index += 1;
         vector = true;
         mandatoryF3 = true;
@@ -598,6 +608,82 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
         throw new DecodeError(offset, "movq from a vector register needs a memory destination, which is the only form 66 0f d6 has");
       }
       return finish("movq", [{ ...modrm.rm, bits: 64 }, vectorOperand(modrm.regField, rex.r, "lo", 64)]);
+    }
+    if (
+      (vector && (second === 0x28 || second === 0x29 || second === 0x6f || second === 0x7f)) ||
+      (mandatoryF3 && (second === 0x6f || second === 0x7f)) ||
+      second === 0x10 ||
+      second === 0x11 ||
+      second === 0x28 ||
+      second === 0x29
+    ) {
+      /*
+       * The whole-register moves: `0f 28` and `0f 29` are the aligned pair, `0f 10` and `0f 11` the unaligned one, `66 0f 6f` and
+       * `66 0f 7f` are `movdqa`, and `f3 0f 6f` with `f3 0f 7f` are `movdqu`. All of them move 128 bits between a vector register and
+       * memory, and the pairs differ only in an alignment promise the emulated memory has no way to break.
+       *
+       * Only the memory forms are decoded. With a register operand the same bytes are a move between two vector registers, whose
+       * 128 bits are not one value here.
+       */
+      const modrm = decodeModRm(cursor, rex, 64, segment);
+      if (modrm.rm.kind !== "memory") {
+        throw new DecodeError(
+          offset,
+          `0x0f 0x${second.toString(16)} with a register operand is a move between two vector registers, whose 128-bit value is ` +
+            "not one value here; only its memory form is decoded",
+        );
+      }
+      const register = vectorOperand(modrm.regField, rex.r, "lo", 64);
+      const loads = second === 0x10 || second === 0x28 || second === 0x6f;
+      const op =
+        second === 0x10 || second === 0x11
+          ? "movups"
+          : second === 0x28 || second === 0x29
+            ? "movaps"
+            : mandatoryF3
+              ? "movdqu"
+              : "movdqa";
+      return finish(op, loads ? [register, modrm.rm] : [modrm.rm, register]);
+    }
+    if (vector && (second === 0xdb || second === 0xdf || second === 0xeb || second === 0xef)) {
+      /*
+       * The four integer logical operations: `pand`, `pandn`, `por` and `pxor`, each of which is bitwise and applies to each half of
+       * the 128 bits independently, which is why a half is a register here. `pandn` is the one that is not symmetric: it computes
+       * `~destination & source`.
+       */
+      const modrm = decodeModRm(cursor, rex, 64, segment);
+      if (modrm.rm.kind === "memory") {
+        throw new DecodeError(
+          offset,
+          `0x66 0f 0x${second.toString(16)} from memory is not decoded: its 128-bit source is not one value here`,
+        );
+      }
+      const op = { 0xdb: "pand", 0xdf: "pandn", 0xeb: "por", 0xef: "pxor" }[second] as string;
+      return finish(op, [vectorOperand(modrm.regField, rex.r, "lo", 64), vectorOperand(modrm.rmField ?? 0, rex.b, "lo", 64)]);
+    }
+    if (second === 0x12 || second === 0x13 || second === 0x16 || second === 0x17) {
+      /*
+       * The four half-width moves: `0f 12` and `0f 13` are the low half of a vector register and `0f 16` and `0f 17` the high one,
+       * with 0x12 and 0x16 loading and 0x13 and 0x17 storing. Unlike `movq`, the half that is not named is left alone, which is the
+       * whole reason they exist: a routine that has already packed one half uses one of these to fill the other.
+       *
+       * Only the memory forms are in the subset. With a register operand the same four opcodes are shuffles between two vector
+       * registers, which is a different instruction rather than a different operand.
+       */
+      const modrm = decodeModRm(cursor, rex, 64, segment);
+      if (modrm.rm.kind !== "memory") {
+        throw new DecodeError(
+          offset,
+          `0x0f 0x${second.toString(16)} with a register operand is a shuffle between two vector registers, which is not in the ` +
+            "decoded subset; only its memory form is",
+        );
+      }
+      const half = second === 0x12 || second === 0x13 ? "lo" : "hi";
+      const destination = vectorOperand(modrm.regField, rex.r, half, 64);
+      const memory = { ...modrm.rm, bits: 64 } as const;
+      // 0x13 and 0x17 name memory first, because they store
+      const op = second === 0x16 || second === 0x17 ? "movhps" : "movlps";
+      return finish(op, second === 0x16 || second === 0x12 ? [destination, memory] : [memory, destination]);
     }
     if (second === 0xa2) {
       // `cpuid`: which CPU this is, and what it can do, answered into four fixed registers from the leaf in %eax

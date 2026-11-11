@@ -184,3 +184,15 @@ describe("the vector load", () => {
     expect(run(hex("b8 44 33 22 11 66 0f 6e c8 f3 0f 7e c1 b8 00 00 00 00 66 0f 7e c8 c3"))).toBe(0x11223344n);
   });
 });
+
+describe("the vector logical operations", () => {
+  it("ands the low halves of two vector registers", () => {
+    // `mov $0xf0f0,%eax ; movd %eax,%xmm0 ; mov $0xffff,%eax ; movd %eax,%xmm1 ; pand %xmm1,%xmm0 ; movd %xmm0,%eax ; ret`
+    expect(run(hex("b8 f0 f0 00 00 66 0f 6e c0 b8 ff ff 00 00 66 0f 6e c8 66 0f db c1 66 0f 7e c0 c3"))).toBe(0xf0f0n);
+  });
+
+  it("exclusive-ors them, which leaves nothing where the bits agree", () => {
+    // the same program with pxor, and the same two values, which agree in every bit the mask covers below 0x10000
+    expect(run(hex("b8 f0 f0 00 00 66 0f 6e c0 b8 ff ff 00 00 66 0f 6e c8 66 0f ef c1 66 0f 7e c0 c3"))).toBe(0x0f0fn);
+  });
+});

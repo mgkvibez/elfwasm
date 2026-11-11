@@ -1704,6 +1704,85 @@ function translateRange(
       index += 1;
       continue;
     }
+    if (instruction.op === "pand" || instruction.op === "pandn" || instruction.op === "por" || instruction.op === "pxor") {
+      /*
+       * Bitwise operations on 128 bits, which are two 64-bit operations here because a half is a register. The source's half is read
+       * before the destination's is written, so `pand %xmm0,%xmm0` is the identity it is on the processor rather than a read of a
+       * half-written register.
+       */
+      const [destination, source] = instruction.operands;
+      if (destination === undefined || source === undefined || destination.kind !== "reg" || source.kind !== "reg") {
+        throw new TranslateError(instruction.offset, `${instruction.op} takes two vector registers`);
+      }
+      const combine = { pand: OP.i64And, pandn: OP.i64And, por: OP.i64Or, pxor: OP.i64Xor }[instruction.op] as number;
+      for (const [target, from] of [
+        [destination, source],
+        [otherHalf(destination, instruction), otherHalf(source, instruction)],
+      ] as const) {
+        // `pandn` is `~destination & source`, so its destination is inverted first
+        out.push(...read(from, instruction), ...localSet(SSE_A));
+        if (instruction.op === "pandn") {
+          out.push(...read(target, instruction), ...i64Const(-1n), OP.i64Xor, ...localGet(SSE_A), combine, ...write(target, instruction));
+        } else {
+          out.push(...read(target, instruction), ...localGet(SSE_A), combine, ...write(target, instruction));
+        }
+      }
+      index += 1;
+      continue;
+    }
+    if (
+      instruction.op === "movaps" ||
+      instruction.op === "movups" ||
+      instruction.op === "movdqa" ||
+      instruction.op === "movdqu"
+    ) {
+      /*
+       * 128 bits between a vector register and memory. WASM has no 16-byte load or store, so this is two 64-bit accesses at the same
+       * address, eight bytes apart: the low half at the operand's own offset and the high half at the memarg's next one.
+       */
+      const [destination, source] = instruction.operands;
+      if (destination === undefined || source === undefined) {
+        throw new TranslateError(instruction.offset, `${instruction.op} needs two operands`);
+      }
+      if (destination.kind === "memory" && source.kind === "reg" && isVectorHalf(source)) {
+        out.push(
+          ...addressOf(destination, instruction), ...read(source, instruction), OP.i64Store, ...memarg(0),
+          ...addressOf(destination, instruction), ...read(otherHalf(source, instruction), instruction), OP.i64Store, ...memarg(8),
+        );
+        index += 1;
+        continue;
+      }
+      if (destination.kind === "reg" && isVectorHalf(destination) && source.kind === "memory") {
+        out.push(
+          ...addressOf(source, instruction), OP.i64Load, ...memarg(0), ...write(destination, instruction),
+          ...addressOf(source, instruction), OP.i64Load, ...memarg(8), ...write(otherHalf(destination, instruction), instruction),
+        );
+        index += 1;
+        continue;
+      }
+      throw new TranslateError(instruction.offset, `${instruction.op} moves 128 bits between memory and a vector register`);
+    }
+    if (instruction.op === "movlps" || instruction.op === "movhps") {
+      /*
+       * A 64-bit move into or out of one named half of a vector register. The half that is not named keeps what it had, which is the
+       * difference between these and `movq`: `movq` into a vector register clears the half above the value it writes.
+       */
+      const [destination, source] = instruction.operands;
+      if (destination === undefined || source === undefined) {
+        throw new TranslateError(instruction.offset, `${instruction.op} needs two operands`);
+      }
+      if (destination.kind === "memory" && source.kind === "reg" && isVectorHalf(source)) {
+        out.push(...translateMovToMemory(destination, source, instruction));
+        index += 1;
+        continue;
+      }
+      if (destination.kind === "reg" && isVectorHalf(destination) && source.kind === "memory") {
+        out.push(...loadFromMemory(source, 64, instruction), ...write(destination, instruction));
+        index += 1;
+        continue;
+      }
+      throw new TranslateError(instruction.offset, `${instruction.op} moves 64 bits between memory and one half of a vector register`);
+    }
     if (instruction.op === "movd" || instruction.op === "movq") {
       /*
        * The two directions of a vector move are different instructions: into a vector register the whole 128 bits are written,

@@ -190,3 +190,26 @@ describe("address resolution", () => {
     expect(code.length).toBeGreaterThan(0);
   });
 });
+
+describe("the 16-byte moves", () => {
+  it("stores both halves of a vector register eight bytes apart", () => {
+    /*
+     * `mov $0x11223344,%eax ; movd %eax,%xmm0 ; movhps` would need a load, so the two halves are written first and then stored at
+     * once: `movaps %xmm0,0x400100` writes 0x11223344 at 0x100 and the zeroed upper half at 0x108.
+     */
+    const { buffer } = run(hex("b8 44 33 22 11 66 0f 6e c0 0f 29 04 25 00 01 40 00 c3"));
+    expect(buffer[0x100]).toBe(0x44);
+    expect(buffer[0x101]).toBe(0x33);
+    expect(buffer[0x104]).toBe(0);
+    expect(buffer[0x108]).toBe(0);
+  });
+
+  it("loads both halves back, which is the move in the other direction", () => {
+    // `movaps 0x400100,%xmm0 ; movd %xmm0,%eax ; ret`, over memory whose first eight bytes are a known value
+    const { result } = run(hex("0f 28 04 25 00 01 40 00 66 0f 7e c0 c3"), {});
+    expect(result).toBe(0n);
+    // and a byte filled in by the test itself comes back through the vector register
+    const filled = run(hex("0f 28 04 25 00 01 40 00 66 0f 7e c0 c3"), { fill: 0x11 });
+    expect(filled.result).toBe(0x11111111n);
+  });
+});
