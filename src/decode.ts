@@ -589,6 +589,17 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
  * Every byte is accounted for. An instruction the subset does not cover is an error at its offset rather than a skipped
  * byte, because a caller that resumes past an unknown instruction is guessing where the next one begins.
  */
+/**
+ * Decodes the one instruction at `offset`.
+ *
+ * Exposed for the translator, which has to follow a call to a function's first byte without decoding the bytes that follow it:
+ * the next function, or the padding after the last one, is not this function's business, and a strict decode of it would fail
+ * on bytes that were never meant to be instructions.
+ */
+export function decodeInstruction(bytes: Uint8Array, offset: number): Instruction {
+  return decodeOne(bytes, offset);
+}
+
 export function decode(bytes: Uint8Array): Instruction[] {
   const instructions: Instruction[] = [];
   let offset = 0;

@@ -170,7 +170,7 @@ describe("opting in", () => {
 });
 
 describe("call", () => {
-  it("is refused by name, because there is no calling convention yet", () => {
+  it("is refused here, because a single function has no program to call into", () => {
     // call +0
     try {
       translateBytes(hex("e8 00 00 00 00 c3"), "main", {
@@ -179,7 +179,7 @@ describe("call", () => {
         memoryPages: 2,
       });
     } catch (error) {
-      expect((error as Error).message).toContain("call is not translated yet");
+      expect((error as Error).message).toContain("needs the code region");
       return;
     }
     throw new Error("expected a refusal");

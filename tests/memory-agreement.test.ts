@@ -111,6 +111,12 @@ const PROGRAMS = [
     expected: 10,
     stackPages: 2,
   },
+  {
+    // 7 into %rdi, the callee returns 7 + 5, the caller adds 1
+    name: "calls",
+    expected: 13,
+    calls: true,
+  },
 ] as const;
 
 const toolchain = ["as", "ld", "nm"].every(has);
@@ -148,9 +154,12 @@ describe.skipIf(!toolchain)("memory against the processor, on a linked binary", 
         loadImage(bytes, image, memory);
         const buffer = new Uint8Array(memory.buffer);
         const codeStart = fileOffsetOf(image, code.address);
+        const calls = "calls" in program && program.calls;
         const module = translateBytes(bytes.subarray(codeStart, codeStart + code.size), "main", {
           addresses,
           codeAddress: code.address,
+          // a call is followed into the executable itself, so the whole file is the code region, addressed as it is mapped
+          ...(calls ? { code: { bytes, virtualAddress: image.baseAddress } } : {}),
           ...(stackPages === 0 ? { memoryPages: image.pages } : { memoryPages: pages, stackPages }),
         });
         const instance = new runtime.Instance(new runtime.Module(module), { env: { memory } });

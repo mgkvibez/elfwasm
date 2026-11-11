@@ -73,12 +73,18 @@ export interface MemoryImport {
 export interface ModuleOptions {
   /** Export name, so a test can call the translated function. */
   readonly name: string;
-  /** Locals the body indexes, each an i64 holding one x86-64 register. */
+  /** Locals the bodies index: the translator's own scratch slots, each an i64. */
   readonly locals: number;
-  /** The body's instructions, without the terminating `end`, which `finish` writes. */
-  readonly body: readonly number[];
-  /** Index of the only result, which the body must leave on the stack. */
-  readonly result: typeof I32 | typeof I64;
+  /**
+   * One body per function, in index order: index 0 is the exported entry, and a `call` names one of the others.
+   *
+   * Every function has the same signature, no parameters and one `i64` result, which is `%rax`. That is not a shortcut: the
+   * machine's argument registers are module globals, so a call passes its arguments by writing them, exactly as SysV says,
+   * and the result comes back as the return value.
+   */
+  readonly bodies: readonly (readonly number[])[];
+  /** How many `i64` globals to declare, which is where the register file lives. */
+  readonly globals?: number;
   /** Present only when the body touches memory, so a module that reads nothing keeps needing nothing. */
   readonly memory?: MemoryImport;
 }
@@ -91,8 +97,22 @@ export interface ModuleOptions {
  */
 export function module(options: ModuleOptions): Uint8Array {
   // the type section's body is a vector: a count, then the signature itself
-  const typeBody = [0x01, 0x60, 0x00, 0x01, options.result]; // one type: no params, one result
-  const functionBody = [0x01, 0x00]; // one function, of type 0
+  const typeBody = [0x01, 0x60, 0x00, 0x01, I64]; // one type: no params, one i64 result
+  // every function shares that one type, so the function section is a count and a run of zeroes
+  const functionBody = [...unsigned(options.bodies.length), ...options.bodies.map(() => 0x00)];
+
+  /*
+   * The global section, which is where the sixteen registers live. Each is mutable and starts at zero, which is the state a
+   * process begins in. They are globals rather than locals because a register outlives a call: a callee that pushes `%rbp`
+   * has to push the caller's `%rbp`, and a local per function would push zero instead.
+   */
+  const globalSection =
+    options.globals === undefined || options.globals === 0
+      ? []
+      : section(6, [
+          ...unsigned(options.globals),
+          ...Array.from({ length: options.globals }, () => [I64, 0x01, 0x42, 0x00, 0x0b]).flat(),
+        ]);
 
   /*
    * The import section, written only when there is something to import. Module and field names are the conventional
@@ -119,14 +139,18 @@ export function module(options: ModuleOptions): Uint8Array {
    * behind: that is the one error in this format that produces a module which loads and misbehaves rather than one that
    * fails to load.
    */
-  const instructions = [0x01, ...unsigned(options.locals), I64, ...options.body, 0x0b];
-  const codeBody = [0x01, ...unsigned(instructions.length), ...instructions];
+  const functions = options.bodies.map((body) => {
+    const instructions = [0x01, ...unsigned(options.locals), I64, ...body, 0x0b];
+    return [...unsigned(instructions.length), ...instructions];
+  });
+  const codeBody = [...unsigned(functions.length), ...functions.flat()];
 
   return Uint8Array.from([
     0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
     ...section(1, typeBody),
     ...importSection,
     ...section(3, functionBody),
+    ...globalSection,
     ...section(7, exportBody),
     ...section(10, codeBody),
   ]);
@@ -134,6 +158,9 @@ export function module(options: ModuleOptions): Uint8Array {
 
 /** Instruction encodings this emitter uses, named so the translator does not carry bare hex bytes. */
 export const OP = {
+  call: 0x10,
+  globalGet: 0x23,
+  globalSet: 0x24,
   localGet: 0x20,
   localSet: 0x21,
   localTee: 0x22,
@@ -187,6 +214,14 @@ export function localGet(index: number): number[] {
 
 export function localSet(index: number): number[] {
   return [OP.localSet, ...unsigned(index)];
+}
+
+export function globalGet(index: number): number[] {
+  return [OP.globalGet, ...unsigned(index)];
+}
+
+export function globalSet(index: number): number[] {
+  return [OP.globalSet, ...unsigned(index)];
 }
 
 export function i64Const(value: bigint): number[] {

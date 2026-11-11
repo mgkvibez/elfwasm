@@ -17,8 +17,19 @@
  * 32-bit compare ignores the upper half falls out of it.
  */
 
-import { decode, type Instruction, type Operand } from "./decode.js";
-import { I64, OP, i32Const, i64Const, localGet, localSet, memarg, module, unsigned } from "./emit.js";
+import { decode, decodeInstruction, type Instruction, type Operand } from "./decode.js";
+import {
+  OP,
+  globalGet,
+  globalSet,
+  i32Const,
+  i64Const,
+  localGet,
+  localSet,
+  memarg,
+  module,
+  unsigned,
+} from "./emit.js";
 import type { AddressSpace } from "./image.js";
 
 /** The register file, in the order the encoding numbers it. Index is the WASM local. */
@@ -28,16 +39,22 @@ const REGISTERS = [
 ] as const;
 
 /** The two locals `cmp` and `test` leave their operands in, so a branch can be the comparison. */
-const CMP_A = REGISTERS.length;
-const CMP_B = REGISTERS.length + 1;
+/**
+ * The scratch locals, which are the only locals left now that the registers are globals.
+ *
+ * A register has to outlive a call, so a register is a global. A comparison's two operands do not: they exist between the
+ * instruction that sets them and the branch that reads them, both inside one function.
+ */
+const CMP_A = 0;
+const CMP_B = 1;
 /**
  * Where a computed address waits between its bound check and its use.
  *
  * It cannot be one of the comparison locals: `cmp (%rax), %rbx` keeps its first operand in `CMP_A` while the second is being
  * loaded, and an address check that wrote `CMP_A` there would silently compare the address against the value.
  */
-const ADDR = REGISTERS.length + 2;
-const LOCAL_COUNT = REGISTERS.length + 3;
+const ADDR = 2;
+const LOCAL_COUNT = 3;
 
 /** WASM's page size, which is what a bound is expressed in. */
 const PAGE_SIZE = 64 * 1024;
@@ -57,12 +74,32 @@ export interface TranslateOptions {
   /** Pages to import when the body touches memory. Defaults to the image's own pages plus `stackPages`. */
   readonly memoryPages?: number;
   /**
+   * The code the entry function was cut from, so a `call` can be followed to the function it names.
+   *
+   * Without it a `call` is refused rather than guessed at: the displacement is relative, and the target may well be a
+   * function in a different image.
+   */
+  readonly code?: { readonly bytes: Uint8Array; readonly virtualAddress: bigint };
+  /** Filled in by `translate` itself. A caller never sets this. */
+  readonly calls?: CallRegistry;
+  /**
+   * Virtual address of the first byte of the function being translated, which a `call` displacement is measured from.
+   * Filled in per function by the program translation; a caller never sets it.
+   */
+  readonly functionAddress?: bigint;
+  /**
    * Pages above the image reserved for the stack, and the opt-in that enables stack translation at all.
    *
    * It is not a default because it changes what the caller has to allocate: the import minimum grows, so a caller that
    * supplies the image's pages alone gets an instantiation error rather than a program with a stack it did not ask for.
    */
   readonly stackPages?: number;
+}
+
+/** The functions one translation knows about, in module order. Index 0 is the entry. */
+export interface CallRegistry {
+  /** The module index of the function at this virtual address, decoding it on first sight. */
+  indexOf(address: bigint, instruction: Instruction): number;
 }
 
 export class TranslateError extends Error {
@@ -92,11 +129,11 @@ function localOf(operand: Operand, instruction: Instruction): number {
 }
 
 function read(operand: Operand, instruction: Instruction): number[] {
-  return localGet(localOf(operand, instruction));
+  return globalGet(localOf(operand, instruction));
 }
 
 function write(operand: Operand, instruction: Instruction): number[] {
-  return localSet(localOf(operand, instruction));
+  return globalSet(localOf(operand, instruction));
 }
 
 /**
@@ -182,14 +219,14 @@ function runtimeAddressCode(
   if (operand.base !== undefined) {
     // a register's value is a virtual address, so the image's own base is subtracted before anything is addressed
     parts.push([
-      ...localGet(localOfRegister(operand.base, instruction)),
+      ...globalGet(localOfRegister(operand.base, instruction)),
       ...i64Const(addresses.baseAddress),
       OP.i64Sub,
     ]);
   }
   if (operand.index !== undefined) {
     const shift = { 1: 0n, 2: 1n, 4: 2n, 8: 3n }[operand.scale];
-    const scaled = [...localGet(localOfRegister(operand.index, instruction))];
+    const scaled = [...globalGet(localOfRegister(operand.index, instruction))];
     if (shift !== 0n) scaled.push(...i64Const(shift), OP.i64Shl);
     parts.push(scaled);
   }
@@ -311,7 +348,7 @@ const STACK_OPERAND: Operand = {
  */
 function adjustStack(bytes: bigint): number[] {
   const rsp = REGISTERS.indexOf("rsp");
-  return [...localGet(rsp), ...i64Const(bytes), OP.i64Add, ...localSet(rsp)];
+  return [...globalGet(rsp), ...i64Const(bytes), OP.i64Add, ...globalSet(rsp)];
 }
 
 /**
@@ -339,7 +376,7 @@ function translatePush(instruction: Instruction, options: TranslateOptions): num
   const { floor } = stackBounds(options);
   return [
     ...adjustStack(-8n),
-    ...localGet(REGISTERS.indexOf("rsp")),
+    ...globalGet(REGISTERS.indexOf("rsp")),
     ...i64Const(floor),
     OP.i64LtU,
     OP.ifEmpty,
@@ -375,13 +412,13 @@ function translatePop(instruction: Instruction, options: TranslateOptions): numb
 function translateLeave(instruction: Instruction, options: TranslateOptions): number[] {
   const rbp = REGISTERS.indexOf("rbp");
   return [
-    ...localGet(rbp),
-    ...localSet(REGISTERS.indexOf("rsp")),
+    ...globalGet(rbp),
+    ...globalSet(REGISTERS.indexOf("rsp")),
     // the pop reads through the same address machinery as any other stack access, so it is bound-checked too
     ...runtimeAddressCode(STACK_OPERAND, instruction, options, 64),
     OP.i64Load,
     ...memarg(0),
-    ...localSet(rbp),
+    ...globalSet(rbp),
     ...adjustStack(8n),
   ];
 }
@@ -795,7 +832,7 @@ function translateRange(
         throw new TranslateError(instruction.offset, "ret with a stack adjustment is not translated yet");
       }
       // `return` rather than a value left on the stack: a ret inside a branch cannot leave the function's result there
-      out.push(...localGet(REGISTERS.indexOf("rax")), OP.returnOp);
+      out.push(...globalGet(REGISTERS.indexOf("rax")), OP.returnOp);
       index += 1;
       if (index < to) {
         throw new TranslateError(instructions[index]!.offset, "there is code after ret, which is dead and not translated");
@@ -914,10 +951,31 @@ function translateRange(
       continue;
     }
     if (instruction.op === "call") {
-      throw new TranslateError(
-        instruction.offset,
-        "call is not translated yet: a translated function has no calling convention to call another with",
+      // a call's displacement is relative to the byte after it, measured from this function's own start
+      const displacement = instruction.operands[0];
+      if (displacement === undefined || displacement.kind !== "immediate") {
+        throw new TranslateError(instruction.offset, "call without a displacement is not something x86 encodes");
+      }
+      const target =
+        (options.functionAddress ?? 0n) +
+        BigInt(instruction.offset + instruction.length) +
+        BigInt(displacement.value);
+      if (options.calls === undefined) {
+        throw new TranslateError(
+          instruction.offset,
+          "call needs a program to call into: use translateProgram, which follows the target and translates it",
+        );
+      }
+      // the arguments are already where SysV puts them, because the machine's registers are module globals
+      out.push(
+        OP.call,
+        ...unsigned(options.calls.indexOf(target, instruction)),
+        ...globalSet(REGISTERS.indexOf("rax")),
       );
+      // a callee may clobber every flag and every caller-saved register, so nothing about the condition survives
+      flags.set = false;
+      index += 1;
+      continue;
     }
     if (instruction.op === "mov") {
       out.push(...translateMov(instruction));
@@ -934,62 +992,234 @@ function translateRange(
   return index;
 }
 
+/** One translated function, with the address it came from so a call can be recognised as reaching it. */
+interface Body {
+  readonly address: bigint;
+  readonly instructions: readonly Instruction[];
+}
+
 /**
- * Translates one function.
+ * The instructions of the function that starts at the beginning of `bytes`, found by walking what it can reach.
  *
- * The function must end in `ret`, and the value it returns is `rax`, which is the only calling convention this increment
- * claims. Loops, jumps out of the branch they belong to, and anything the instruction set covers but the translator does
- * not are refused by name and offset.
+ * A compiled function rarely has one `ret`: an early return or a shared epilogue gives it several, and the bytes after the
+ * first one are still part of it. Cutting there would drop the epilogue, and a branch into the dropped region would be
+ * reported as a bad branch target, which is true but points at the wrong thing.
+ *
+ * So the extent comes from reachability, and only the instructions that are walked get decoded. That matters: the bytes after
+ * a function are the next function, or the zero padding the linker leaves, and a strict decode of those would fail on bytes
+ * that were never instructions. What is left inside the range but unreachable is refused rather than included, because it
+ * means this is not where a function starts.
  */
-export function translate(
+function functionExtent(bytes: Uint8Array, address: bigint): readonly Instruction[] {
+  const decoded = new Map<number, Instruction>();
+  const decodeAt = (offset: number): Instruction => {
+    const known = decoded.get(offset);
+    if (known !== undefined) return known;
+    if (offset >= bytes.length) {
+      throw new TranslateError(
+        offset,
+        `the function at ${hex(address)} runs off the end of the bytes given, so its extent is unknown`,
+      );
+    }
+    const instruction = decodeInstruction(bytes, offset);
+    decoded.set(offset, instruction);
+    return instruction;
+  };
+
+  const reachable = new Set<number>();
+  const work: number[] = [0];
+  while (work.length > 0) {
+    const offset = work.pop()!;
+    if (reachable.has(offset)) continue;
+    const instruction = decodeAt(offset);
+    reachable.add(offset);
+    // a ret has no successor, which is what stops the walk before the next function's bytes
+    if (instruction.op === "ret") continue;
+    if (instruction.op === "jmp") {
+      work.push(branchTarget(instruction));
+      continue;
+    }
+    if (instruction.op.startsWith("j")) work.push(branchTarget(instruction));
+    // a call returns to the instruction after it; the function it names is translated separately
+    work.push(offset + instruction.length);
+  }
+
+  const ordered: Instruction[] = [];
+  const end = Math.max(...reachable);
+  let offset = 0;
+  while (offset <= end) {
+    if (!reachable.has(offset)) {
+      throw new TranslateError(
+        offset,
+        `nothing reaches the bytes at 0x${offset.toString(16)} inside the function at ${hex(address)}, so this is not where ` +
+          `a function starts, or a branch lands inside another instruction`,
+      );
+    }
+    const instruction = decodeAt(offset);
+    ordered.push(instruction);
+    offset += instruction.length;
+  }
+  return ordered;
+}
+
+/**
+ * Translates one function's instructions into a WASM body.
+ *
+ * Only the entry function sets `%rsp`: it is the machine's initial state, and a callee that reset it would throw away the
+ * stack its caller was using. Every function returns `%rax`, which is the whole of this calling convention.
+ */
+function bodyOf(
   instructions: readonly Instruction[],
-  name = "main",
-  options: TranslateOptions = {},
-): Uint8Array {
+  options: TranslateOptions,
+): number[] {
   if (instructions.length === 0) {
     throw new TranslateError(0, "there is nothing to translate");
   }
-  instructions = resolveAddresses(instructions, options);
+  const resolved = resolveAddresses(instructions, options);
   const body: number[] = [];
   const flags: Flags = { set: false, width: 64 };
-  const loops = findLoops(instructions);
+  const loops = findLoops(resolved);
   /*
-   * The stack's pointer is set here rather than by the caller, because `%rsp` is a local and locals start at zero. Pointing
-   * it at the top of the imported memory is the one decision that makes every later push and pop arithmetic rather than a
-   * special case, and it happens before the body so a stack access in the first instruction is already legal.
+   * The stack's pointer is set here rather than by the caller, because `%rsp` is a register and registers start at zero.
+   * Pointing it at the top of the imported memory is the one decision that makes every later push and pop arithmetic rather
+   * than a special case, and it happens before the body so a stack access in the first instruction is already legal.
    */
-  if (usesStack(instructions)) {
+  if (usesStack(resolved)) {
     if ((options.stackPages ?? 0) < 1) {
       throw new TranslateError(
         0,
         "this function uses the stack, so it needs stackPages: pass how many pages to set aside above the image",
       );
     }
-    const { top } = stackBounds(options);
-    body.push(...i64Const(top), ...localSet(REGISTERS.indexOf("rsp")));
+
   }
-  translateRange(instructions, 0, instructions.length, new Map(), body, flags, loops, options);
-  if (!instructions.some((instruction) => instruction.op === "ret")) {
+  translateRange(resolved, 0, resolved.length, new Map(), body, flags, loops, options);
+  if (!resolved.some((instruction) => instruction.op === "ret")) {
     throw new TranslateError(
-      instructions.at(-1)?.offset ?? 0,
+      resolved.at(-1)?.offset ?? 0,
       "the block does not end in ret, so it has no value to return",
     );
   }
-  const stackUsed = usesStack(instructions);
+  return body;
+}
+
+/**
+ * Translates a program: the entry function, and every function it calls, each as its own WASM function.
+ *
+ * This is the increment that turns the translator from a calculator into a machine. The registers are module globals, so a
+ * call passes its arguments exactly as SysV says: by writing `%rdi`, `%rsi`, `%rdx` and the rest. `call` is a WASM `call`,
+ * `ret` is a WASM `return`, and the result comes back in `%rax`. A callee is found by following the call's displacement into
+ * the code region the caller supplied, which is why that region is required the moment anything is called.
+ */
+function programOf(
+  entryInstructions: readonly Instruction[],
+  name: string,
+  options: TranslateOptions,
+): Uint8Array {
+  const entryAddress = options.codeAddress ?? options.code?.virtualAddress ?? 0n;
+  // `order` is both the queue and the module index: position i is function i, and a call appends on first sight
+  const order: Body[] = [];
+  const known = new Map<string, number>();
+
+  const register = (address: bigint, instructions: readonly Instruction[]): number => {
+    const key = address.toString();
+    const seen = known.get(key);
+    if (seen !== undefined) return seen;
+    const index = order.length;
+    known.set(key, index);
+    order.push({ address, instructions });
+    return index;
+  };
+
+  const calls: CallRegistry = {
+    indexOf(address, instruction) {
+      const seen = known.get(address.toString());
+      if (seen !== undefined) return seen;
+      const region = options.code;
+      if (region === undefined) {
+        throw new TranslateError(
+          instruction.offset,
+          `call to ${hex(address)} needs the code region it was cut from: pass code: { bytes, virtualAddress }`,
+        );
+      }
+      const offset = address - region.virtualAddress;
+      if (offset < 0n || offset >= BigInt(region.bytes.length)) {
+        throw new TranslateError(
+          instruction.offset,
+          `call to ${hex(address)} is outside the code region, so there is nothing here to translate: an external or ` +
+            `library function needs the syscall layer, which does not exist yet`,
+        );
+      }
+      return register(address, functionExtent(region.bytes.subarray(Number(offset)), address));
+    },
+  };
+
+  // index 0 is the entry, registered before anything can call it, so a recursive call resolves to the function itself
+  register(entryAddress, entryInstructions);
+  const withCalls: TranslateOptions = { ...options, calls };
+  const bodies: number[][] = [];
+  for (let index = 0; index < order.length; index += 1) {
+    const body = order[index]!;
+    bodies.push(bodyOf(body.instructions, { ...withCalls, functionAddress: body.address }));
+  }
+
+  const all = order.flatMap((body) => [...body.instructions]);
+  const stackUsed =
+    all.some((instruction) => instruction.op === "push" || instruction.op === "pop" || instruction.op === "leave") ||
+    all.some((instruction) =>
+      instruction.operands.some(
+        (operand) =>
+          operand.kind === "memory" && [operand.base, operand.index].some((register) => register === "rsp" || register === "rbp"),
+      ),
+    );
   const touchesMemory =
-    stackUsed ||
-    instructions.some((instruction) => instruction.operands.some((operand) => operand.kind === "memory"));
+    stackUsed || all.some((instruction) => instruction.operands.some((operand) => operand.kind === "memory"));
+  /*
+   * The stack's pointer is machine state, so it is set once, in the entry body, and only when *anything* in the program uses
+   * the stack: a callee that pushes is enough, since its caller's frame is the same stack.
+   */
+  if (stackUsed) {
+    const { top } = stackBounds(options);
+    bodies[0]!.unshift(...i64Const(top), ...globalSet(REGISTERS.indexOf("rsp")));
+  }
   return module({
     name,
     locals: LOCAL_COUNT,
-    body,
-    result: I64,
+    globals: REGISTERS.length,
+    bodies,
     // the import appears only when something addresses memory, so a module that reads nothing still needs nothing
-    ...(touchesMemory || stackUsed ? { memory: { minimumPages: totalPages(options) } } : {}),
+    ...(touchesMemory ? { memory: { minimumPages: totalPages(options) } } : {}),
   });
 }
 
 /** Bytes to a module, which is the path every test uses: decode, translate, run. */
-export function translateBytes(bytes: Uint8Array, name = "main", options: TranslateOptions = {}): Uint8Array {
-  return translate(decode(bytes), name, options);
+export function translateProgram(
+  bytes: Uint8Array,
+  name = "main",
+  options: TranslateOptions = {},
+): Uint8Array {
+  return programOf(decode(bytes), name, options);
+}
+
+/** The same thing under the name the earlier tests use, which is also the name the README uses. */
+export function translateBytes(
+  bytes: Uint8Array,
+  name = "main",
+  options: TranslateOptions = {},
+): Uint8Array {
+  return programOf(decode(bytes), name, options);
+}
+
+/**
+ * Translates one function, with nothing to call into.
+ *
+ * Kept for the common case and for the tests: a `call` is refused here because there is no program for it to call into, and
+ * `translateProgram` is the function that follows one.
+ */
+export function translate(
+  instructions: readonly Instruction[],
+  name = "main",
+  options: TranslateOptions = {},
+): Uint8Array {
+  return programOf(instructions, name, options);
 }

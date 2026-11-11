@@ -58,7 +58,7 @@ section's `sh_size`), SSE and `x87`, translation to WASM, and any syscall. Two h
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 137
+**Tests:** 145
 
 ```bash
 npm ci && npm run verify
@@ -184,9 +184,23 @@ the accounting forgets them.
 a caller who supplies the image's pages alone gets a refusal at translation and an instantiation error at load, rather than
 a program with a stack it did not size.
 
-`call` is refused by name. It needs a calling convention, which means deciding where arguments and the return address live
-and how a translated callee is reached, and none of that exists yet: `ret` still returns the module's own result. So the
-stack works inside one function (frames, spills, `push`/`pop`) and not yet between two.
+### Calling another function
+
+The registers are module globals rather than locals, and that is the calling convention rather than a shortcut around one: a
+register has to outlive a call, because a callee that pushes `%rbp` must push the caller's `%rbp`. Arguments are already where
+SysV puts them when the `call` executes, so passing one is just writing `%rdi`; `call` is a WASM `call`, `ret` is a WASM
+`return`, and the result comes back in `%rax`, which is the whole of the convention this claims.
+
+A callee is found by following the call's displacement into the code region the caller supplied, so `translateProgram` is the
+entry point whenever anything is called. Its extent is settled by reachability from its first byte, not by cutting at the
+first `ret`: a compiled function usually has several returns and one shared epilogue, and the bytes after the first `ret` are
+still part of it. Only instructions the walk actually reaches are decoded, which matters because the bytes after a function
+are the next function or the linker's zero padding, and a strict decode of those would fail on bytes that were never
+instructions. What the walk leaves unreachable inside the range is refused: that means the address is not a function's start,
+or a branch lands inside another instruction.
+
+A call whose target is outside the region is refused by name. That is where libc lives, and reaching it needs the syscall
+layer, which does not exist yet.
 
 ## Checked against the processor, not against itself
 
@@ -205,7 +219,7 @@ run with no toolchain.
 headers are read into a `MemoryImage`, its `PT_LOAD` segments are copied into a fresh `WebAssembly.Memory`, the bytes the
 symbol table gives for `target` are translated with that image as its address space, and both versions run. Two programs:
 an absolute store and load (42), a pointer in a register that is read through, added to, written back, and read again with
-a displacement (12), and a stack frame with a spill, a push/pop pair and a `leave` (10). Each one's expected number is stated in the test rather than taken from either side, and the
+a displacement (12), a stack frame with a spill, a push/pop pair and a `leave` (10), and a call across two functions (13). Each one's expected number is stated in the test rather than taken from either side, and the
 store is then read out of the caller's buffer at the offset the image maps for the symbol. The linked binary's own headers
 choose every address, so no part of that test hardcodes one.
 
@@ -217,9 +231,9 @@ choose every address, so no part of that test hardcodes one.
    `x87`, the string instructions and 16-bit operands are outside it, and an `objdump`-driven fixture keeps the boundaries
    honest.
 3. **Translator** (in progress): arithmetic, flags as comparisons, forward branches, loops, memory against the mapped image
-   including register-relative and indexed addressing with a bound check, and the stack with a checked floor, registers in
-   locals, results checked by running the module and, where the toolchain allows, by the processor. A calling convention
-   next.
+   including register-relative and indexed addressing with a bound check, the stack with a checked floor, and calls between
+   translated functions with the registers as module globals, results checked by running the module and, where the toolchain
+   allows, by the processor.
 4. **Syscall layer**: `write`, `exit_group`, `brk`, `mmap`, then the file syscalls, each behind a capability check.
 5. **Evidence**: the same binary run under real Linux and under the translator, stdout and exit code compared.
 
