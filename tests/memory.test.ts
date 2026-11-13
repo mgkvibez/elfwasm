@@ -406,3 +406,99 @@ describe("a switch compiled to a jump table", () => {
     expect(() => runSwitch(false)).toThrow(/nothing reaches the bytes/);
   });
 });
+
+describe("a switch table whose base is loaded far from the jump", () => {
+  /*
+   * The table's address is invariant, so gcc computes it once and keeps it: the `lea` can be twenty instructions from the jump, with
+   * the value switched on read, the bounds check and other tests in between. The reader used to require the `lea` exactly three
+   * instructions before the jump, which read only the gcc shape where the base is computed where it is used.
+   *
+   * Each fixture is a `call` into the function below, because a function the program calls is walked and the entry's own bytes are
+   * not: what is being tested is the walk reading a table.
+   *
+   * The switch, at 0x10:
+   *  10: mov $2,%edx                       the value switched on
+   *  15: lea table(%rip),%rcx              the base, five instructions early
+   *  1c: mov %edi,%edi ... 23: mov %r9d,%r9d     four instructions that leave %rcx alone
+   *  26: cmp $3,%edx; 29: ja default
+   *  2b: movsxd (%rcx,%rdx,4),%rdx; 2f: add %rcx,%rdx; 32: jmp *%rdx
+   *  34: case 0 answers 10 ... 4c: default answers 99, and the table at 0x100 in the image's data
+   */
+  const distant = (): Uint8Array =>
+    hex(
+      "e8 0b 00 00 00 c3 90 90 90 90 90 90 90 90 90 90 " +
+        "ba 02 00 00 00 48 8d 0d e4 00 00 00 89 ff 89 f6 45 89 c0 45 89 c9 83 fa 03 77 21 " +
+        "48 63 14 91 48 01 ca ff e2 " +
+        "b8 0a 00 00 00 c3 b8 0b 00 00 00 c3 b8 0c 00 00 00 c3 b8 0d 00 00 00 c3 b8 63 00 00 00 c3",
+    );
+
+  /*
+   * The same table with a loop around it, which is what gcc emits for a `switch` inside a loop: the `jne` at 0x25 goes back to the
+   * `lea` at 0x17, so it passes the write again and the base is still known at the load.
+   *
+   *  10: xor %edi,%edi; 12: mov $2,%edx; 17: lea table(%rip),%rcx; 1e: cmp $3,%edx; 21: ja default
+   *  23: test %edi,%edi; 25: jne 17; 27: movsxd (%rcx,%rdx,4),%rdx; 2b: add %rcx,%rdx; 2e: jmp *%rdx
+   *  30: case 0 answers 10 ... 48: default answers 99, and the table at 0x100
+   */
+  const looped = (): Uint8Array =>
+    hex(
+      "e8 0b 00 00 00 c3 90 90 90 90 90 90 90 90 90 90 " +
+        "31 ff ba 02 00 00 00 48 8d 0d e2 00 00 00 83 fa 03 77 25 85 ff 75 f0 48 63 14 91 48 01 ca ff e2 " +
+        "b8 0a 00 00 00 c3 b8 0b 00 00 00 c3 b8 0c 00 00 00 c3 b8 0d 00 00 00 c3 b8 63 00 00 00 c3",
+    );
+
+  /*
+   * A call between the write and the load. The base is in `%rcx`, which a callee is free to clobber, so the register's value at the
+   * load is not something these bytes say and the table is not read.
+   *
+   *  10: mov $2,%edx; 15: lea table(%rip),%rcx; 1c: call helper; 21: cmp $3,%edx; 24: ja default
+   *  26: movsxd (%rcx,%rdx,4),%rdx; 2a: add %rcx,%rdx; 2d: jmp *%rdx
+   *  2f: case 0 answers 10 ... 47: default answers 99; 4d: helper: ret
+   */
+  const clobbered = (): Uint8Array =>
+    hex(
+      "e8 0b 00 00 00 c3 90 90 90 90 90 90 90 90 90 90 " +
+        "ba 02 00 00 00 48 8d 0d e4 00 00 00 e8 2c 00 00 00 83 fa 03 77 21 48 63 14 91 48 01 ca ff e2 " +
+        "b8 0a 00 00 00 c3 b8 0b 00 00 00 c3 b8 0c 00 00 00 c3 b8 0d 00 00 00 c3 b8 63 00 00 00 c3 c3",
+    );
+
+  /** Runs one of the fixtures with its table written into the image's data at 0x100, which is where each `lea` names it. */
+  const runWithTable = (bytes: Uint8Array, cases: readonly number[]): bigint => {
+    const image = imageOf();
+    const addresses = addressSpaceOf(image);
+    const memory = new runtime.Memory({ initial: 1 });
+    const buffer = new Uint8Array(memory.buffer);
+    buffer.fill(0);
+    // each entry is an offset from the table's own address, which is what makes the table position-independent
+    const view = new DataView(memory.buffer);
+    cases.forEach((target, slot) => view.setInt32(0x100 + slot * 4, target - 0x100, true));
+    const readData = (address: bigint, width: number): bigint | undefined => {
+      const start = addresses.offsetOf(address);
+      if (start === undefined || start + width > buffer.length) return undefined;
+      let value = 0n;
+      for (let byte = width - 1; byte >= 0; byte -= 1) value = (value << 8n) | BigInt(buffer[start + byte]!);
+      return value;
+    };
+    const module = translateBytes(bytes, "main", {
+      addresses,
+      memoryPages: 1,
+      codeAddress: 0x400000n,
+      code: { bytes, virtualAddress: 0x400000n },
+      readData,
+    });
+    const instance = new runtime.Instance(new runtime.Module(module), { env: { memory } });
+    return instance.exports.main!();
+  };
+
+  it("reads a table whose base was computed long before the jump", () => {
+    expect(runWithTable(distant(), [0x34, 0x3a, 0x40, 0x46])).toBe(12n);
+  });
+
+  it("reads a table whose base is written before the loop the switch sits in", () => {
+    expect(runWithTable(looped(), [0x30, 0x36, 0x3c, 0x42])).toBe(12n);
+  });
+
+  it("refuses it when a call sits between the write and the load, because a callee may clobber the base", () => {
+    expect(() => runWithTable(clobbered(), [0x2f, 0x35, 0x3b, 0x41])).toThrow(/its table cannot be read/);
+  });
+});

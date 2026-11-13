@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 286
+**Tests:** 289
 
 ```bash
 npm ci && npm run verify
@@ -606,9 +606,41 @@ Only a `jmp` is read this way. A conditional branch to a byte before the functio
 might not be taken is not a handover: it means the extent is wrong, and translating it as a tail call would invent a return the
 program does not have.
 
-Where it stops now: `0x69e` into the function at `0x43c370`, which the tail call at `0x43b860` reaches. It is a jump through a register whose table cannot be read, the
-one shape where a hole in a body is evidence rather than a neighbour's bytes: the walk knows the body goes places it could not
-enumerate. Reading the table is the next piece.
+### Where a switch table's base comes from
+
+A switch table's length comes from the bounds check the compiler put in front of it, and its address from a `lea` that loads the
+table's own address. The reader used to require that `lea` exactly three instructions before the jump, because that is the shape gcc
+emits when the table's base is computed where it is used:
+
+```
+lea table(%rip),%rcx
+movsxd (%rcx,%rdx,4),%rdx
+add %rcx,%rdx
+jmp *%rdx
+```
+
+The address is invariant, though, so a compiler is free to keep it: libc's `_dl_relocate_static_pie` loads it forty instructions
+earlier, with the value switched on read, the bounds check and a test in between. What matters is not the distance but *which
+instruction last wrote the base register*, so the reader now walks back to that write and reads the table from there. The walk hands
+it the whole run of instructions that reached the jump rather than a fixed window, and a branch target gets a predecessor of its own
+so that run can be read back through a jump.
+
+Refusing is still the answer when the register's value at the load is not something the bytes say:
+
+1. A `call` between the write and the load clobbers every caller-saved register, so the base is unknown.
+2. A backwards branch is the loop a `switch` usually sits inside, and it is harmless as long as it lands at or before the write,
+   because the path from there passes the write again. One that lands after it reaches the load with whatever the register held
+   before, which is not a table this can read.
+3. A `ret`, `hlt` or a computed jump in between means nothing after it is reached by falling through, or that the flow is not in the
+   bytes at all.
+
+A hole in a body is only evidence of a table that could not be read. Once the table is read, a gap between the cases is a neighbour's
+bytes like any other gap, and it is skipped.
+
+Where it stops now: a `call` at `0x40afcc` in `__libc_start_main` whose target resolves to the image's own first byte. That is the
+static-PIE placeholder `call 0`, which glibc leaves in a path this binary never takes, and the walk treats the target as a function
+because offset 0 of the file it was given lies inside the region it calls code. Translating it decodes the ELF header. Two ways out:
+tell the walk which ranges are executable, or write the relocations into the code before the walk reads it.
 
 The cost of the dispatcher is worth stating: a body with any backward branch takes that path, so even a clean loop is expressed by
 naming blocks rather than as a WASM `loop`. The structured path is kept for the bodies that are trees, which is most of the small

@@ -2427,6 +2427,8 @@ function functionExtent(
   const reachable = new Set<number>();
   // jumps out of the body, by offset, holding the address each one reaches
   const tailCalls = new Map<number, bigint>();
+  // the offset of the first jump through a register whose table named no case, which is what a hole in the body is evidence of
+  let unreadableTable: number | undefined;
   const work: number[] = [0];
   while (work.length > 0) {
     const offset = work.pop()!;
@@ -2448,6 +2450,7 @@ function functionExtent(
           tailCalls.set(offset, address + BigInt(target));
           continue;
         }
+        if (!previous.has(target)) previous.set(target, offset);
         work.push(target);
         continue;
       }
@@ -2461,16 +2464,22 @@ function functionExtent(
        * place the walk continues from. The three instructions before the jump are what say which table: they are the chain of
        * fall-throughs that led here, and they are the `lea`, the `movsxd` and the `add` that compute an entry's address.
        */
+      /*
+       * The chain is the run of instructions that led here, and how far back it has to go is not fixed: gcc loads the table's base
+       * once, where the value it holds is still cheap, and the `cmp`, the bounds check and whatever else belongs in between. The reader
+       * wants the last write to the base register, so the walk hands it the whole run and lets that be decided there.
+       */
       const chain: Instruction[] = [];
-      for (let cursor = offset; chain.length < 10; ) {
+      for (let cursor = offset; chain.length < 64; ) {
         const before = previous.get(cursor);
         if (before === undefined) break;
         chain.unshift(decodeAt(before));
         cursor = before;
       }
-      for (const target of jumpTableTargets([...chain, instruction], chain.length, address, bytes.length, options)) {
-        work.push(target);
-      }
+  const cases = jumpTableTargets([...chain, instruction], chain.length, address, bytes.length, options);
+      // a table that named nothing is a table this could not read, which is what a hole later in the body is evidence of
+      if (cases.length === 0 && unreadableTable === undefined) unreadableTable = offset;
+      for (const target of cases) work.push(target);
       const afterJump = offset + instruction.length;
       if (afterJump >= bytes.length || bytes[afterJump] === 0) continue;
       try {
@@ -2482,7 +2491,16 @@ function functionExtent(
       work.push(afterJump);
       continue;
     }
-    if (instruction.op.startsWith("j")) work.push(branchTarget(instruction));
+    if (instruction.op.startsWith("j")) {
+      /*
+       * A branch target gets a predecessor of its own, so the run that reached an instruction can be read back through a jump and not
+       * only through fall-through. A target that already has one keeps it: the first path the walk took is the one that reading was
+       * written against.
+       */
+      const target = branchTarget(instruction);
+      if (!previous.has(target)) previous.set(target, offset);
+      work.push(target);
+    }
     /*
      * A call returns to the instruction after it, and the function it names is translated separately. But a call to one that
      * never returns has no code after it, and gcc emits exactly that shape: `call __stack_chk_fail` at the end of a
@@ -2598,12 +2616,11 @@ function functionExtent(
    * where a hole is evidence, because the body is telling us it goes places this walk could not enumerate. It is refused rather than
    * translated into a dispatcher that would have no case to land in.
    */
-  const computedJump = ordered.find((instruction) => instruction.op.startsWith("j") && instruction.operands[0]?.kind !== "immediate");
-  if (computedJump !== undefined && skipped !== undefined) {
+  if (unreadableTable !== undefined && skipped !== undefined) {
     throw new TranslateError(
       skipped,
       `nothing reaches the bytes at 0x${skipped.toString(16)} inside the function at ${hex(address)}, and the jump through a ` +
-        `register at ${hex(address + BigInt(computedJump.offset))} is the reason they were expected to be reached: its table ` +
+        `register at ${hex(address + BigInt(unreadableTable))} is the reason they were expected to be reached: its table ` +
         "cannot be read, so the cases it names are unknown",
     );
   }
@@ -2660,6 +2677,53 @@ function registerNumberOf(name: string): number | undefined {
  * table, which is what the section's other data looks like when read as offsets. A table whose data happens to look like offsets would
  * be read too far, and the extra targets are blocks that nothing runs, so the mistake costs size rather than correctness.
  */
+/** The operations whose first operand is the register they write, which is what makes one instruction the definition of another. */
+const WRITING_OPERATIONS = new Set([
+  "mov", "movsxd", "movzx", "movsx", "lea", "add", "sub", "and", "or", "xor", "adc", "sbb", "shl", "shr", "sar", "imul", "inc",
+  "dec", "neg", "not", "pop", "xchg",
+]);
+
+/** True when this instruction writes the given register as its first operand. */
+function writesRegister(instruction: Instruction, register: number): boolean {
+  const [destination] = instruction.operands;
+  if (destination?.kind !== "reg") return false;
+  if (registerNumberOf(destination.name) !== register) return false;
+  if (instruction.op.startsWith("cmov") || instruction.op.startsWith("set")) return true;
+  return WRITING_OPERATIONS.has(instruction.op);
+}
+
+/**
+ * The instruction that last wrote a register before the one at `index`, when the bytes between them are a straight run.
+ *
+ * Undefined means the register's value there is not something these bytes say. A call clobbers every caller-saved register, and a
+ * `ret` means nothing after it is reached by falling through. A backwards branch is the loop that a `switch` usually sits inside, and
+ * it is harmless as long as it lands at or before the write: the path from there passes the write again. A branch that lands after it
+ * would reach the load with whatever the register held before, which is not a table this can read.
+ *
+ * A forward branch is not a problem at all: the instructions it skips are inside the span being scanned, so a write among them is
+ * still found, and one that lands past the load does not reach it.
+ */
+function definingLea(instructions: readonly Instruction[], index: number, register: number): Instruction | undefined {
+  const backwards: number[] = [];
+  for (let back = index - 1; back >= 0 && index - back <= 64; back -= 1) {
+    const candidate = instructions[back]!;
+    if (candidate.op === "call" || candidate.op === "syscall" || candidate.op === "ret" || candidate.op === "hlt") {
+      return undefined;
+    }
+    if (candidate.op.startsWith("j")) {
+      // a jump whose target is a value is a path this cannot follow, so the register's value here is not known
+      if (candidate.operands[0]?.kind !== "immediate") return undefined;
+      const target = branchTarget(candidate);
+      if (target < candidate.offset) backwards.push(target);
+      continue;
+    }
+    if (writesRegister(candidate, register)) {
+      return backwards.every((target) => target <= candidate.offset) ? candidate : undefined;
+    }
+  }
+  return undefined;
+}
+
 function jumpTableTargets(
   instructions: readonly Instruction[],
   index: number,
@@ -2671,8 +2735,7 @@ function jumpTableTargets(
   if (read === undefined) return [];
   const add = instructions[index - 1];
   const load = instructions[index - 2];
-  const lea = instructions[index - 3];
-  if (add?.op !== "add" || load?.op !== "movsxd" || lea?.op !== "lea") return [];
+  if (add?.op !== "add" || load?.op !== "movsxd") return [];
   // `add base, entry`: the destination is the entry the load produced, and the source is the table's own address
   const [sum, offset] = add.operands;
   if (sum?.kind !== "reg" || offset?.kind !== "reg") return [];
@@ -2684,6 +2747,13 @@ function jumpTableTargets(
   if (registerNumberOf(entry.name) !== entryRegister) return [];
   if (table.scale !== 4 || table.index === undefined) return [];
   if (table.base === undefined || registerNumberOf(table.base) !== baseRegister) return [];
+  /*
+   * The base is usually loaded three instructions before the jump, and gcc loads it much earlier when the function has other work
+   * between: the table's address is invariant, so there is no reason to compute it twice. What matters is which instruction last
+   * wrote the register, not how far back it sits.
+   */
+  const lea = definingLea(instructions, index - 2, baseRegister);
+  if (lea === undefined) return [];
   const [base, address] = lea.operands;
   if (base?.kind !== "reg" || address?.kind !== "memory" || !address.ripRelative) return [];
   if (registerNumberOf(base.name) !== baseRegister) return [];
