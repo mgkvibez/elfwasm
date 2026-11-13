@@ -236,6 +236,9 @@ export const OP = {
   i64Shl: 0x86,
   i64ShrU: 0x88,
   i64ShrS: 0x87,
+  // how many bits a value has at either end: the two a bit scan is built from, since WASM has no `bsf` or `bsr`
+  i64Clz: 0x79,
+  i64Ctz: 0x7a,
   i32Shl: 0x74,
   i32ShrU: 0x76,
   i32ShrS: 0x75,

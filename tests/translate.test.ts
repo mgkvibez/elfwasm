@@ -193,6 +193,48 @@ describe("flags become comparisons, not flag variables", () => {
   });
 });
 
+describe("the bit scans", () => {
+  /*
+   * `bsf` and `bsr` write the index of the lowest and highest set bit of the source. WASM has neither, and the two counts it does
+   * have answer 64 for a zero source, where the processor leaves the destination exactly as it was, so the destination is picked
+   * between its own value and the index.
+   */
+  it("finds the lowest set bit, which is 2 for 0x2c", () => {
+    // mov $0x2c,%eax ; bsf %eax,%ecx ; mov %ecx,%eax ; ret
+    expect(run(hex("b8 2c 00 00 00 0f bc c8 89 c8 c3"))).toBe(2n);
+  });
+
+  it("finds the highest set bit, which is 5 for the same 0x2c", () => {
+    // mov $0x2c,%eax ; bsr %eax,%ecx ; mov %ecx,%eax ; ret
+    expect(run(hex("b8 2c 00 00 00 0f bd c8 89 c8 c3"))).toBe(5n);
+  });
+
+  it("leaves the destination alone when the source is zero, and sets the zero flag", () => {
+    /*
+     * mov $0x2c,%ecx ; xor %eax,%eax ; bsr %eax,%ecx ; je found ; mov $99,%eax ; found: mov %ecx,%eax ; ret
+     * the answer is the destination the scan left untouched, not the 63 a bare `clz` subtraction would have written
+     */
+    expect(run(hex("b9 2c 00 00 00 31 c0 0f bd c8 74 05 b8 63 00 00 00 89 c8 c3"))).toBe(0x2cn);
+  });
+
+  it("scans a 64-bit source at 64 bits, where the highest bit is 63", () => {
+    // mov $1,%rax ; shl $63,%rax ; bsr %rax,%rcx ; mov %rcx,%rax ; ret
+    expect(run(hex("48 c7 c0 01 00 00 00 48 c1 e0 3f 48 0f bd c8 48 89 c8 c3"))).toBe(63n);
+  });
+
+  it("refuses a condition the scan does not define, because it says nothing about the value", () => {
+    // bsr %eax,%ecx ; js ...: the sign flag is undefined after a scan, which is not the sign of the index it wrote
+    expect(() => run(hex("b8 2c 00 00 00 0f bd c8 78 05 b8 01 00 00 00 c3"))).toThrow(
+      /bsf and bsr set the zero flag/,
+    );
+  });
+
+  it("refuses the prefixed tzcnt by name rather than reading it as bsf", () => {
+    // f3 0f bc c0 is `tzcnt %eax,%eax`, which answers the operand width for a zero source where bsf answers nothing
+    expect(() => run(hex("31 c0 f3 0f bc c0 c3"))).toThrow(/tzcnt/);
+  });
+});
+
 describe("branches nest as structure", () => {
   it("nests one conditional branch inside another and branches out of both", () => {
     /*

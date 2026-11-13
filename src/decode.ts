@@ -502,6 +502,18 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
         mandatoryF3 = true;
         continue;
       }
+      /*
+       * `f3 0f bc` and `f3 0f bd` are `tzcnt` and `lzcnt`, which share the bit scan's opcodes and are a different instruction: they
+       * are defined for a zero source, where the scan leaves the destination alone, and they write the carry as well as the zero flag.
+       * Named rather than read as the unprefixed pair, whose answer for zero is not this one.
+       */
+      if (bytes[afterPrefix] === 0x0f && (bytes[afterPrefix + 1] === 0xbc || bytes[afterPrefix + 1] === 0xbd)) {
+        throw new DecodeError(
+          offset,
+          `0xf3 0f 0x${bytes[afterPrefix + 1]!.toString(16)} is ${bytes[afterPrefix + 1] === 0xbc ? "tzcnt" : "lzcnt"}, which is not in the ` +
+            "decoded subset: it counts zeros rather than scanning for a set bit, and it writes the carry as well as the zero flag",
+        );
+      }
       throw new DecodeError(offset, "a lock or repeat prefix is not in the decoded subset");
     }
     if (next === 0xf0 || next === 0xf2) {
@@ -567,6 +579,15 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
       const modrm = decodeModRm(cursor, rex, bits, segment);
       const register = registerOperand(modrm.regField, rex.r, bits);
       return finish("bt", [modrm.rm, register]);
+    }
+    if (second === 0xbc || second === 0xbd) {
+      /*
+       * `bsf` finds the lowest set bit of its source and `bsr` the highest, and each writes the bit's index into the register
+       * operand. Both leave the destination alone and set the zero flag when the source is zero, which is the case the translation
+       * has to spell out because neither WASM count does it.
+       */
+      const modrm = decodeModRm(cursor, rex, bits, segment);
+      return finish(second === 0xbc ? "bsf" : "bsr", [registerOperand(modrm.regField, rex.r, bits), modrm.rm]);
     }
     if (second === 0xb6 || second === 0xbe) {
       // movzx / movsx from a byte: the source is a byte register or a byte of memory, the destination 32 or 64 bits

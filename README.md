@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 291
+**Tests:** 297
 
 ```bash
 npm ci && npm run verify
@@ -650,9 +650,23 @@ is outside all of them does not name a function. It is registered as a body that
 it traps exactly where the processor would fault. Without the ranges, the whole region counts as executable, which is what a caller
 that hands over bytes and no segments is saying.
 
-Where it stops now: `+0x247` into the function at `0x409c20`, on `bsr`, the bit scan that finds the highest set bit (`0x0f 0xbd`). It
-is the reverse of `bsf`, which is not decoded either, and both leave the destination register alone when the source is zero, so the
-flags and the destination are two separate questions.
+### The bit scans
+
+`bsf` and `bsr` write the index of the lowest and highest set bit of their source. WASM has neither, and the two counts it does have
+are what they are built from: the lowest index is `ctz`, which counts the bits after the lowest set one, and the highest is
+`63 - clz`.
+
+The case neither count gets right is a zero source, where the processor leaves the destination exactly as it was and sets the zero
+flag. `ctz` and `clz` both answer 64 there, so the destination is picked between its own value and the index by a `select`, and the
+flag locals hold the source against zero rather than the result.
+
+Its flags are about the source, not about the index it wrote: only the zero flag is defined, so `je` and `jne` are answerable after a
+scan and every other condition is refused by name. `sbb` after a scan or a shift is refused for the same reason: the carry neither
+defines is the borrow it would subtract. The prefixed `tzcnt` and `lzcnt`, which share the two opcodes, are refused by name: they are
+defined for a zero source and write the carry.
+
+Where it stops now: a jump through a register at `0x4098da` in the function at `0x409810`, whose table cannot be read, so the cases
+at `0xf1` are expected and unreached.
 
 The cost of the dispatcher is worth stating: a body with any backward branch takes that path, so even a clean loop is expressed by
 naming blocks rather than as a WASM `loop`. The structured path is kept for the bodies that are trees, which is most of the small

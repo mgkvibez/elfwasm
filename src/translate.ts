@@ -991,6 +991,55 @@ type ShiftOp = keyof typeof SHIFTS_TRANSLATED;
  * zero and sign conditions read the value that was written. The carry is the last bit shifted out, which is a fact about the bits
  * that left rather than about the result, so it is not modelled here and the conditions that read it refuse by name.
  */
+/**
+ * `bsf` and `bsr`: the index of the lowest or highest set bit of the source, written into the destination.
+ *
+ * Neither has a WASM instruction, and both are built from one: `ctz` counts the bits after the lowest set one, which is its index,
+ * and the highest index is `63 - clz`. The case that neither count gets right is a zero source: `ctz` answers 64 and `clz` answers
+ * 64, where the processor leaves the destination exactly as it was and sets the zero flag. So the destination is picked between its
+ * own value and the index by a `select`, and the flag locals hold the source against zero rather than the result.
+ */
+function translateBitScan(instruction: Instruction): number[] {
+  const [destination, source] = instruction.operands;
+  if (destination === undefined || source === undefined) {
+    throw new TranslateError(instruction.offset, `a ${instruction.op} needs two operands`);
+  }
+  if (destination.kind !== "reg") {
+    throw new TranslateError(instruction.offset, `a ${instruction.op} into a ${destination.kind} is not an encoding: the destination is a register`);
+  }
+  const width = destination.bits;
+  if (width !== 32 && width !== 64) {
+    throw new TranslateError(instruction.offset, `a ${width}-bit ${instruction.op} is not translated: only 32 and 64`);
+  }
+  const sourceBits = source.kind === "reg" || source.kind === "memory" ? source.bits : undefined;
+  if (sourceBits !== width) {
+    throw new TranslateError(
+      instruction.offset,
+      `a ${instruction.op} from a ${sourceBits ?? source.kind} operand into a ${width}-bit destination is not an encoding`,
+    );
+  }
+  const raw = source.kind === "memory" ? loadFromMemory(source, width, instruction) : read(source, instruction);
+  // a 32-bit operand is read from a 64-bit local, so the bits above its width are not part of what the scan walks
+  const value = width === 32 ? [...raw, ...i64Const(0xffffffffn), OP.i64And] : raw;
+  const index = instruction.op === "bsf"
+    ? [...value, OP.i64Ctz]
+    : [...i64Const(63n), ...value, OP.i64Clz, OP.i64Sub];
+  return [
+    ...value,
+    ...localSet(CMP_A),
+    ...i64Const(0n),
+    ...localSet(CMP_B),
+    // the destination is its own value when the source is zero, and the index otherwise: `select` picks the first when the
+    // condition is not zero, so the source being zero is the condition it gets
+    ...read(destination, instruction),
+    ...index,
+    ...value,
+    OP.i64Eqz,
+    OP.select,
+    ...write(destination, instruction),
+  ];
+}
+
 function translateShift(instruction: Instruction): number[] {
   const op = instruction.op as ShiftOp;
   const [destination, count] = instruction.operands;
@@ -1463,6 +1512,13 @@ function flagCondition(suffix: string, flags: Flags, instruction: Instruction): 
         "undefined, so only the carry conditions, jb and jae, can be read after it",
     );
   }
+  if (flags.kind === "zero" && !ZERO_CONDITIONS.has(suffix)) {
+    throw new TranslateError(
+      instruction.offset,
+      `a ${instruction.op} after a bit scan reads a flag the scan does not define: bsf and bsr set the zero flag when no bit is set ` +
+        "and leave the sign, the parity, the carry and the overflow undefined, so only je and jne can be read after one",
+    );
+  }
   if (flags.kind === "shift" && !SHIFT_CONDITIONS.has(suffix)) {
     throw new TranslateError(
       instruction.offset,
@@ -1476,6 +1532,9 @@ function flagCondition(suffix: string, flags: Flags, instruction: Instruction): 
 /** The conditions a shift answers: what the result it wrote is, and not what left it. */
 const SHIFT_CONDITIONS: ReadonlySet<string> = new Set(["e", "ne", "z", "nz", "s", "ns"]);
 
+/** The conditions a bit scan answers: whether it found a bit, and nothing about the value it found. */
+const ZERO_CONDITIONS: ReadonlySet<string> = new Set(["e", "ne", "z", "nz"]);
+
 /** A region's exit points: the instruction index of its end, and how many blocks a `br` must cross to reach it. */
 type Scope = Map<number, number>;
 
@@ -1488,7 +1547,7 @@ interface Flags {
    * What defined them. A comparison defines every condition a compiler reads; a bit test defines the carry and leaves the rest
    * undefined, so the conditions that read them are refused instead of being answered from a value that is not there.
    */
-  kind?: "bit" | "shift" | undefined;
+  kind?: "bit" | "shift" | "zero" | undefined;
 }
 
 function indexOfOffset(instructions: readonly Instruction[], offset: number): number {
@@ -2322,6 +2381,13 @@ function translateRange(
           "sbb reads the carry flag, which needs a cmp or test that every path reaching it goes through",
         );
       }
+      if (flags.kind === "shift" || flags.kind === "zero") {
+        throw new TranslateError(
+          instruction.offset,
+          `sbb after a ${flags.kind === "zero" ? "bit scan" : "shift"} reads the carry, which it does not define: a shift's carry is ` +
+            "the bit that left and a scan's is not defined at all, so neither is a borrow to subtract here",
+        );
+      }
       const [destination, source] = instruction.operands;
       if (destination === undefined || source === undefined) {
         throw new TranslateError(instruction.offset, "sbb needs two operands");
@@ -2344,6 +2410,19 @@ function translateRange(
       );
       // the arithmetic flags it sets are not modelled, so the comparison it inherited is spent
       flags.set = false;
+      index += 1;
+      continue;
+    }
+    if (instruction.op === "bsf" || instruction.op === "bsr") {
+      /*
+       * Its flags are about the source, not about the index it wrote: the zero flag says whether a bit was found at all, and every
+       * other flag is undefined. `kind: "zero"` is how a condition is told so.
+       */
+      out.push(...translateBitScan(instruction));
+      flags.set = true;
+      const destination = instruction.operands[0];
+      flags.width = destination !== undefined && destination.kind === "reg" && destination.bits === 32 ? 32 : 64;
+      flags.kind = "zero";
       index += 1;
       continue;
     }
