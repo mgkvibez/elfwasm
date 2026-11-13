@@ -255,6 +255,53 @@ describe("what the flags are after an instruction", () => {
   });
 });
 
+describe("a comparison at sixteen bits", () => {
+  it("reads the sign from bit fifteen and not from bit sixty-three", () => {
+    // mov $0x8000,%eax ; cmpw $0,%ax ; jl skip ; mov $7,%eax ; skip: ret  ->  the low half is negative, so the jump is taken
+    expect(run(hex("b8 00 80 00 00 66 83 f8 00 7c 05 b8 07 00 00 00 c3"))).toBe(0x8000n);
+  });
+
+  it("compares as unsigned values, where the sign-extended reading would be wrong", () => {
+    // mov $0x8000,%eax ; cmpw $1,%ax ; ja skip ; mov $7,%eax ; skip: ret
+    // 0x8000 is above 1 as a word, and below it as a sign-extended value: keeping the operands masked is what makes this right
+    expect(run(hex("b8 00 80 00 00 66 83 f8 01 77 05 b8 07 00 00 00 c3"))).toBe(0x8000n);
+  });
+
+  it("reads the sign of a masked test", () => {
+    // mov $0x8000,%eax ; testw %ax,%ax ; js skip ; mov $7,%eax ; skip: ret
+    expect(run(hex("b8 00 80 00 00 66 85 c0 78 05 b8 07 00 00 00 c3"))).toBe(0x8000n);
+  });
+
+  it("reads the sign of a negated word, which is the result and not the register above it", () => {
+    // mov $5,%eax ; negw %ax ; js skip ; mov $7,%eax ; skip: ret  ->  0 - 5 is 0xfffb in the half, so the sign flag is set
+    expect(run(hex("b8 05 00 00 00 66 f7 d8 78 05 b8 07 00 00 00 c3"))).toBe(0xfffbn);
+  });
+});
+
+describe("the compare and swap", () => {
+  /*
+   * The shape a one-time guard is written in: compare, and write only if nothing has claimed it yet. The register form is used
+   * here because it needs no memory to be set up, and both arms are checked because they are the two answers it exists to give.
+   */
+  it("writes the source into the destination when the accumulator matches it", () => {
+    // mov $5,%eax ; mov $5,%ecx ; mov $42,%edx ; cmpxchg %edx,%ecx ; jne +2 ; mov %ecx,%eax ; ret
+    expect(run(hex("b8 05 00 00 00 b9 05 00 00 00 ba 2a 00 00 00 0f b1 d1 75 02 89 c8 c3"))).toBe(0x2an);
+  });
+
+  it("loads the destination into the accumulator when they differ, and leaves the destination alone", () => {
+    // the same bytes with a different accumulator, and `je` where the `jne` was: on a mismatch the move is the one that runs, so
+    // the answer is the destination's old value. If the source had been written where the destination was, it would be 42.
+    expect(run(hex("b8 07 00 00 00 b9 05 00 00 00 ba 2a 00 00 00 0f b1 d1 74 02 89 c8 c3"))).toBe(5n);
+  });
+
+  it("leaves the flags describing the comparison, so a branch on order answers too", () => {
+    // mov $9,%eax ; mov $5,%ecx ; mov $42,%edx ; cmpxchg %edx,%ecx ; ja skip ; mov $1,%eax ; ret
+    // 9 is above 5, so the jump is taken and the accumulator keeps the destination's value: a translator that read the flags the
+    // other way round would answer 1
+    expect(run(hex("b8 09 00 00 00 b9 05 00 00 00 ba 2a 00 00 00 0f b1 d1 77 05 b8 01 00 00 00 c3"))).toBe(5n);
+  });
+});
+
 describe("the widenings a compiler reads a field with", () => {
   it("zero-extends a byte register, which keeps the byte and drops the rest", () => {
     // mov $0x2c,%eax ; movzbl %al,%ecx ; mov %ecx,%eax ; ret

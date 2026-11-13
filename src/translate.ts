@@ -1113,7 +1113,7 @@ function operandCode64(operand: Operand, instruction: Instruction): number[] {
   if (operand.kind === "memory") {
     // the comparison's own width decides, and a memory operand carries it: a byte of memory is not a 64-bit value
     if (operand.bits === 8) return loadByteFromMemory(operand, instruction);
-    const width = operand.bits === 32 ? 32 : 64;
+    const width = operand.bits === 16 ? 16 : operand.bits === 32 ? 32 : 64;
     return loadFromMemory(operand, width, instruction);
   }
   return read(operand, instruction);
@@ -1134,7 +1134,7 @@ const FLAG_SETTING: ReadonlySet<string> = new Set(["add", "sub", "and", "or", "x
  * `not` leaves the flags alone, which is not the same as clearing them: a branch after it reads what the previous
  * instruction set. `neg` reports its result, so only the zero and sign flags are modelled, and its borrow is not.
  */
-function translateUnary(instruction: Instruction): { code: number[]; width?: 32 | 64 } {
+function translateUnary(instruction: Instruction): { code: number[]; width?: 16 | 32 | 64 } {
   const [destination] = instruction.operands;
   if (destination === undefined) {
     throw new TranslateError(instruction.offset, `${instruction.op} needs an operand`);
@@ -1143,13 +1143,14 @@ function translateUnary(instruction: Instruction): { code: number[]; width?: 32 
     throw new TranslateError(instruction.offset, `a ${instruction.op} in memory is not translated yet`);
   }
   const width = destination.bits;
-  if (width !== 8 && width !== 32 && width !== 64) {
+  if (width !== 8 && width !== 16 && width !== 32 && width !== 64) {
     throw new TranslateError(instruction.offset, `a ${width}-bit ${instruction.op} is not translated yet`);
   }
-  const ones = width === 8 ? 0xffn : width === 32 ? 0xffffffffn : 0xffffffffffffffffn;
-  // a 32-bit result is zero-extended as it is written, so the value that goes into the local and the value that is reported
-  // to the flags are the same one
-  const narrowed = (code: number[]): number[] => (width === 32 ? [...code, NARROW_32, WIDEN_32] : code);
+  const ones = width === 8 ? 0xffn : width === 16 ? 0xffffn : width === 32 ? 0xffffffffn : 0xffffffffffffffffn;
+  // a narrow result is reduced to its own half here, so the value that goes into the local and the value that is reported to the
+  // flags are the same one, and a sixteen-bit one is kept masked rather than sign-extended for the reason a comparison is
+  const narrowed = (code: number[]): number[] =>
+    width === 32 ? [...code, NARROW_32, WIDEN_32] : width === 16 ? [...code, ...i64Const(0xffffn), OP.i64And] : code;
   if (instruction.op === "not") {
     return { code: [...narrowed([...read(destination, instruction), ...i64Const(ones), OP.i64Xor]), ...write(destination, instruction)] };
   }
@@ -1399,7 +1400,69 @@ function translateConditionalMove(instruction: Instruction): number[] {
   return [...widened, ...write(destination, instruction)];
 }
 
-function translateFlags(instruction: Instruction): { code: number[]; width: 32 | 64 } {
+/**
+ * The accumulator each width of `cmpxchg` reads and, on a mismatch, writes: the register it never touches on a match.
+ *
+ * A thirty-two-bit operand names the sixty-four-bit register and carries its own width, which is the convention every other operand
+ * here uses; only the word has a name of its own.
+ */
+const ACCUMULATOR: Readonly<Record<16 | 32 | 64, RegisterName>> = { 16: "ax", 32: "rax", 64: "rax" };
+
+/**
+ * `cmpxchg`: one instruction that is a comparison and a choice.
+ *
+ * It compares the accumulator with the destination, and then exactly one of two writes happens. Equal, the source goes where the
+ * destination was and the accumulator keeps its value; not equal, the destination's old value goes into the accumulator and the
+ * destination keeps its own. Both writes are on the same path and neither is speculative, which is what makes the atomicity of the
+ * prefix unobservable here: with one thread there is nothing between the comparison and the write to interleave with.
+ *
+ * The flags are the comparison's own, which is why the two values are left in the comparison locals: `jne` after it reads them, and
+ * so does the mismatch path, whose value is the second of the two.
+ */
+function translateCompareExchange(instruction: Instruction): { code: number[]; width: 16 | 32 | 64 } {
+  const [destination, source] = instruction.operands;
+  if (destination === undefined || source === undefined) {
+    throw new TranslateError(instruction.offset, "cmpxchg needs two operands");
+  }
+  if (destination.kind !== "memory" && destination.kind !== "reg") {
+    throw new TranslateError(instruction.offset, `cmpxchg into a ${destination.kind} is not an encoding`);
+  }
+  const width = destination.bits;
+  if (width !== 16 && width !== 32 && width !== 64) {
+    throw new TranslateError(instruction.offset, "an 8-bit cmpxchg is not translated yet: it compares the low byte of the accumulator");
+  }
+  const accumulator: Operand = { kind: "reg", name: ACCUMULATOR[width], bits: width };
+  // a sixteen-bit value is kept masked so the unsigned conditions are right, and a thirty-two-bit one is narrowed through i32 so
+  // that a write of it zero-extends, the same rule every other operand here follows
+  const half = (code: number[]): number[] =>
+    width === 16 ? [...code, ...i64Const(0xffffn), OP.i64And] : width === 32 ? [...code, NARROW_32, WIDEN_32] : code;
+  const current =
+    destination.kind === "memory" ? loadFromMemory(destination, width, instruction) : read(destination, instruction);
+  const replacement = half(read(source, instruction));
+  return {
+    code: [
+      ...half(read(accumulator, instruction)),
+      ...localSet(CMP_A),
+      ...half(current),
+      ...localSet(CMP_B),
+      ...localGet(CMP_A),
+      ...localGet(CMP_B),
+      OP.i64Eq,
+      OP.ifEmpty,
+      OP.emptyBlockType,
+      ...(destination.kind === "memory"
+        ? storeToMemory(destination, width === 64 ? replacement : [...replacement, NARROW_32], width, instruction)
+        : [...replacement, ...write(destination, instruction)]),
+      OP.elseOp,
+      ...localGet(CMP_B),
+      ...write(accumulator, instruction),
+      OP.end,
+    ],
+    width,
+  };
+}
+
+function translateFlags(instruction: Instruction): { code: number[]; width: 16 | 32 | 64 } {
   const [destination, source] = instruction.operands;
   if (destination === undefined || source === undefined) {
     throw new TranslateError(instruction.offset, `${instruction.op} needs two operands`);
@@ -1412,21 +1475,23 @@ function translateFlags(instruction: Instruction): { code: number[]; width: 32 |
     throw new TranslateError(instruction.offset, `a ${instruction.op} against a ${destination.kind} is not translated`);
   }
   const width = destination.bits;
-  if (width !== 8 && width !== 32 && width !== 64) {
+  if (width !== 8 && width !== 16 && width !== 32 && width !== 64) {
     throw new TranslateError(instruction.offset, `a ${width}-bit ${instruction.op} is not translated yet`);
   }
   /*
    * A byte comparison is evaluated at 64 bits on sign-extended bytes, so `width` is reported as the width the comparison is
-   * *done* at rather than the width the instruction names. That is the same convention a 32-bit comparison already uses: its
+   * *done* at rather than the width the instruction names. A word is different: its operands are masked to sixteen bits and kept
+   * that way, because a sign-extended word gets the unsigned conditions wrong. That is the same convention a 32-bit comparison already uses: its
    * operands are kept as i64 and narrowed when the condition is evaluated, and here the narrowing happens on the way in
    * because a byte's sign lives at bit 7 and not at bit 31.
    */
-  const shape = (code: number[]): number[] => (width === 8 ? signExtend8(code) : code);
+  const shape = (code: number[]): number[] =>
+    width === 8 ? signExtend8(code) : width === 16 ? [...code, ...i64Const(0xffffn), OP.i64And] : code;
   const left =
     destination.kind === "memory"
       ? destination.bits === 8
         ? loadByteFromMemory(destination, instruction)
-        : loadFromMemory(destination, destination.bits === 32 ? 32 : 64, instruction)
+        : loadFromMemory(destination, destination.bits === 16 ? 16 : destination.bits === 32 ? 32 : 64, instruction)
       : read(destination, instruction);
   if (instruction.op === "test") {
     // `test a, b` is `and` with the result discarded: the flags come from a & b, and comparing the mask against zero
@@ -1470,9 +1535,25 @@ const COMPARE_OPCODES: Record<32 | 64, Record<Comparison, number>> = {
   },
 };
 
-/** Both operands of the last comparison, at the width it was made, ready for one comparison opcode. */
-function comparisonOperands(width: 32 | 64): number[] {
+/** A sixteen-bit value sign-extended from its own half, so a signed comparison is about bit 15 rather than bit 63. */
+function signExtend16(value: number[]): number[] {
+  return [...value, ...i64Const(48n), OP.i64Shl, ...i64Const(48n), OP.i64ShrS];
+}
+
+/**
+ * Both operands of the last comparison, at the width it was made, ready for one comparison opcode.
+ *
+ * A sixteen-bit comparison is kept masked to its own half, which is what makes the unsigned conditions right: `0x8000` is above
+ * `0x7fff` and both are below every value a wider register holds. A signed condition needs the sign of bit 15 and not of bit 63, so
+ * the two bits are swapped first and the 64-bit signed opcodes then answer it.
+ */
+function comparisonOperands(width: 16 | 32 | 64, signed = false): number[] {
   if (width === 64) return [...localGet(CMP_A), ...localGet(CMP_B)];
+  if (width === 16) {
+    const left = [...localGet(CMP_A)];
+    const right = [...localGet(CMP_B)];
+    return signed ? [...signExtend16(left), ...signExtend16(right)] : [...left, ...right];
+  }
   return [...localGet(CMP_A), NARROW_32, ...localGet(CMP_B), NARROW_32];
 }
 
@@ -1482,19 +1563,23 @@ function comparisonOperands(width: 32 | 64): number[] {
  * `js` and `jns` are the only two that need the subtraction rather than a comparison, because the sign flag is the sign
  * of the difference: `a - b` is pushed and compared against zero, which is the definition rather than a shortcut.
  */
-function conditionCode(suffix: string, width: 32 | 64): number[] {
+function conditionCode(suffix: string, width: 16 | 32 | 64): number[] {
   if (suffix === "s" || suffix === "ns") {
     const difference =
       width === 64
         ? [...comparisonOperands(64), OP.i64Sub, ...i64Const(0n), OP.i64LtS]
-        : [...comparisonOperands(32), OP.i32Sub, ...i32Const(0), OP.i32LtS];
+        : width === 16
+          ? [...comparisonOperands(16, true), OP.i64Sub, ...i64Const(0n), OP.i64LtS]
+          : [...comparisonOperands(32), OP.i32Sub, ...i32Const(0), OP.i32LtS];
     return suffix === "s" ? difference : [...difference, OP.i32Eqz];
   }
   const comparison = COMPARISONS[suffix as keyof typeof COMPARISONS];
   if (comparison === undefined) {
     throw new Error(`unreachable: ${suffix} has no comparison`);
   }
-  return [...comparisonOperands(width), COMPARE_OPCODES[width][comparison]];
+  // `ltS`, `leS`, `gtS` and `geS` are the four that are about the sign; eq, ne and the unsigned four are about the bits
+  const signed = comparison.endsWith("S");
+  return [...comparisonOperands(width, signed), COMPARE_OPCODES[width === 32 ? 32 : 64][comparison]];
 }
 
 /**
@@ -1540,7 +1625,7 @@ type Scope = Map<number, number>;
 
 interface Flags {
   set: boolean;
-  width: 32 | 64;
+  width: 16 | 32 | 64;
   /** Whether the comparison was a subtraction, whose borrow is the carry `sbb` reads; a `test` has no carry to give. */
   borrows?: boolean;
   /**
@@ -1893,6 +1978,16 @@ function translateRange(
       flags.width = width;
       flags.borrows = false;
       flags.kind = "bit";
+      index += 1;
+      continue;
+    }
+    if (instruction.op === "cmpxchg") {
+      const translated = translateCompareExchange(instruction);
+      out.push(...translated.code);
+      flags.set = true;
+      flags.width = translated.width;
+      flags.borrows = true;
+      flags.kind = undefined;
       index += 1;
       continue;
     }
@@ -2471,7 +2566,9 @@ function translateRange(
           ? [...i64Const(0n)]
           : flags.width === 32
             ? [...comparisonOperands(32), OP.i32LtU, OP.i64ExtendI32U]
-            : [...comparisonOperands(64), OP.i64LtU, OP.i64ExtendI32U];
+            : flags.width === 16
+              ? [...comparisonOperands(16), OP.i64LtU, OP.i64ExtendI32U]
+              : [...comparisonOperands(64), OP.i64LtU, OP.i64ExtendI32U];
       out.push(
         ...carry,
         ...localSet(SBB_CARRY),

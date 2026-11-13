@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 305
+**Tests:** 315
 
 ```bash
 npm ci && npm run verify
@@ -117,7 +117,7 @@ send a reader to different places in the architecture.
 
 `translate` takes the decoder's instructions and emits one WASM function per x86-64 function: no parameters, one `i64`
 result, sixteen `i64` globals for the sixteen registers in encoding order. The subset is `mov`, `lea`, `movzx`, `movsx`,
-`movsxd`, `add`, `sub`, `xor`, `and`, `or`, `imul` at 32 and 64 bits, `cmp` and `test`, `setcc`, the ten conditional branches
+`movsxd`, `add`, `sub`, `xor`, `and`, `or`, `imul` at 32 and 64 bits, `cmp` and `test`, `cmpxchg`, `setcc`, the ten conditional branches
 that need only zf, sf, cf and of, `jmp` in both directions, loops, `call`, `syscall`, and `ret`, which returns `rax`.
 
 Flags are never materialised as variables. `cmp` and `test` leave their operands in two extra locals and a `jcc` becomes
@@ -509,8 +509,33 @@ which is how it was found.
 And a 16-bit register is a half of a 64-bit one, not a variable of its own. `%ax` and `%r8w` are the low 16 bits of `%rax` and `%r8`,
 read through a `0xffff` mask and written by merging, so the upper 48 bits survive a narrow move. The translator's `mov` family now takes
 that width in all three shapes: register to register, register to memory, and memory into a register, where the load zero-extends like
-every other narrow load. 16-bit arithmetic is still refused by name, because its flags are 16 bits wide and this translator computes them
-at 64.
+every other narrow load.
+
+A comparison at that width was the next thing a walk of glibc needed, and it is not the same question as a comparison at 32: its operands
+are kept *masked* to their own half rather than sign-extended, because a sign-extended word gets the unsigned conditions wrong. `cmpw $1,%ax`
+with `0x8000` in the register is *above* 1 as a word and below it as a sign-extended value, and only the masked reading answers `ja`. A
+signed condition then needs the sign of bit 15 rather than of bit 63, so the two bits are swapped with a shift pair before the 64-bit
+signed opcodes answer it: `jl` after `cmpw $0,%ax` with `0x8000` is taken, which is where a sign-extended operand and this one agree, and
+`js` after a `testw` of the same value is taken for the same reason. Reading two bytes from memory for such an operand, rather than eight,
+matters for more than correctness: a word at the end of a page is a fault to a processor that read eight.
+
+16-bit arithmetic is still refused by name, because its flags are 16 bits wide and this translator computes them at 64.
+
+### The compare and swap
+
+`lock cmpxchg %edx,0x4c687(%rip)` is how glibc claims a one-time initialisation, and it is one instruction that is a comparison and a
+choice: compare the accumulator with the destination, and on a match write the source where the destination was, on a mismatch load the
+destination's old value into the accumulator and leave the destination alone. Both writes are translated, one on each arm of an `if`, and
+neither is speculative.
+
+The flags are the comparison's own, so the two operands are left in the comparison locals and the mismatch arm reads its value from the
+second of them: `jne` after it says which of the two happened, and so do `ja` and `js`, because Intel defines the whole flag set from the
+comparison rather than the zero flag alone.
+
+The `lock` prefix is read and recorded rather than thrown away, and there is one thread here, so it changes no answer: nothing can run
+between the comparison and the write it belongs to. What it is not allowed to do is land on an instruction it cannot belong to, since that
+is an invalid-opcode fault on a processor and translating it would be translating a program that cannot run. A set names the eight
+instructions it is legal on, and each of them must write memory, which is the shape it makes indivisible.
 
 ### The 128-bit interleave, and what a call target is not
 

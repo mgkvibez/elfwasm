@@ -422,8 +422,23 @@ describe("refusals", () => {
     expect(source).toMatchObject({ kind: "memory", segment: "fs", displacement: 0x28n, ripRelative: false });
   });
 
-  it("refuses a lock prefix rather than dropping it, since dropping it changes the meaning", () => {
-    expect(refuse(hex("f0 48 01 08")).message).toContain("lock or repeat");
+  it("reads a lock prefix on a read-modify-write of memory, and records that it was there", () => {
+    // lock add %rcx,(%rax): one access, indivisible, which is the only thing the prefix can mean
+    const [instruction] = decode(hex("f0 48 01 08"));
+    expect(instruction?.op).toBe("add");
+    expect(instruction?.lock).toBe(true);
+  });
+
+  it("refuses a lock prefix on a register destination, which the processor faults on", () => {
+    expect(refuse(hex("f0 48 01 c8")).message).toContain("lock prefix on add is not an instruction");
+  });
+
+  it("refuses a lock prefix on an instruction that only reads", () => {
+    expect(refuse(hex("f0 48 3b 08")).message).toContain("lock prefix on cmp is not an instruction");
+  });
+
+  it("still refuses a repeat prefix", () => {
+    expect(refuse(hex("f2 48 01 08")).message).toContain("lock or repeat");
   });
 
   it("refuses the lea form that cannot exist", () => {

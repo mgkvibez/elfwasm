@@ -64,6 +64,15 @@ function vectorOperand(code: number, extended: boolean, half: "lo" | "hi", bits:
   return { kind: "reg", name: `xmm${index}.${half}` as VectorRegisterName, bits };
 }
 
+/**
+ * The instructions a `lock` prefix is legal on.
+ *
+ * The prefix makes one read-modify-write of memory indivisible, so it belongs on the instructions that do exactly that and nowhere
+ * else: on a register destination, or on an instruction that only reads, it is an invalid-opcode fault on the processor. Refused
+ * rather than dropped, because dropping it would translate a program that cannot run.
+ */
+const LOCKABLE: ReadonlySet<string> = new Set(["cmpxchg", "xadd", "add", "sub", "and", "or", "xor", "inc", "dec"]);
+
 export type Operand =
   | { readonly kind: "reg"; readonly name: RegisterName; readonly bits: 8 | 16 | 32 | 64 }
   | { readonly kind: "immediate"; readonly value: bigint }
@@ -116,6 +125,14 @@ export interface Instruction {
   /** `mov`, `lea`, `xor`, `add`, `sub`, `cmp`, `push`, `pop`, `call`, `jmp`, `je`, `jne`, `ret`, `syscall`, `nop`. */
   readonly op: string;
   readonly operands: readonly Operand[];
+  /**
+   * True when a `lock` prefix said the access is indivisible.
+   *
+   * There is one thread in this machine, so the prefix changes no answer and the translator never has to look at it: it is kept so
+   * that a reader of the decoding can see the instruction was atomic, and so that a second thread is a decision rather than a
+   * surprise.
+   */
+  readonly lock?: true;
 }
 
 export class DecodeError extends Error {
@@ -391,6 +408,8 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
   let mandatoryF3 = false;
   // set by 0x66 where it is not the mandatory prefix of an SSE encoding: the operand is 16 bits wide rather than 32
   let operandSize16 = false;
+  // set by 0xf0: the access is meant to be indivisible, which is a fact about the instruction rather than about its operands
+  let locked = false;
 
   for (;;) {
     const next = bytes[cursor.index];
@@ -516,7 +535,12 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
       }
       throw new DecodeError(offset, "a lock or repeat prefix is not in the decoded subset");
     }
-    if (next === 0xf0 || next === 0xf2) {
+    if (next === 0xf0) {
+      cursor.index += 1;
+      locked = true;
+      continue;
+    }
+    if (next === 0xf2) {
       throw new DecodeError(offset, "a lock or repeat prefix is not in the decoded subset");
     }
     if (next >= 0x40 && next <= 0x4f) {
@@ -536,12 +560,16 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
   // REX.W wins over the prefix, which is what `66 48 8b` means: a 64-bit operand with a prefix in front of it
   const bits: 16 | 32 | 64 = rex.w ? 64 : operandSize16 ? 16 : 32;
   const opcode = byteAt(cursor);
-  const finish = (op: string, operands: readonly Operand[]): Instruction => ({
-    offset,
-    length: cursor.index - offset,
-    op,
-    operands,
-  });
+  const finish = (op: string, operands: readonly Operand[]): Instruction => {
+    if (locked && !(LOCKABLE.has(op) && operands[0]?.kind === "memory")) {
+      throw new DecodeError(
+        offset,
+        `a lock prefix on ${op} is not an instruction: it is legal only on a read-modify-write of memory, and this one ` +
+          `${operands[0] === undefined ? "has no destination" : `writes a ${operands[0].kind}`}`,
+      );
+    }
+    return { offset, length: cursor.index - offset, op, operands, ...(locked ? { lock: true as const } : {}) };
+  };
 
   if (opcode === 0x90) return finish("nop", []);
   if (opcode === 0xc3) return finish("ret", []);
@@ -606,6 +634,16 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
         );
       }
       return finish(second === 0xb7 ? "movzx" : "movsx", [registerOperand(modrm.regField, rex.r, bits), modrm.rm]);
+    }
+    if (second === 0xb1 || second === 0xc1 || second === 0xb0 || second === 0xb1) {
+      /*
+       * The two instructions that swap and compare against the accumulator: `cmpxchg` (0f b1) and `xadd` (0f c1). Both read,
+       * modify and write one operand, which is what `lock` is for, and both are `/r` with the source in the register field and
+       * the destination in the r/m field. `cmpxchg8b` and `cmpxchg16b` are 0f c7, a different encoding, so `bits` is the only
+       * width question here.
+       */
+      const modrm = decodeModRm(cursor, rex, bits, segment);
+      return finish(second === 0xb1 ? "cmpxchg" : "xadd", [modrm.rm, registerOperand(modrm.regField, rex.r, bits)]);
     }
     if (second === 0x1f) {
       // the multi-byte nop. The linker's alignment padding spells it with a 0x66 prefix and is handled above; a compiler emits
