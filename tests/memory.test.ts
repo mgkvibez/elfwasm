@@ -176,6 +176,19 @@ describe("stores and loads", () => {
     expect(BigInt.asUintN(32, result)).toBe(0x0f000000n);
   });
 
+  it("tests a bit of a word in memory, which is how a compiled program reads a flags word", () => {
+    /*
+     * movq $0x10,0x400100 ; mov $4,%ecx ; bt %rcx,0x400100 ; jb done ; mov $0,%eax ; ret ; done: mov $1,%eax ; ret
+     *
+     * Bit 4 of 0x10 is set, so the carry is set and the branch is taken. A bit test is the one instruction besides a comparison
+     * whose result is a flag, so the fixture is here: the value has to be in memory for the memory form to be the one under test.
+     */
+    const { result } = run(
+      hex("48 c7 04 25 00 01 40 00 10 00 00 00 b9 04 00 00 00 48 0f a3 0c 25 00 01 40 00 72 06 b8 00 00 00 00 c3 b8 01 00 00 00 c3"),
+    );
+    expect(result).toBe(1n);
+  });
+
   it("imports the memory rather than owning one, so the caller's buffer is the one written", () => {
     const module = translateBytes(
       hex("48 c7 04 25 00 01 40 00 2a 00 00 00 c3"),

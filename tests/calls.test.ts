@@ -214,3 +214,31 @@ describe("what this machine says it can do", () => {
     expect(run(code, 0x06)).toBe(3n);
   });
 });
+
+describe("a bit that becomes a flag", () => {
+  /*
+   * `bt value, index` writes the carry and leaves every other flag undefined. The carry is expressed the way a comparison already is,
+   * as the unsigned-below pair in the two locals a `cmp` uses, so `jb` after a bit test means the bit was set.
+   */
+  it("sets the carry from the bit the index names, and jb follows it", () => {
+    /*
+     * mov $0x8,%eax ; mov $3,%ecx ; bt %ecx,%eax ; jb done ; mov $0,%eax ; ret ; done: mov $1,%eax ; ret
+     *
+     * Bit 3 of 8 is set, so the carry is set and jb is taken. The same bytes with the index at bit 2 ask about a zero bit.
+     */
+    const programme = (index: string): Uint8Array =>
+      Uint8Array.from(hex(`b8 08 00 00 00 b9 ${index} 00 00 00 0f a3 c8 72 06 b8 00 00 00 00 c3 b8 01 00 00 00 c3`));
+    expect(run(programme("03"), 0x1b)).toBe(1n);
+    expect(run(programme("02"), 0x1b)).toBe(0n);
+  });
+
+  it("refuses a condition a bit test does not define, instead of answering it from the last comparison", () => {
+    /*
+     * `bt %rcx,%rax ; je done` asks whether the value was zero, which a bit test says nothing about. The answer is refused rather
+     * than taken from whatever comparison happened to run before it.
+     */
+    // mov $8,%eax ; mov $3,%ecx ; bt %ecx,%eax ; je done ; ret ; done: ret
+    const code = Uint8Array.from(hex("b8 08 00 00 00 b9 03 00 00 00 0f a3 c8 74 01 c3 c3"));
+    expect(() => run(code, 0x12)).toThrow(/bit test|does not define/);
+  });
+});

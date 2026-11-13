@@ -589,3 +589,24 @@ describe("xgetbv", () => {
     expect(() => decode(Uint8Array.from([0x0f, 0x01, 0xc9]))).toThrow(/only 0f 01 d0, xgetbv/);
   });
 });
+
+describe("bt", () => {
+  it("decodes the two-byte form with the register as the index and the other operand as the value", () => {
+    // 0f a3 c8 is `bt %ecx,%eax`
+    const [instruction] = decode(Uint8Array.from([0x0f, 0xa3, 0xc8]));
+    expect(instruction!.op).toBe("bt");
+    expect(instruction!.operands.map((operand) => operand.kind)).toEqual(["reg", "reg"]);
+    const value = instruction!.operands[0]!;
+    expect(value.kind === "reg" ? value.bits : undefined).toBe(32);
+  });
+
+  it("takes its width from REX.W, and reads a memory destination the same way", () => {
+    // 48 0f a3 0c 25 00 01 40 00 is `bt %rcx,0x400100`
+    const [instruction] = decode(Uint8Array.from([0x48, 0x0f, 0xa3, 0x0c, 0x25, 0x00, 0x01, 0x40, 0x00]));
+    expect(instruction!.op).toBe("bt");
+    const value = instruction!.operands[0]!;
+    expect(value.kind).toBe("memory");
+    expect(value.kind === "memory" ? value.bits : undefined).toBe(64);
+    expect(instruction!.length).toBe(9);
+  });
+});

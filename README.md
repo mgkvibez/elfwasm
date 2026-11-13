@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 275
+**Tests:** 280
 
 ```bash
 npm ci && npm run verify
@@ -557,9 +557,23 @@ what a program does with it is take the path this translator can run, which is t
 Answering with the AVX bit set would send libc into instructions that would then refuse. The other `0f 01` forms are privileged or
 loader instructions (`sgdt`, `lgdt`, `lidt`) and are refused by name rather than read as this one.
 
-Where it stops now: `+0x258` into `0x40a360`, on `0f a3`, which is `bt`: a bit test, whose result is the carry flag and whose
-destination can be memory. The instruction is a shift and an `and`; the question it raises is how this translator records a flag that
-came from a bit rather than from a comparison.
+### A bit that becomes a flag
+
+`bt value, index` writes the carry and nothing else. Every other flag is left undefined, and the translator had no way to say that:
+flags here are not stored, they are *recomputed* from two locals a `cmp` leaves its operands in, and a condition reads them back by
+comparing. A carry that came from a bit is not a comparison of anything, so the model needed two things.
+
+The first is that the carry can be expressed in those same two locals. `1 - bit` against 1 is the pair the unsigned-below condition
+reads, because `A < B` is a borrow and `1 - bit < 1` is exactly `bit == 1`. `jb` after a bit test therefore means the bit was set, and
+`jae` means it was not, which is how a compiled program tests a flag in a word.
+
+The second is that `Flags` now records what defined it. A bit test leaves the zero, sign and overflow flags undefined, so a `je` after
+one is refused by name rather than answered from whatever comparison happened to leave its operands in those locals last. A join of
+two arms that learned their flags different ways refuses too, for the same reason: two kinds of carry live in the same two locals.
+
+Where it stops now: `+0x108` into a function `0x40a360` calls, on `or` with a memory destination. The instruction decodes and
+`translateBinary` refuses it, because the ALU's read-modify-write path was never needed before: every memory operand so far has been a
+source.
 
 The cost of the dispatcher is worth stating: a body with any backward branch takes that path, so even a clean loop is expressed by
 naming blocks rather than as a WASM `loop`. The structured path is kept for the bodies that are trees, which is most of the small

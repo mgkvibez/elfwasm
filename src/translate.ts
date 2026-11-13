@@ -1284,6 +1284,24 @@ function conditionCode(suffix: string, width: 32 | 64): number[] {
   return [...comparisonOperands(width), COMPARE_OPCODES[width][comparison]];
 }
 
+/**
+ * The comparison a condition reads, from the flags as they stand.
+ *
+ * `bt` is the reason this exists apart from `conditionCode`: it writes the carry and leaves every other flag undefined, so a
+ * condition that reads one of those has no answer here and is refused rather than answered from whatever the last comparison left
+ * in the locals. `b` and `ae` are the unsigned-below pair, which is how the carry is expressed: the same pair a `cmp` produces.
+ */
+function flagCondition(suffix: string, flags: Flags, instruction: Instruction): number[] {
+  if (flags.kind === "bit" && suffix !== "b" && suffix !== "ae") {
+    throw new TranslateError(
+      instruction.offset,
+      `a ${instruction.op} after a bit test reads a flag the bit test does not define: bt writes the carry and leaves the rest ` +
+        "undefined, so only the carry conditions, jb and jae, can be read after it",
+    );
+  }
+  return conditionCode(suffix, flags.width);
+}
+
 /** A region's exit points: the instruction index of its end, and how many blocks a `br` must cross to reach it. */
 type Scope = Map<number, number>;
 
@@ -1292,6 +1310,11 @@ interface Flags {
   width: 32 | 64;
   /** Whether the comparison was a subtraction, whose borrow is the carry `sbb` reads; a `test` has no carry to give. */
   borrows?: boolean;
+  /**
+   * What defined them. A comparison defines every condition a compiler reads; a bit test defines the carry and leaves the rest
+   * undefined, so the conditions that read them are refused instead of being answered from a value that is not there.
+   */
+  kind?: "bit" | undefined;
 }
 
 function indexOfOffset(instructions: readonly Instruction[], offset: number): number {
@@ -1516,7 +1539,7 @@ function translateRange(
         throw new TranslateError(instruction.offset, `${instruction.op} needs a cmp or test that every path reaching it goes through`);
       }
       const target = indexOfOffset(instructions, branchTarget(instruction));
-      const condition = conditionCode(suffix, flags.width);
+      const condition = flagCondition(suffix, flags, instruction);
       const depth = scope.get(target);
       if (depth !== undefined) {
         /*
@@ -1551,7 +1574,7 @@ function translateRange(
          * each arm reports its own state and the flags survive the join only if they survived both. That is what a conditional
          * move after an if/else needs, and it is a fact about the paths rather than about the instruction alone.
          */
-        const entered: Flags = { set: flags.set, width: flags.width };
+        const entered: Flags = { set: flags.set, width: flags.width, kind: flags.kind };
         const then: Flags = { ...entered };
         out.push(...condition, OP.ifEmpty, OP.emptyBlockType);
         translateRange(instructions, target, join.join, new Map(shared), out, then, loops, options);
@@ -1559,9 +1582,15 @@ function translateRange(
         const otherwise: Flags = { ...entered };
         translateRange(instructions, index + 1, join.jmp, new Map(shared), out, otherwise, loops, options);
         out.push(OP.end);
-        // two arms that compared at different widths leave the join with an answer only one of them can read
+        /*
+         * Two arms that compared at different widths leave the join with an answer only one of them can read, and two arms that
+         * learned their flags a different way leave an answer neither can read: a carry from a bit test and a carry from a borrow
+         * live in the same two locals, so a join that mixes them refuses rather than picking one.
+         */
         flags.set = then.set && otherwise.set && then.width === otherwise.width;
         flags.width = then.width;
+        flags.kind = then.kind === otherwise.kind ? then.kind : undefined;
+        if (then.kind !== otherwise.kind) flags.set = false;
         index = join.join;
         continue;
       }
@@ -1575,6 +1604,58 @@ function translateRange(
       // dropped rather than assumed
       flags.set = false;
       index = target;
+      continue;
+    }
+    if (instruction.op === "bt") {
+      /*
+       * `bt value, index` writes the carry and nothing else: the bit it names becomes the carry, and every other flag is left
+       * undefined, which is why the flag model now records what defined it.
+       *
+       * The carry is expressed in the two locals a comparison already uses, as `1 - bit` against 1, because that is the pair the
+       * unsigned-below condition reads: `A < B` is a borrow, and `1 - bit < 1` is exactly `bit == 1`. So `jb` after a `bt` means the
+       * bit was set and `jae` means it was not, which is how a compiled program tests a flag in a word.
+       */
+      const [destination, source] = instruction.operands;
+      if (destination === undefined || source === undefined) {
+        throw new TranslateError(instruction.offset, "bt needs two operands");
+      }
+      if (destination.kind !== "reg" && destination.kind !== "memory") {
+        throw new TranslateError(instruction.offset, `a bt against a ${destination.kind} is not translated`);
+      }
+      const width = destination.bits;
+      if (width !== 32 && width !== 64) {
+        throw new TranslateError(instruction.offset, `a ${width}-bit bt is not translated: only 32 and 64`);
+      }
+      const raw =
+        destination.kind === "memory"
+          ? loadFromMemory(destination, width, instruction)
+          : read(destination, instruction);
+      // a 32-bit operand is read from a 64-bit local, so the bits above its width are not part of the value the index walks
+      const value = width === 32 ? [...raw, ...i64Const(0xffffffffn), OP.i64And] : raw;
+      /*
+       * An index past the operand's width wraps at that width, so the low bits of the index are what count. What that leaves out is
+       * the bit-string form, where an index past the width addresses the next word along; here it wraps, which is the register form's
+       * rule and not the memory form's.
+       */
+      const bit = [
+        ...operandCode64(source, instruction),
+        ...i64Const(BigInt(width - 1)),
+        OP.i64And,
+        OP.i64ShrU,
+        ...i64Const(1n),
+        OP.i64And,
+      ];
+      out.push(
+        ...value, ...bit,
+        ...localSet(CMP_A),
+        ...i64Const(1n), ...localGet(CMP_A), OP.i64Xor, ...localSet(CMP_A),
+        ...i64Const(1n), ...localSet(CMP_B),
+      );
+      flags.set = true;
+      flags.width = width;
+      flags.borrows = false;
+      flags.kind = "bit";
+      index += 1;
       continue;
     }
     if (instruction.op === "cmp" || instruction.op === "test") {
@@ -1598,7 +1679,7 @@ function translateRange(
         throw new TranslateError(instruction.offset, `${instruction.op} needs a cmp or test that every path reaching it goes through`);
       }
       out.push(
-        ...conditionCode(suffix, flags.width),
+        ...flagCondition(suffix, flags, instruction),
         OP.ifEmpty,
         OP.emptyBlockType,
         ...translateConditionalMove(instruction),
@@ -2527,7 +2608,7 @@ function translateAsBlocks(instructions: readonly Instruction[], options: Transl
         throw new TranslateError(last.offset, `${last.op} falls off the end of the function, which has no value to return`);
       }
       out.push(
-        ...conditionCode(suffix, flags.width),
+        ...flagCondition(suffix, flags, last),
         OP.ifEmpty,
         OP.emptyBlockType,
         ...i64Const(BigInt(taken)),

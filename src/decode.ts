@@ -559,6 +559,15 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
       const modrm = decodeModRm(cursor, rex, 8, segment);
       return finish(`set${CONDITIONS[second - 0x90]!}`, [modrm.rm]);
     }
+    if (second === 0xa3) {
+      /*
+       * `bt`: a bit test. The register names which bit, the other operand holds the value, and the answer lands in the carry flag
+       * rather than in any register, which is why it needed the flag model widened before it could be translated.
+       */
+      const modrm = decodeModRm(cursor, rex, bits, segment);
+      const register = registerOperand(modrm.regField, rex.r, bits);
+      return finish("bt", [modrm.rm, register]);
+    }
     if (second === 0xb6 || second === 0xbe) {
       // movzx / movsx from a byte: the source is a byte register or a byte of memory, the destination 32 or 64 bits
       const modrm = decodeModRm(cursor, rex, 8, segment);
