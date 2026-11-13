@@ -1999,6 +1999,22 @@ function translateRange(
       index += 1;
       continue;
     }
+    if (instruction.op === "punpcklqdq") {
+      /*
+       * `punpcklqdq %xmm1, %xmm0` interleaves the low quadwords, and since a quadword is exactly a half of the register, that is a
+       * pair of moves: the destination's low half goes up into its high half, and the source's low half becomes the low half.
+       * The destination's old low half is read first, because writing the low half is what overwrites it.
+       */
+      const [destination, source] = instruction.operands;
+      if (destination === undefined || source === undefined || destination.kind !== "reg" || source.kind !== "reg") {
+        throw new TranslateError(instruction.offset, "punpcklqdq takes two vector registers");
+      }
+      out.push(...read(destination, instruction), ...localSet(SSE_A));
+      out.push(...read(source, instruction), ...write(destination, instruction));
+      out.push(...localGet(SSE_A), ...write(otherHalf(destination, instruction), instruction));
+      index += 1;
+      continue;
+    }
     if (instruction.op === "mov") {
       out.push(...translateMov(instruction));
       index += 1;
@@ -2206,27 +2222,34 @@ function functionExtent(
   }
 
   /*
-   * A call whose target is inside this function but is not one of its instruction starts is a call into the middle of it, which
-   * no compiler emits and which translates to something the source never said. It is caught here rather than left to the
-   * decoder: the bytes at the target may well decode, and decoding is not the same as being a function's start.
+   * A call whose target lands inside one of this function's own instructions is a call into the middle of it, which no compiler
+   * emits and which translates to something the source never said.
+   *
+   * What it is not is a call to a byte the walk never reached. The walk follows fall-through, branches and calls, so a body with a
+   * branch into a cold block leaves a hole where that block's neighbours are, and the next function can start inside the hole: a
+   * call to it names a real function start and not the middle of anything. The test is therefore whether an instruction covers the
+   * target, not whether the target is below the far end of the walk.
    */
-  const end = Math.max(...reachable);
-  const extentEnd = Math.max(...starts.map((start) => start + decodeAt(start).length));
+  const extent = starts
+    .map((start) => ({ start, end: start + decodeAt(start).length }))
+    .sort((left, right) => left.start - right.start);
   for (const start of starts) {
     const instruction = decodeAt(start);
     if (instruction.op !== "call") continue;
     // a call through a register has no target in the bytes to be in the middle of an instruction
     if (instruction.operands[0]?.kind !== "immediate") continue;
     const target = branchTarget(instruction);
-    if (target >= 0 && target < extentEnd && !reachable.has(target)) {
-      throw new TranslateError(
-        start,
-        `the call at ${hex(address + BigInt(start))} targets ${hex(address + BigInt(target))}, which is inside this function ` +
-          "and is not an instruction start, so it is not where a function starts",
-      );
-    }
+    if (target < 0 || reachable.has(target)) continue;
+    const covering = extent.find((entry) => entry.start < target && target < entry.end);
+    if (covering === undefined) continue;
+    throw new TranslateError(
+      start,
+      `the call at ${hex(address + BigInt(start))} targets ${hex(address + BigInt(target))}, which is inside the instruction at ` +
+        `${hex(address + BigInt(covering.start))} and not at its start, so it is not where a function starts`,
+    );
   }
 
+  const end = Math.max(...reachable);
   const ordered: Instruction[] = [];
   let offset = 0;
   while (offset <= end) {

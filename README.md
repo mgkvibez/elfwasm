@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 265
+**Tests:** 268
 
 ```bash
 npm ci && npm run verify
@@ -512,9 +512,21 @@ that width in all three shapes: register to register, register to memory, and me
 every other narrow load. 16-bit arithmetic is still refused by name, because its flags are 16 bits wide and this translator computes them
 at 64.
 
-Where it stops now: offset `+0x2e1` into the same function, on `66 0f 6c c1`, which is `punpcklqdq`: an SSE shuffle that interleaves the
-low halves of two vector registers. The 16-bit store that stopped the walk at `+0xa7` translates, and what stops it next is a vector
-instruction again rather than a width.
+### The 128-bit interleave, and what a call target is not
+
+`punpcklqdq` (`66 0f 6c /r`) takes the low quadword of each operand and interleaves them. A quadword is exactly a half of a register
+here, so the whole operation is two moves: the destination's low half goes up into its high half, and the source's low half becomes
+the low half. The memory form is refused by name, like the dword interleave's.
+
+That moved the walk past the frontier and onto a check that had been hiding behind it. A call whose target was below the far end of the
+reachable set was being called "a call into the middle of this function". In a linked image the far end is most of the text: a function's
+cold blocks sit far from its hot ones, and the region between holds other functions. So the check now asks the only question it can
+answer from the bytes, which is whether one of *this body's instructions covers* the target. A call into the middle of an instruction
+still refuses and now names that instruction; a call to a byte inside a hole is a function start, and is translated as one.
+
+Where it stops now: `+0xcb0` into `0x43d330`, and the refusal is finally the structural one. Nothing reaches the bytes there and they are
+not padding: they are a one-byte `ret` at `0x43dfe0`, a thunk sitting between two other functions, with `push %r15` starting the next
+one. The body absorbed a far jump target, so its holes now hold other functions, and what bounds a body is the open question.
 
 The cost of the dispatcher is worth stating: a body with any backward branch takes that path, so even a clean loop is expressed by
 naming blocks rather than as a WASM `loop`. The structured path is kept for the bodies that are trees, which is most of the small

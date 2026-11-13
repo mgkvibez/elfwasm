@@ -240,6 +240,21 @@ describe("the 16-byte moves", () => {
     expect(buffer[0x108]).toBe(0);
   });
 
+  it("interleaves two low quadwords, which is the destination's low half moving up and the source's coming in", () => {
+    /*
+     * mov $0xaaaa,%rax ; movd %rax,%xmm0 ; mov $0xbbbb,%rax ; movd %rax,%xmm1 ; punpcklqdq %xmm1,%xmm0 ; movaps %xmm0,0x400100
+     *
+     * Both vector registers are built from a `movd`, which zeroes the half it does not write, so the interleave is visible: the low
+     * half of the result is the source's 0xbbbb and the high half is the destination's old 0xaaaa.
+     */
+    const { buffer } = run(
+      hex("48 c7 c0 aa 0a 00 00 66 0f 6e c0 48 c7 c0 bb 0b 00 00 66 0f 6e c8 66 0f 6c c1 0f 29 04 25 00 01 40 00 c3"),
+    );
+    expect([...buffer.slice(0x100, 0x110)].map((byte) => byte.toString(16).padStart(2, "0")).join("")).toBe(
+      "bb0b000000000000aa0a000000000000",
+    );
+  });
+
   it("loads both halves back, which is the move in the other direction", () => {
     // `movaps 0x400100,%xmm0 ; movd %xmm0,%eax ; ret`, over memory whose first eight bytes are a known value
     const { result } = run(hex("0f 28 04 25 00 01 40 00 66 0f 7e c0 c3"), {});

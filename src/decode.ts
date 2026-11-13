@@ -184,7 +184,7 @@ interface Rex {
  * The prefix is what makes them vector instructions rather than the MMX or packed-float instructions the same bytes name without
  * it, so a byte that is not in this set is refused by name rather than read as something it is not.
  */
-const VECTOR_WITH_66 = new Set([0x62, 0x6e, 0x7e, 0xd6, 0x6f, 0x7f, 0x28, 0x29, 0xdb, 0xdf, 0xeb, 0xef]);
+const VECTOR_WITH_66 = new Set([0x62, 0x6c, 0x6e, 0x7e, 0xd6, 0x6f, 0x7f, 0x28, 0x29, 0xdb, 0xdf, 0xeb, 0xef]);
 
 function isSseOpcode(second: number): boolean {
   return (
@@ -628,6 +628,21 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
         throw new DecodeError(offset, "punpckldq from memory is not in the decoded subset: only a vector register source is");
       }
       return finish("punpckldq", [
+        vectorOperand(modrm.regField, rex.r, "lo", 64),
+        vectorOperand(modrm.rmField ?? 0, rex.b, "lo", 64),
+      ]);
+    }
+    if (vector && second === 0x6c) {
+      /*
+       * `punpcklqdq`: the low quadword of each operand, interleaved, which is the whole 128-bit operation written out: the
+       * destination's own low half moves up into its high half and the source's low half lands in the low half. It is how a
+       * compiler builds a 128-bit value out of two 64-bit ones, and unlike `punpckldq` it swaps nothing within a half.
+       */
+      const modrm = decodeModRm(cursor, rex, 64, segment);
+      if (modrm.rm.kind === "memory") {
+        throw new DecodeError(offset, "punpcklqdq from memory is not in the decoded subset: only a vector register source is");
+      }
+      return finish("punpcklqdq", [
         vectorOperand(modrm.regField, rex.r, "lo", 64),
         vectorOperand(modrm.rmField ?? 0, rex.b, "lo", 64),
       ]);

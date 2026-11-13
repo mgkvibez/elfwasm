@@ -74,6 +74,17 @@ describe("the vector encodings a startup uses", () => {
     expect(() => decode(hex("66 0f 62 00"))).toThrow(/punpckldq from memory/);
   });
 
+  it("reads punpcklqdq and refuses its memory form, which is the half that is not implemented", () => {
+    // 66 0f 6c c1: punpcklqdq %xmm1,%xmm0, the interleave a startup uses to build a 128-bit value out of two 64-bit ones
+    const [instruction] = decode(hex("66 0f 6c c1"));
+    expect(instruction?.op).toBe("punpcklqdq");
+    expect(instruction?.length).toBe(4);
+    expect(instruction?.operands[0]).toMatchObject({ name: "xmm0.lo" });
+    expect(instruction?.operands[1]).toMatchObject({ name: "xmm1.lo" });
+    // 66 0f 6c 00: punpcklqdq (%rax),%xmm0, whose 128-bit load this does not model
+    expect(() => decode(hex("66 0f 6c 00"))).toThrow(/punpcklqdq from memory/);
+  });
+
   it("reads movq out to memory, which is a 64-bit store of the low half", () => {
     // `66 0f d6 05 98 c8 0a 00`: movq %xmm0,0xac898(%rip)
     const [instruction] = decode(hex("66 0f d6 05 98 c8 0a 00"));
