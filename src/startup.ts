@@ -168,6 +168,13 @@ export function translatedResolver(
         readData,
         codeAddress: target,
         code: { bytes, virtualAddress: image.baseAddress },
+        // only a segment the file marks executable is code: a call to anything else is a call to a header or to data
+        executable: image.segments
+          .filter((segment) => segment.permissions.execute)
+          .map((segment) => ({
+            start: segment.virtualAddress,
+            end: segment.virtualAddress + segment.memorySize,
+          })),
         memoryPages,
         syscalls: options.syscalls ?? false,
         ...(options.stackPages === undefined ? {} : { stackPages: options.stackPages }),

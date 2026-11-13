@@ -148,6 +148,16 @@ export interface TranslateOptions {
    */
   readonly code?: { readonly bytes: Uint8Array; readonly virtualAddress: bigint };
   /**
+   * The ranges of the code region a processor would let a program execute, which is what a `PT_LOAD` segment with `PF_X` says.
+   *
+   * A call whose target is outside every one of them does not name a function: the bytes there are a header, a relocation table or
+   * data, and jumping to one faults. A static PIE leaves exactly such a call in the path it never takes, `call 0`, whose target is
+   * the image's own first byte. Translated as a call into a body that traps, the program keeps its own answer and the dead path
+   * crashes where the machine would crash. Left out, the whole region counts as executable, which is what a caller that hands over
+   * bytes and nothing about segments is saying.
+   */
+  readonly executable?: readonly { readonly start: bigint; readonly end: bigint }[];
+  /**
    * Function addresses that nothing in the program calls directly, so that an indirect call can still be aimed at them.
    *
    * A function pointer handed to a program as an argument (`main`, whose address `_start` passes to `__libc_start_main`) never appears
@@ -2375,6 +2385,8 @@ interface Body {
   readonly instructions: readonly Instruction[];
   /** The jumps in this body that leave its bytes, by offset, and where each one goes. */
   readonly tailCalls: ReadonlyMap<number, bigint>;
+  /** True when the address does not name code, so the body is a trap rather than a translation of any bytes. */
+  readonly traps?: boolean;
 }
 
 /**
@@ -3044,15 +3056,24 @@ function programOf(
     address: bigint,
     instructions: readonly Instruction[],
     tailCalls: ReadonlyMap<number, bigint> = new Map(),
+    traps = false,
   ): number => {
     const key = address.toString();
     const seen = known.get(key);
     if (seen !== undefined) return seen;
     const index = order.length;
     known.set(key, index);
-    order.push({ address, instructions, tailCalls });
+    order.push({ address, instructions, tailCalls, traps });
     return index;
   };
+
+  /**
+   * Whether a processor would execute the byte at this address. Without `executable` every byte of the region counts, which is the
+   * standing answer for a caller that gave bytes and no segments.
+   */
+  const isExecutable = (address: bigint): boolean =>
+    options.executable === undefined ||
+    options.executable.some((range) => range.start <= address && address < range.end);
 
   const calls: CallRegistry = {
     candidates: () => order.map((body) => body.address),
@@ -3066,6 +3087,12 @@ function programOf(
           `call to ${hex(address)} needs the code region it was cut from: pass code: { bytes, virtualAddress }`,
         );
       }
+      /*
+       * A target no segment would execute is not a function, and its bytes are not instructions: a header, a relocation table or
+       * data. Decoding them is how a static PIE's `call 0` turned the ELF header into a body, so the body registered for such an
+       * address is a trap. A call to it keeps the program's own answer, since the path that makes it is the one that crashes.
+       */
+      if (!isExecutable(address)) return register(address, [], new Map(), true);
       const offset = address - region.virtualAddress;
       if (offset < 0n || offset >= BigInt(region.bytes.length)) {
         throw new TranslateError(
@@ -3105,8 +3132,11 @@ function programOf(
     bodies.length = 0;
     for (let index = 0; index < order.length; index += 1) {
       const body = order[index]!;
+      // a body that traps needs no translation: `unreachable` satisfies any result type, and it is what jumping there does
       bodies.push(
-        bodyOf(body.instructions, { ...withCalls, functionAddress: body.address, tailCalls: body.tailCalls }),
+        body.traps === true
+          ? [OP.unreachable]
+          : bodyOf(body.instructions, { ...withCalls, functionAddress: body.address, tailCalls: body.tailCalls }),
       );
     }
   }

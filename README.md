@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 289
+**Tests:** 291
 
 ```bash
 npm ci && npm run verify
@@ -637,10 +637,22 @@ Refusing is still the answer when the register's value at the load is not someth
 A hole in a body is only evidence of a table that could not be read. Once the table is read, a gap between the cases is a neighbour's
 bytes like any other gap, and it is skipped.
 
-Where it stops now: a `call` at `0x40afcc` in `__libc_start_main` whose target resolves to the image's own first byte. That is the
-static-PIE placeholder `call 0`, which glibc leaves in a path this binary never takes, and the walk treats the target as a function
-because offset 0 of the file it was given lies inside the region it calls code. Translating it decodes the ELF header. Two ways out:
-tell the walk which ranges are executable, or write the relocations into the code before the walk reads it.
+### What counts as code
+
+`0x40afcc` in `__libc_start_main` is `call 0`: the static-PIE placeholder, with a zero displacement that names the image's own first
+byte, left in a path this binary never takes. The walk treated any offset inside the region it was handed as the start of a function,
+so it started decoding the ELF header there, and stopped on the first byte it did not know.
+
+What separates code from the rest of a file is the segment permissions: a `PT_LOAD` segment with `PF_X` is what a processor will
+execute, and a header, a relocation table or data is what it will not. The translator now takes those ranges, and a call whose target
+is outside all of them does not name a function. It is registered as a body that traps rather than as a translation of any bytes:
+`unreachable`, which satisfies the callee's result type and costs nothing on a path that never makes the call. A path that does makes
+it traps exactly where the processor would fault. Without the ranges, the whole region counts as executable, which is what a caller
+that hands over bytes and no segments is saying.
+
+Where it stops now: `+0x247` into the function at `0x409c20`, on `bsr`, the bit scan that finds the highest set bit (`0x0f 0xbd`). It
+is the reverse of `bsf`, which is not decoded either, and both leave the destination register alone when the source is zero, so the
+flags and the destination are two separate questions.
 
 The cost of the dispatcher is worth stating: a body with any backward branch takes that path, so even a clean loop is expressed by
 naming blocks rather than as a WASM `loop`. The structured path is kept for the bodies that are trees, which is most of the small

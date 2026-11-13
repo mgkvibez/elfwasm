@@ -28,6 +28,20 @@ const runtime = (
 
 const ORIGIN = 0x401000n;
 
+/**
+ * Translates and runs an entry, telling the walk which bytes a processor would execute.
+ *
+ * `end` is where the executable range stops, so a call past it names an address that is inside the region and is still not code.
+ */
+function runExecutable(code: Uint8Array, entrySize: number, end: bigint): bigint {
+  const module = translateProgram(code.subarray(0, entrySize), "main", {
+    code: { bytes: code, virtualAddress: ORIGIN },
+    codeAddress: ORIGIN,
+    executable: [{ start: ORIGIN, end }],
+  });
+  return new runtime.Instance(new runtime.Module(module)).exports.main!();
+}
+
 /** One page of address space at the origin, so a stack can sit above it in the test that needs one. */
 const EMPTY_IMAGE = {
   baseAddress: ORIGIN,
@@ -274,5 +288,29 @@ describe("a bit that becomes a flag", () => {
     // mov $8,%eax ; mov $3,%ecx ; bt %ecx,%eax ; je done ; ret ; done: ret
     const code = Uint8Array.from(hex("b8 08 00 00 00 b9 03 00 00 00 0f a3 c8 74 01 c3 c3"));
     expect(() => run(code, 0x12)).toThrow(/bit test|does not define/);
+  });
+});
+
+describe("a call to an address no segment executes", () => {
+  /*
+   * A static PIE keeps `call 0` in the path it does not take: the displacement is zero, so the target is the image's own first byte,
+   * where the ELF header sits. Decoding that as a function turns a header into instructions, and it stopped the walk on the first
+   * byte it did not know. The ranges a `PT_LOAD` segment marks executable are what separates code from everything else in the file,
+   * so a call to anything outside them is not a call to a function: it is a jump to a header or to data, which faults.
+   *
+   * Translated as a call into a body that traps, the two readings agree. A path that never makes the call costs nothing, and a path
+   * that does traps where the processor would.
+   *
+   * `mov $7,%eax ; cmp $7,%eax ; je +5 ; call 0x401040 (data) ; ret`, so the call is the path not taken.
+   */
+  it("translates a call into data as a trap rather than decoding the bytes there", () => {
+    const code = region([{ at: 0, bytes: hex("b8 07 00 00 00 83 f8 07 74 05 e8 31 00 00 00 c3") }], 0x50);
+    expect(runExecutable(code, 0x10, ORIGIN + 0x20n)).toBe(7n);
+  });
+
+  it("traps where the machine would, when that call is the path taken", () => {
+    // `call 0x401040 ; ret`, with the target past the end of the only executable range
+    const code = region([{ at: 0, bytes: hex("e8 3b 00 00 00 c3") }], 0x50);
+    expect(() => runExecutable(code, 0x6, ORIGIN + 0x20n)).toThrow();
   });
 });
