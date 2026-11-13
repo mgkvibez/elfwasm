@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 253
+**Tests:** 258
 
 ```bash
 npm ci && npm run verify
@@ -470,10 +470,31 @@ inside a function is reached refused a function the assembler wrote, and the wal
 code it is. Any other unreachable byte is still refused, because it may be data or the middle of another instruction, and a `nop` is
 the only padding this decoder knows.
 
-Where it stops now: `+0x100c` into `__libc_start_main`, at a `switch` whose case body is `cmp $0x5,%eax; ja ...; jmp ...`. The bytes
-before it are reached by falling into them, and these are not: a case no branch names is reachable only through a jump table in the
-image, and reading that table is the next piece. It is a data question rather than an instruction, and it needs the image's bytes at
-translation time, which is why it is not in yet.
+### The jump table a switch reads
+
+A `switch` over a dense range of values does not name its cases in its bytes: gcc emits four instructions that read a table of 32-bit
+offsets, and each entry is where a case starts.
+
+```
+lea    table(%rip),%rcx       the table's own address, which is what its entries are measured from
+movsxd (%rcx,%rdx,4),%rdx     one entry, sign-extended: an offset rather than an address
+add    %rcx,%rdx              the offset plus the table, which is where the case starts
+jmp    *%rdx
+```
+
+That shape is recognised, the table is read out of the image's file bytes, and every entry becomes a place the extent walk continues
+from and a block the dispatcher can land in. How many entries there are is not in the table, so the count comes from the bounds check
+the compiler put before it (`cmp $0x22,%edx; ja default` is twenty-three entries). Without that comparison no table is read at all: a
+table read past its end names a target in some other function, and an early version of this walked into unrelated code exactly that way.
+
+Two things the switch needed besides the table. `movsxd` translates now, because a table entry is a signed offset. And a body may end in
+`hlt`: an entry point that calls `exit` and halts leaves its answer in `%rax` where a call's would have gone.
+
+RIP-relative operands are now resolved against the body's own address rather than the program's. They agree for the entry point and differ
+for every function it calls, and reading a callee's globals against the entry's neighbourhood was wrong.
+
+Where it stops now: offset `+0xa7` into one of the case bodies the table made reachable, on a `0x66` operand-size prefix. The structural
+question that blocked the walk for two increments is done, and what is left is an instruction again.
 
 The cost of the dispatcher is worth stating: a body with any backward branch takes that path, so even a clean loop is expressed by
 naming blocks rather than as a WASM `loop`. The structured path is kept for the bodies that are trees, which is most of the small

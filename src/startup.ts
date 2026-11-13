@@ -142,12 +142,30 @@ export function translatedResolver(
   );
   const memoryPages = Math.floor(memory.buffer.byteLength / 0x10000);
   const modules = new Map<bigint, Uint8Array>();
+  /*
+   * The image's bytes at a virtual address, for the one thing translation has to read rather than translate: a `switch`'s jump table,
+   * which says where the cases are and holds no instructions. A segment's file part is what can be read, so an address in the part that
+   * is only reserved answers nothing and the table stops there.
+   */
+  const readData = (virtualAddress: bigint, width: number): bigint | undefined => {
+    for (const segment of image.segments) {
+      if (virtualAddress < segment.virtualAddress) continue;
+      const within = virtualAddress - segment.virtualAddress;
+      if (within + BigInt(width) > segment.fileSize) continue;
+      const start = Number(segment.fileOffset + within);
+      let value = 0n;
+      for (let byte = width - 1; byte >= 0; byte -= 1) value = (value << 8n) | BigInt(bytes[start + byte]!);
+      return value;
+    }
+    return undefined;
+  };
 
   return (target: bigint): bigint => {
     let module = modules.get(target);
     if (module === undefined) {
       module = translate(instructionsOf(bytes, image, target, options.limit ?? DEFAULT_LIMIT), "resolver", {
         addresses: machine.addresses,
+        readData,
         codeAddress: target,
         code: { bytes, virtualAddress: image.baseAddress },
         memoryPages,

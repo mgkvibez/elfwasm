@@ -124,6 +124,11 @@ const PAGE_SIZE = 64 * 1024;
 export interface TranslateOptions {
   /** The mapped image's address space. Without it, a memory operand is refused rather than assumed. */
   readonly addresses?: AddressSpace;
+  /**
+   * Reads the image's bytes at a virtual address, which is what a jump table is: data the walk has to read to know where a `switch`
+   * goes. A file's bytes and its segments are enough to answer it, and the caller has both.
+   */
+  readonly readData?: (virtualAddress: bigint, width: number) => bigint | undefined;
   /** Virtual address of the first byte of `instructions`, for RIP-relative operands. Defaults to 0. */
   readonly codeAddress?: bigint;
   /** Pages to import when the body touches memory. Defaults to the image's own pages plus `stackPages`. */
@@ -320,6 +325,18 @@ function hex(value: bigint): string {
  * it depends on a register the program will compute later, and saying so is what stops a reader looking for the missing
  * case in the wrong place.
  */
+/**
+ * The virtual address of the first byte of the body being translated.
+ *
+ * `functionAddress` is set per body by the program translation and `codeAddress` is where the program starts, so these agree for the
+ * entry and differ for everything it calls. A RIP-relative operand is measured from the instruction's own end, which only means
+ * something against the body's own address: reading it against the program's would resolve every callee's globals to the entry's
+ * neighbourhood.
+ */
+function bodyBase(options: TranslateOptions): bigint {
+  return options.functionAddress ?? options.codeAddress ?? 0n;
+}
+
 function virtualAddressOf(operand: Operand, instruction: Instruction, options: TranslateOptions): bigint {
   if (operand.kind !== "memory") {
     throw new TranslateError(instruction.offset, `expected a memory operand, found ${operand.kind}`);
@@ -339,7 +356,7 @@ function virtualAddressOf(operand: Operand, instruction: Instruction, options: T
   }
   // RIP-relative is measured from the end of this instruction, which is what the processor adds the displacement to
   if (operand.ripRelative) {
-    return (options.codeAddress ?? 0n) + BigInt(instruction.offset + instruction.length) + operand.displacement;
+    return bodyBase(options) + BigInt(instruction.offset + instruction.length) + operand.displacement;
   }
   return operand.displacement;
 }
@@ -1696,6 +1713,21 @@ function translateRange(
       index += 1;
       continue;
     }
+    if (instruction.op === "movsxd") {
+      /*
+       * `movsxd` loads 32 bits and keeps their sign, which is how a `switch` table's entry is read: an offset from the table, which may
+       * be negative, widened to the width the table's own address is added at. The load itself is the same as any 32-bit read, so this
+       * is the load, a wrap to its width, and the sign extension the instruction is named for.
+       */
+      const [destination, source] = instruction.operands;
+      if (destination?.kind !== "reg" || source === undefined || source.kind === "immediate") {
+        throw new TranslateError(instruction.offset, "movsxd needs a register to write and a 32-bit value to read");
+      }
+      const loaded = source.kind === "memory" ? loadFromMemory(source, 32, instruction) : read(source, instruction);
+      out.push(...loaded, NARROW_32, OP.i64ExtendI32S, ...write(destination, instruction));
+      index += 1;
+      continue;
+    }
     if (instruction.op === "mul" || instruction.op === "imul1" || instruction.op === "div" || instruction.op === "idiv") {
       /*
        * The four instructions that read and write registers the encoding does not name. `%rax` is the accumulator and `%rdx` the
@@ -2031,8 +2063,14 @@ interface Body {
  * that were never instructions. What is left inside the range but unreachable is refused rather than included, because it
  * means this is not where a function starts.
  */
-function functionExtent(bytes: Uint8Array, address: bigint): readonly Instruction[] {
+function functionExtent(
+  bytes: Uint8Array,
+  address: bigint,
+  options: TranslateOptions = {},
+): readonly Instruction[] {
   const decoded = new Map<number, Instruction>();
+  // which instruction fell into which, which is how the three that build a jump table's address are found
+  const previous = new Map<number, number>();
   const decodeAt = (offset: number): Instruction => {
     const known = decoded.get(offset);
     if (known !== undefined) return known;
@@ -2067,6 +2105,21 @@ function functionExtent(bytes: Uint8Array, address: bigint): readonly Instructio
        * bytes stop, which is where a compiler puts the cases of the switch such a jump usually ends, and stop where there is no code
        * to continue into: a tail call through a register has the linker's padding after it, and following that would decode zeros.
        */
+      /*
+       * A `switch` says where its cases are in a table rather than in its bytes, so the table is read here and each entry becomes a
+       * place the walk continues from. The three instructions before the jump are what say which table: they are the chain of
+       * fall-throughs that led here, and they are the `lea`, the `movsxd` and the `add` that compute an entry's address.
+       */
+      const chain: Instruction[] = [];
+      for (let cursor = offset; chain.length < 10; ) {
+        const before = previous.get(cursor);
+        if (before === undefined) break;
+        chain.unshift(decodeAt(before));
+        cursor = before;
+      }
+      for (const target of jumpTableTargets([...chain, instruction], chain.length, address, bytes.length, options)) {
+        work.push(target);
+      }
       const afterJump = offset + instruction.length;
       if (afterJump >= bytes.length || bytes[afterJump] === 0) continue;
       try {
@@ -2074,6 +2127,7 @@ function functionExtent(bytes: Uint8Array, address: bigint): readonly Instructio
       } catch {
         continue;
       }
+      previous.set(afterJump, offset);
       work.push(afterJump);
       continue;
     }
@@ -2100,6 +2154,7 @@ function functionExtent(bytes: Uint8Array, address: bigint): readonly Instructio
         continue;
       }
     }
+    previous.set(next, offset);
     work.push(next);
   }
 
@@ -2192,7 +2247,102 @@ function needsDispatcher(instructions: readonly Instruction[]): boolean {
  * Where each block of straight-line code starts: the body's first instruction, every branch target, and the instruction after a
  * branch or a `ret`, since control can arrive there without the bytes before it having run.
  */
-function blockStarts(instructions: readonly Instruction[]): number[] {
+/**
+ * Which of the sixteen registers a name refers to, or undefined for one this does not map.
+ *
+ * `%ecx` and `%rcx` are one register written at two widths, which is exactly the pair a jump table's base is loaded into and then read
+ * through, so a check that compared names would see two registers where the program has one.
+ */
+function registerNumberOf(name: string): number | undefined {
+  const widened: Record<string, string> = {
+    eax: "rax", ecx: "rcx", edx: "rdx", ebx: "rbx", esp: "rsp", ebp: "rbp", esi: "rsi", edi: "rdi",
+  };
+  const base = widened[name] ?? name.replace(/^r(\d+)[bwd]?$/, "r$1");
+  if (base.startsWith("xmm")) return undefined;
+  const index = REGISTERS.indexOf(base as (typeof REGISTERS)[number]);
+  return index < 0 ? undefined : index;
+}
+
+/**
+ * The targets a jump table names, read out of the image.
+ *
+ * A `switch` over a dense range of values compiles to a table of 32-bit offsets and four instructions that use it, in a fixed shape:
+ *
+ *   lea    table(%rip),%rcx       the table's own address, which is what its entries are measured from
+ *   movsxd (%rcx,%rdx,4),%rdx     one entry, sign-extended: an offset rather than an address
+ *   add    %rcx,%rdx              the offset plus the table, which is where the case starts
+ *   jmp    *%rdx
+ *
+ * Reading the table is what lets the walk reach a case body no branch names, and what lets the dispatcher land in one.
+ *
+ * How many entries there are is not in the table. The bounds check before it compares against a case count that is already a value in a
+ * register, so this reads until an entry stops naming a place inside the body: an entry that is not an offset into these bytes ends the
+ * table, which is what the section's other data looks like when read as offsets. A table whose data happens to look like offsets would
+ * be read too far, and the extra targets are blocks that nothing runs, so the mistake costs size rather than correctness.
+ */
+function jumpTableTargets(
+  instructions: readonly Instruction[],
+  index: number,
+  bodyAddress: bigint,
+  bodyBytes: number,
+  options: TranslateOptions,
+): number[] {
+  const read = options.readData;
+  if (read === undefined) return [];
+  const add = instructions[index - 1];
+  const load = instructions[index - 2];
+  const lea = instructions[index - 3];
+  if (add?.op !== "add" || load?.op !== "movsxd" || lea?.op !== "lea") return [];
+  // `add base, entry`: the destination is the entry the load produced, and the source is the table's own address
+  const [sum, offset] = add.operands;
+  if (sum?.kind !== "reg" || offset?.kind !== "reg") return [];
+  const entryRegister = registerNumberOf(sum.name);
+  const baseRegister = registerNumberOf(offset.name);
+  if (entryRegister === undefined || baseRegister === undefined) return [];
+  const [entry, table] = load.operands;
+  if (entry?.kind !== "reg" || table?.kind !== "memory") return [];
+  if (registerNumberOf(entry.name) !== entryRegister) return [];
+  if (table.scale !== 4 || table.index === undefined) return [];
+  if (table.base === undefined || registerNumberOf(table.base) !== baseRegister) return [];
+  const [base, address] = lea.operands;
+  if (base?.kind !== "reg" || address?.kind !== "memory" || !address.ripRelative) return [];
+  if (registerNumberOf(base.name) !== baseRegister) return [];
+  /*
+   * How many entries there are comes from the bounds check the compiler put before the table, which compares the switch's value
+   * against the highest case: `cmp $0x22,%edx; ja default` means twenty-three entries. Without that comparison there is no bound to
+   * trust, and a table read past its end is a target in some other function, so an unmatched shape names no targets at all.
+   */
+  const indexRegister = registerNumberOf(table.index);
+  let count: number | undefined;
+  for (let back = index - 4; back >= 0 && index - back <= 10; back -= 1) {
+    const candidate = instructions[back]!;
+    if (candidate.op !== "cmp") continue;
+    const immediate = candidate.operands.find((operand) => operand.kind === "immediate");
+    const compared = candidate.operands.find((operand) => operand.kind === "reg");
+    if (immediate?.kind !== "immediate" || compared?.kind !== "reg") continue;
+    if (registerNumberOf(compared.name) !== indexRegister) continue;
+    count = Number(immediate.value) + 1;
+    break;
+  }
+  if (count === undefined || count < 1 || count > 1024) return [];
+  const tableAddress = bodyAddress + BigInt(lea.offset + lea.length) + address.displacement;
+  const targets: number[] = [];
+  for (let slot = 0n; slot < BigInt(count); slot += 1n) {
+    const value = read(tableAddress + slot * 4n, 4);
+    if (value === undefined) break;
+    const target = tableAddress + BigInt.asIntN(32, value) - bodyAddress;
+    if (target < 0n || target >= BigInt(bodyBytes)) break;
+    targets.push(Number(target));
+  }
+  return targets;
+}
+
+/** The offset of the last instruction, which with its length is how many bytes the body covers. */
+function lastOffset(instructions: readonly Instruction[]): number {
+  return instructions.at(-1)?.offset ?? 0;
+}
+
+function blockStarts(instructions: readonly Instruction[], bodyAddress: bigint, options: TranslateOptions): number[] {
   const starts = new Set<number>([0]);
   for (const [index, instruction] of instructions.entries()) {
     if (instruction.op === "ret") {
@@ -2206,6 +2356,11 @@ function blockStarts(instructions: readonly Instruction[]): number[] {
      */
     if (instruction.operands[0]?.kind !== "immediate") {
       starts.add(index + 1);
+      const bodyBytes = lastOffset(instructions) + (instructions.at(-1)?.length ?? 0);
+      for (const target of jumpTableTargets(instructions, index, bodyAddress, bodyBytes, options)) {
+        const targetIndex = instructions.findIndex((entry) => entry.offset === target);
+        if (targetIndex >= 0) starts.add(targetIndex);
+      }
       continue;
     }
     const target = indexOfOffset(instructions, branchTarget(instruction));
@@ -2225,7 +2380,7 @@ function blockStarts(instructions: readonly Instruction[]): number[] {
  * returns to the top. Registers are globals and a comparison's operands are locals, so a block carries no state of its own.
  */
 function translateAsBlocks(instructions: readonly Instruction[], options: TranslateOptions): number[] {
-  const starts = blockStarts(instructions);
+  const starts = blockStarts(instructions, bodyBase(options), options);
   const numbers = new Map<number, number>(starts.map((start, number) => [start, number]));
   const blockAt = (index: number): number => {
     const number = numbers.get(index);
@@ -2366,11 +2521,16 @@ function bodyOf(
      * returns, so nothing follows it in this function's bytes. Returning `%rax` is right there too, because that is where a
      * callee's answer would have gone if it came back.
      */
+    /*
+     * A `hlt` is the other way a body ends without returning: it traps, so nothing follows it, and what it leaves in `%rax` is where a
+     * `call`'s answer would have gone. An entry point that calls `exit` and then halts is exactly that shape.
+     */
     const last = resolved.at(-1)?.op;
-    if (last !== "syscall" && last !== "call") {
+    if (last !== "syscall" && last !== "call" && last !== "hlt") {
       throw new TranslateError(
         resolved.at(-1)?.offset ?? 0,
-        "the block does not end in ret, in a syscall or in a call that never returns, so it has no value to return",
+        `the body at ${hex(bodyBase(options))} does not end in ret, in a syscall, in a hlt or in a call that never ` +
+          "returns, so it has no value to return",
       );
     }
     body.push(...globalGet(REGISTERS.indexOf("rax")));
@@ -2426,7 +2586,7 @@ function programOf(
             `library function needs the syscall layer, which does not exist yet`,
         );
       }
-      return register(address, functionExtent(region.bytes.subarray(Number(offset)), address));
+      return register(address, functionExtent(region.bytes.subarray(Number(offset)), address, options));
     },
   };
 

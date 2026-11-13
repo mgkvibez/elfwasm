@@ -254,3 +254,61 @@ describe("an indirect call", () => {
     expect(() => run(program, { code: { bytes: program, virtualAddress: 0x400000n } })).toThrow();
   });
 });
+
+describe("a switch compiled to a jump table", () => {
+  /*
+   * A `call` into a function whose body is the four instructions gcc emits for a `switch` over a dense range, and a table of offsets in
+   * the image's data rather than its code:
+   *
+   *  16: mov $2,%edx                     the value switched on
+   *  21: cmp $3,%edx; 24: ja default     the bounds check, which is also how the table's length is known
+   *  26: lea table(%rip),%rcx            the table is at 0x400100
+   *  33: movsxd (%rcx,%rdx,4),%rdx
+   *  37: add %rcx,%rdx
+   *  40: jmp *%rdx
+   *  42: case 0 answers 10, 48: case 1 answers 11, 54: case 2 answers 12, 60: case 3 answers 13, 66: default answers 99
+   */
+  const code = (): Uint8Array =>
+    hex(
+      "e8 0b 00 00 00 c3 90 90 90 90 90 90 90 90 90 90 " +
+        "ba 02 00 00 00 83 fa 03 77 28 48 8d 0d df 00 00 00 48 63 14 91 48 01 ca ff e2 " +
+        "b8 0a 00 00 00 c3 b8 0b 00 00 00 c3 b8 0c 00 00 00 c3 b8 0d 00 00 00 c3 b8 63 00 00 00 c3",
+    );
+
+  /** Runs the switch with the table at 0x400100, and with the image's data reader or without one. */
+  const runSwitch = (readable: boolean): bigint => {
+    const image = imageOf();
+    const addresses = addressSpaceOf(image);
+    const memory = new runtime.Memory({ initial: 1 });
+    const buffer = new Uint8Array(memory.buffer);
+    buffer.fill(0);
+    // each entry is an offset from the table's own address, which is what makes the table position-independent
+    const view = new DataView(memory.buffer);
+    [42, 48, 54, 60].forEach((target, slot) => view.setInt32(0x100 + slot * 4, target - 0x100, true));
+    const readData = (address: bigint, width: number): bigint | undefined => {
+      const start = addresses.offsetOf(address);
+      if (start === undefined || start + width > buffer.length) return undefined;
+      let value = 0n;
+      for (let byte = width - 1; byte >= 0; byte -= 1) value = (value << 8n) | BigInt(buffer[start + byte]!);
+      return value;
+    };
+    const bytes = code();
+    const module = translateBytes(bytes, "main", {
+      addresses,
+      memoryPages: 1,
+      codeAddress: 0x400000n,
+      code: { bytes, virtualAddress: 0x400000n },
+      ...(readable ? { readData } : {}),
+    });
+    const instance = new runtime.Instance(new runtime.Module(module), { env: { memory } });
+    return instance.exports.main!();
+  };
+
+  it("runs the case the table names, which no branch in the bytes names", () => {
+    expect(runSwitch(true)).toBe(12n);
+  });
+
+  it("refuses the case bodies when the table cannot be read, because nothing else reaches them", () => {
+    expect(() => runSwitch(false)).toThrow(/nothing reaches the bytes/);
+  });
+});

@@ -247,3 +247,21 @@ describe("alignment padding", () => {
     expect(run(bytes, { code: { bytes, virtualAddress: 0n } })).toBe(42n);
   });
 });
+
+describe("movsxd", () => {
+  it("keeps the sign of the 32 bits it loads, which is what an offset in a table needs", () => {
+    // `mov $-1,%eax ; movsxd %eax,%rax ; ret`: zero-extended the answer would be 4294967295, sign-extended it is -1
+    expect(run(hex("b8 ff ff ff ff 48 63 c0 c3"))).toBe(-1n);
+  });
+
+  it("widens a positive value to itself", () => {
+    expect(run(hex("b8 2a 00 00 00 48 63 c0 c3"))).toBe(42n);
+  });
+});
+
+describe("a body that ends in hlt", () => {
+  it("translates, because a halt never returns and the answer is where a call's would have gone", () => {
+    // `mov $5,%eax ; hlt`, which is how an entry point ends after calling exit
+    expect(translateBytes(hex("b8 05 00 00 00 f4"))).toBeInstanceOf(Uint8Array);
+  });
+});
