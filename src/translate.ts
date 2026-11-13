@@ -17,7 +17,14 @@
  * 32-bit compare ignores the upper half falls out of it.
  */
 
-import { decode, decodeInstruction, type Instruction, type Operand, type RegisterName } from "./decode.js";
+import {
+  DecodeError,
+  decode,
+  decodeInstruction,
+  type Instruction,
+  type Operand,
+  type RegisterName,
+} from "./decode.js";
 import {
   OP,
   globalGet,
@@ -225,6 +232,19 @@ const BYTE_TO_FULL: Readonly<Record<string, string>> = {
   ...Object.fromEntries(Array.from({ length: 8 }, (_unused, index) => [`r${index + 8}b`, `r${index + 8}`])),
 };
 
+/** The sixteen 16-bit registers, which are the low half of a 64-bit register under a name of its own. */
+const WORD_TO_FULL: Readonly<Record<string, string>> = {
+  ax: "rax",
+  cx: "rcx",
+  dx: "rdx",
+  bx: "rbx",
+  sp: "rsp",
+  bp: "rbp",
+  si: "rsi",
+  di: "rdi",
+  ...Object.fromEntries(Array.from({ length: 8 }, (_unused, index) => [`r${index + 8}w`, `r${index + 8}`])),
+};
+
 /** `ah`, `ch`, `dh` and `bh`: the second byte of four registers, which no REX prefix can name. */
 const HIGH_BYTES: Readonly<Record<string, string>> = { ah: "rax", ch: "rcx", dh: "rdx", bh: "rbx" };
 
@@ -233,6 +253,13 @@ function slotOf(operand: Operand, instruction: Instruction): RegisterSlot {
     throw new TranslateError(instruction.offset, `expected a register operand, found ${operand.kind}`);
   }
   const { name, bits } = operand;
+  if (bits === 16) {
+    const full = WORD_TO_FULL[name];
+    if (full === undefined) {
+      throw new TranslateError(instruction.offset, `${name} is not a 16-bit register this translator knows`);
+    }
+    return { local: localOfRegister(full, instruction), shift: 0, bits };
+  }
   if (bits === 8) {
     const high = HIGH_BYTES[name];
     if (high !== undefined) return { local: localOfRegister(high, instruction), shift: 8, bits };
@@ -248,10 +275,11 @@ function slotOf(operand: Operand, instruction: Instruction): RegisterSlot {
 /** The eight bits a narrow register owns, as an i64 in the range a byte holds. */
 function read(operand: Operand, instruction: Instruction): number[] {
   const slot = slotOf(operand, instruction);
-  if (slot.bits !== 8) return globalGet(slot.local);
+  if (slot.bits === 32 || slot.bits === 64) return globalGet(slot.local);
+  // a byte or a word: the same register seen through a mask, at the offset the name puts it
   const code = globalGet(slot.local);
   const placed = slot.shift === 0 ? code : [...code, ...i64Const(BigInt(slot.shift)), OP.i64ShrU];
-  return [...placed, ...i64Const(0xffn), OP.i64And];
+  return [...placed, ...i64Const(slot.bits === 8 ? 0xffn : 0xffffn), OP.i64And];
 }
 
 /**
@@ -263,11 +291,12 @@ function read(operand: Operand, instruction: Instruction): number[] {
  */
 function write(operand: Operand, instruction: Instruction): number[] {
   const slot = slotOf(operand, instruction);
-  if (slot.bits !== 8) return globalSet(slot.local);
+  if (slot.bits === 32 || slot.bits === 64) return globalSet(slot.local);
+  const owned = slot.bits === 8 ? 0xffn : 0xffffn;
   const placed = slot.shift === 0 ? [] : [...i64Const(BigInt(slot.shift)), OP.i64Shl];
-  const keep = BigInt.asUintN(64, ~(0xffn << BigInt(slot.shift)));
+  const keep = BigInt.asUintN(64, ~(owned << BigInt(slot.shift)));
   return [
-    ...i64Const(0xffn),
+    ...i64Const(owned),
     OP.i64And,
     ...placed,
     ...globalGet(slot.local),
@@ -678,9 +707,10 @@ function wasmOffsetOf(operand: Operand, instruction: Instruction): number {
 }
 
 /** A load at the operand's width, as an i64, because every register is an i64 local. */
-function loadFromMemory(operand: Operand, width: 32 | 64, instruction: Instruction): number[] {
+function loadFromMemory(operand: Operand, width: 16 | 32 | 64, instruction: Instruction): number[] {
   const address = addressOf(operand, instruction);
   if (width === 64) return [...address, OP.i64Load, ...memarg(0)];
+  if (width === 16) return [...address, OP.i32Load16U, ...memarg(0), WIDEN_32];
   // a 32-bit load zeroes the upper half of the destination, which is x86's own rule for `movl`
   return [...address, OP.i32Load, ...memarg(0), WIDEN_32];
 }
@@ -832,9 +862,6 @@ function translateMov(instruction: Instruction): number[] {
     throw new TranslateError(instruction.offset, `a mov into a ${destination.kind} is not translated`);
   }
   const width = destination.bits;
-  if (width !== 8 && width !== 32 && width !== 64) {
-    throw new TranslateError(instruction.offset, `a ${width}-bit mov is not translated yet`);
-  }
   refuseByteMemory(source, instruction);
   if (source.kind === "immediate") {
     // a narrow destination keeps only its own bits, so this masks rather than sign-extends: `mov $-1, %eax` leaves
@@ -843,14 +870,16 @@ function translateMov(instruction: Instruction): number[] {
     return [...i64Const(value), ...write(destination, instruction)];
   }
   if (source.kind === "memory") {
-    if (source.bits !== 32 && source.bits !== 64) {
-      throw new TranslateError(instruction.offset, `a ${source.bits}-bit memory load is not translated yet`);
+    const bits = source.bits;
+    if (bits !== 16 && bits !== 32 && bits !== 64) {
+      throw new TranslateError(instruction.offset, `a ${bits}-bit memory load is not translated yet`);
     }
     // the load already yields the destination's width, so no narrowing of a register is involved
-    return [...loadFromMemory(source, source.bits, instruction), ...write(destination, instruction)];
+    return [...loadFromMemory(source, bits, instruction), ...write(destination, instruction)];
   }
   const code = read(source, instruction);
   if (width === 32) return [...code, NARROW_32, WIDEN_32, ...write(destination, instruction)];
+  // a 16-bit source is already masked to its own half by `read`, and `write` merges it into the destination's
   return [...code, ...write(destination, instruction)];
 }
 
@@ -2586,7 +2615,20 @@ function programOf(
             `library function needs the syscall layer, which does not exist yet`,
         );
       }
-      return register(address, functionExtent(region.bytes.subarray(Number(offset)), address, options));
+      const body = region.bytes.subarray(Number(offset));
+      try {
+        return register(address, functionExtent(body, address, options));
+      } catch (error) {
+        /*
+         * The walk's own refusals name the function they are about, but one thrown while decoding a byte does not: the offset it
+         * carries is relative to a body the caller never asked for by name. Naming the function here is what turns "one of the
+         * functions this program calls cannot be decoded" into an address to look at.
+         */
+        if (error instanceof DecodeError) {
+          throw new TranslateError(error.offset, `the function at ${hex(address)}: ${error.detail}`);
+        }
+        throw error;
+      }
     },
   };
 

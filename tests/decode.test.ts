@@ -354,8 +354,43 @@ describe("refusals", () => {
     expect(error.message).toContain("past the end");
   });
 
-  it("refuses a 16-bit operand size, which has no WASM local here", () => {
-    expect(refuse(hex("66 89 c0")).message).toContain("16-bit");
+  it("reads 0x66 as a 16-bit operand size, naming the half of the register it writes", () => {
+    // 66 89 c0 is `mov %ax,%ax`: the same register on both sides, at the width the prefix asked for
+    const [instruction] = decode(hex("66 89 c0"));
+    expect(instruction!.op).toBe("mov");
+    expect(instruction!.length).toBe(3);
+    expect(instruction!.operands).toEqual([
+      { kind: "reg", name: "ax", bits: 16 },
+      { kind: "reg", name: "ax", bits: 16 },
+    ]);
+  });
+
+  it("narrows the immediate with the width, so the instruction after it still starts where it should", () => {
+    // 66 b8 34 12 is `mov $0x1234,%ax`, which is two bytes of immediate and not four
+    const [instruction, following] = decode(hex("66 b8 34 12 90"));
+    expect(instruction!.length).toBe(4);
+    expect(instruction!.operands[1]).toEqual({ kind: "immediate", value: 0x1234n });
+    expect(following!.op).toBe("nop");
+  });
+
+  it("keeps the immediate 32 bits wide under REX.W, which is what makes `mov $1,%rax` seven bytes", () => {
+    const [instruction, following] = decode(hex("48 c7 c0 01 00 00 00 90"));
+    expect(instruction!.length).toBe(7);
+    expect(following!.op).toBe("nop");
+  });
+
+  it("refuses a 16-bit push and pop, because the stack here is a 64-bit pointer", () => {
+    expect(refuse(hex("66 50")).message).toContain("16-bit push");
+    expect(refuse(hex("66 58")).message).toContain("16-bit pop");
+  });
+
+  it("names r8w through r15w, which are the low halves REX adds a name to", () => {
+    // 66 45 89 c8 is `mov %r9w,%r8w`: one REX bit names the destination, the other the source
+    const [instruction] = decode(hex("66 45 89 c8"));
+    expect(instruction!.operands).toEqual([
+      { kind: "reg", name: "r8w", bits: 16 },
+      { kind: "reg", name: "r9w", bits: 16 },
+    ]);
   });
 
   it("reads the stack canary load with its segment, so `fs:0x28` is not left looking like address 0x28", () => {

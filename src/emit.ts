@@ -247,6 +247,7 @@ export const OP = {
   i32Load: 0x28,
   i32Load8S: 0x2c,
   i32Load8U: 0x2d,
+  i32Load16U: 0x2f,
   i64ExtendI32S: 0xac,
   i64Load: 0x29,
   i32Store: 0x36,

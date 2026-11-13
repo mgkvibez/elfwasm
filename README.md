@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 258
+**Tests:** 265
 
 ```bash
 npm ci && npm run verify
@@ -493,8 +493,28 @@ Two things the switch needed besides the table. `movsxd` translates now, because
 RIP-relative operands are now resolved against the body's own address rather than the program's. They agree for the entry point and differ
 for every function it calls, and reading a callee's globals against the entry's neighbourhood was wrong.
 
-Where it stops now: offset `+0xa7` into one of the case bodies the table made reachable, on a `0x66` operand-size prefix. The structural
-question that blocked the walk for two increments is done, and what is left is an instruction again.
+### 16-bit operands, and the 0x66 prefix
+
+`0x66` is not a separate instruction set, it is a width: `66 89 15 4e 3d 07 00` is `mov %dx,0x4b112c`, the same store as the 32-bit
+form with a two-byte value and a two-byte register name. The prefix records a 16-bit operand size and the decode continues, with REX.W
+winning over it (`66 48 8b` is a 64-bit operand with a prefix in front of it).
+
+Two things follow from the width rather than from the prefix.
+
+The immediate shrinks with it: `66 b8 34 12` is two bytes of immediate, and the `81`/`c7` group reads imm16 rather than imm32. It
+shrinks only for those: `48 c7 c0 01 00 00 00` is `mov $1,%rax` with four bytes of immediate, sign-extended, and reading eight would
+take three bytes of the next instruction with it. That mistake desynchronised the decode of four of the assembler fixtures at once,
+which is how it was found.
+
+And a 16-bit register is a half of a 64-bit one, not a variable of its own. `%ax` and `%r8w` are the low 16 bits of `%rax` and `%r8`,
+read through a `0xffff` mask and written by merging, so the upper 48 bits survive a narrow move. The translator's `mov` family now takes
+that width in all three shapes: register to register, register to memory, and memory into a register, where the load zero-extends like
+every other narrow load. 16-bit arithmetic is still refused by name, because its flags are 16 bits wide and this translator computes them
+at 64.
+
+Where it stops now: offset `+0x2e1` into the same function, on `66 0f 6c c1`, which is `punpcklqdq`: an SSE shuffle that interleaves the
+low halves of two vector registers. The 16-bit store that stopped the walk at `+0xa7` translates, and what stops it next is a vector
+instruction again rather than a width.
 
 The cost of the dispatcher is worth stating: a body with any backward branch takes that path, so even a clean loop is expressed by
 naming blocks rather than as a WASM `loop`. The structured path is kept for the bodies that are trees, which is most of the small

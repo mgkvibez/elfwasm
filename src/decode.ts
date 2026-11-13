@@ -120,9 +120,12 @@ export interface Instruction {
 
 export class DecodeError extends Error {
   readonly offset: number;
+  /** The message without the offset it was raised at, so a caller that reports its own can say it once. */
+  readonly detail: string;
 
   constructor(offset: number, message: string) {
     super(`at offset 0x${offset.toString(16)}: ${message}`);
+    this.detail = message;
     this.name = "DecodeError";
     this.offset = offset;
   }
@@ -220,6 +223,21 @@ function alignmentNopPrefixes(bytes: Uint8Array, start: number): number | undefi
   return index + 2;
 }
 
+/** How wide the immediate of `b8+r` is, which carries a whole 64-bit value under REX.W and a narrow one under `0x66`. */
+function immediateSize(bits: 16 | 32 | 64): 2 | 4 | 8 {
+  return bits === 16 ? 2 : bits === 64 ? 8 : 4;
+}
+
+/**
+ * How wide every other immediate is: 32 bits, sign-extended to the operand size, and 16 under `0x66`.
+ *
+ * REX.W does not widen one of these. `48 c7 c0 01 00 00 00` is `mov $1,%rax` with a four-byte immediate, and reading eight
+ * would take three bytes of the next instruction with it.
+ */
+function signExtendedImmediateSize(bits: 16 | 32 | 64): 2 | 4 {
+  return bits === 16 ? 2 : 4;
+}
+
 function byteAt(cursor: Cursor): number {
   if (cursor.index >= cursor.bytes.length) {
     throw new DecodeError(cursor.start, "the instruction runs past the end of the code buffer");
@@ -268,7 +286,7 @@ interface ModRm {
 function decodeModRm(
   cursor: Cursor,
   rex: Rex,
-  bits: 8 | 32 | 64,
+  bits: 8 | 16 | 32 | 64,
   segment?: "fs" | "gs" | "cs" | "ss" | "ds" | "es",
 ): ModRm {
   const byte = byteAt(cursor);
@@ -371,6 +389,8 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
   let vector = false;
   // set by 0xf3 instead, which turns `0f 7e` from `movd` into a vector register out to a general one into `movq` into a vector one
   let mandatoryF3 = false;
+  // set by 0x66 where it is not the mandatory prefix of an SSE encoding: the operand is 16 bits wide rather than 32
+  let operandSize16 = false;
 
   for (;;) {
     const next = bytes[cursor.index];
@@ -414,7 +434,13 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
           `0x66 0f 0x${(third ?? 0).toString(16)} is an SSE instruction, and SSE is not in the decoded subset`,
         );
       }
-      throw new DecodeError(offset, "a 16-bit operand size prefix (0x66) is not in the decoded subset");
+      /*
+       * Everywhere else 0x66 is the operand-size override: the instruction it introduces is 16 bits wide rather than 32. That is a
+       * width, not a separate instruction set, so the prefix is recorded and the decode continues at the same offset.
+       */
+      cursor.index += 1;
+      operandSize16 = true;
+      continue;
     }
     if (next === 0x67) {
       /*
@@ -495,7 +521,8 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
     break;
   }
 
-  const bits: 32 | 64 = rex.w ? 64 : 32;
+  // REX.W wins over the prefix, which is what `66 48 8b` means: a 64-bit operand with a prefix in front of it
+  const bits: 16 | 32 | 64 = rex.w ? 64 : operandSize16 ? 16 : 32;
   const opcode = byteAt(cursor);
   const finish = (op: string, operands: readonly Operand[]): Instruction => ({
     offset,
@@ -566,12 +593,13 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
       return finish("imul", [registerOperand(modrm.regField, rex.r, bits), modrm.rm]);
     }
     if (vector && second === 0x6e) {
-      // `movd`/`movq` into a vector register: 32 bits, or 64 with REX.W, from a general register or memory. The whole 128-bit
-      // destination is written, because the upper half is cleared, which the translator does as a second write.
-      const modrm = decodeModRm(cursor, rex, bits, segment);
+      // `movd`/`movq` into a vector register: 32 bits, or 64 with REX.W, from a general register or memory. The width comes from REX
+      // alone, because the 0x66 in front of this pair was the encoding's mandatory prefix rather than an operand size.
+      const width = rex.w ? 64 : 32;
+      const modrm = decodeModRm(cursor, rex, width, segment);
       return finish("movd", [
-        vectorOperand(modrm.regField, rex.r, "lo", bits),
-        modrm.rm.kind === "memory" ? { ...modrm.rm, bits } : modrm.rm,
+        vectorOperand(modrm.regField, rex.r, "lo", width),
+        modrm.rm.kind === "memory" ? { ...modrm.rm, bits: width } : modrm.rm,
       ]);
     }
     if (mandatoryF3 && second === 0x7e) {
@@ -586,10 +614,11 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
     }
     if (vector && second === 0x7e) {
       // the same in the other direction, four bytes into a general register or into memory
-      const modrm = decodeModRm(cursor, rex, bits, segment);
+      const width = rex.w ? 64 : 32;
+      const modrm = decodeModRm(cursor, rex, width, segment);
       return finish("movd", [
-        modrm.rm.kind === "memory" ? { ...modrm.rm, bits } : modrm.rm,
-        vectorOperand(modrm.regField, rex.r, "lo", bits),
+        modrm.rm.kind === "memory" ? { ...modrm.rm, bits: width } : modrm.rm,
+        vectorOperand(modrm.regField, rex.r, "lo", width),
       ]);
     }
     if (vector && second === 0x62) {
@@ -699,8 +728,14 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
     }
     throw new DecodeError(offset, `two-byte opcode 0x0f 0x${second.toString(16)} is not in the decoded subset`);
   }
-  if (opcode >= 0x50 && opcode <= 0x57) return finish("push", [registerOperand(opcode - 0x50, rex.b, 64)]);
-  if (opcode >= 0x58 && opcode <= 0x5f) return finish("pop", [registerOperand(opcode - 0x58, rex.b, 64)]);
+  if (opcode >= 0x50 && opcode <= 0x57) {
+    if (operandSize16) throw new DecodeError(offset, "a 16-bit push is not in the decoded subset: the stack this runs on is 64 bits wide");
+    return finish("push", [registerOperand(opcode - 0x50, rex.b, 64)]);
+  }
+  if (opcode >= 0x58 && opcode <= 0x5f) {
+    if (operandSize16) throw new DecodeError(offset, "a 16-bit pop is not in the decoded subset: the stack this runs on is 64 bits wide");
+    return finish("pop", [registerOperand(opcode - 0x58, rex.b, 64)]);
+  }
   if (opcode >= 0xb0 && opcode <= 0xb7) {
     // mov r8, imm8: codes 4 to 7 are the high bytes without REX and `spl` to `dil` with one, which the operand reads for
     // itself so the same byte decodes to `%dh` or `%sil` depending on the prefix it arrived with
@@ -713,7 +748,7 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
     // 0x48 B8+rd carries a full 64-bit immediate; without REX.W the immediate is 32 bits and zero-extends
     return finish("mov", [
       registerOperand(opcode - 0xb8, rex.b, bits),
-      { kind: "immediate", value: readImmediate(cursor, rex.w ? 8 : 4) },
+      { kind: "immediate", value: readImmediate(cursor, immediateSize(bits)) },
     ]);
   }
   if (opcode === 0xeb) return finish("jmp", [{ kind: "immediate", value: readImmediate(cursor, 1) }]);
@@ -777,7 +812,7 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
     if (modrm.regField !== 0) {
       throw new DecodeError(offset, "0xc7 with a /reg field other than 0 is not a mov and is not in the decoded subset");
     }
-    return finish("mov", [modrm.rm, { kind: "immediate", value: readImmediate(cursor, 4) }]);
+    return finish("mov", [modrm.rm, { kind: "immediate", value: readImmediate(cursor, signExtendedImmediateSize(bits)) }]);
   }
   if (opcode === 0x80) {
     // group 1 at a byte's width: the same eight operations, with an imm8 that is a byte rather than a sign-extended one
@@ -797,7 +832,10 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
         `arithmetic /${modrm.regField} (0x${opcode.toString(16)}) is not in the decoded subset`,
       );
     }
-    return finish(mnemonic, [modrm.rm, { kind: "immediate", value: readImmediate(cursor, opcode === 0x83 ? 1 : 4) }]);
+    return finish(mnemonic, [
+      modrm.rm,
+      { kind: "immediate", value: readImmediate(cursor, opcode === 0x83 ? 1 : signExtendedImmediateSize(bits)) },
+    ]);
   }
 
   if (opcode === 0x85) {

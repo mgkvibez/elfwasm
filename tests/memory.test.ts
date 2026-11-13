@@ -120,6 +120,32 @@ describe("stores and loads", () => {
     expect(buffer[0x101]).toBe(0xaa);
   });
 
+  it("writes two bytes at a 16-bit width and leaves the two after them alone", () => {
+    // mov $0xabcd,%edx ; mov %dx,0x400100 ; mov 0x400100,%rax ; ret
+    const { result, buffer } = run(
+      hex("ba cd ab 00 00 66 89 14 25 00 01 40 00 48 8b 04 25 00 01 40 00 c3"),
+      { fill: 0xaa },
+    );
+    // the qword around the two bytes is the 0xaa this test filled memory with, so the load reads 0xaaaa_aaaa_aaaa_abcd
+    expect(BigInt.asUintN(64, result)).toBe(0xaaaaaaaaaaaaabcdn);
+    expect([buffer[0x100], buffer[0x101], buffer[0x102]]).toEqual([0xcd, 0xab, 0xaa]);
+  });
+
+  it("keeps the upper 48 bits of a register a 16-bit move writes", () => {
+    // mov $0x0123456789abcdef,%rax ; mov $0x1234,%ax ; ret: only the low half of the register is the destination
+    const { result } = run(hex("48 b8 ef cd ab 89 67 45 23 01 66 b8 34 12 c3"));
+    expect(result).toBe(0x0123456789ab1234n);
+  });
+
+  it("zero-extends a 16-bit load into the register it lands in", () => {
+    // mov $0xabcd,%edx ; mov %dx,0x400100 ; mov $-16,%rax ; mov 0x400100,%ax ; ret
+    const { result } = run(
+      hex("ba cd ab 00 00 66 89 14 25 00 01 40 00 48 c7 c0 f0 ff ff ff 66 8b 04 25 00 01 40 00 c3"),
+    );
+    // 0xfffffffffffffff0 with its low half replaced by 0xabcd: a 16-bit load widens and does not sign-extend
+    expect(BigInt.asUintN(64, result)).toBe(0xffffffffffffabcdn);
+  });
+
   it("adds a memory operand to a register", () => {
     // movq $0x20, 0x400100 ; mov $0x10, %rax ; add 0x400100, %rax ; ret
     const { result } = run(
