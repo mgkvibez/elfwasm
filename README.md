@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 268
+**Tests:** 272
 
 ```bash
 npm ci && npm run verify
@@ -541,9 +541,15 @@ There is one shape where a hole is evidence rather than a neighbour: a body cont
 jump's destinations in a table, so when the table cannot be read the case bodies are unreached and the hole is the gap the jump would
 have filled. That is refused, naming the jump, rather than translated into a dispatcher with no case to land in.
 
-Where it stops now: `+0x4d` into `0x40a360`, on `0b 05 59 cf 0a 00`, which is `or 0xacf59(%rip),%eax`. It is the reverse-direction
-form of the ALU group, where the destination is the register and the source is the memory operand, and the decoder has only ever had
-the direction that reads memory into the ModRM destination. `0x43d330` translates end to end now.
+### The other direction of and and or
+
+Opcodes `0x21` and `0x09` put the memory operand in the ModRM destination (`and %eax,(%rbx)`). Opcodes `0x23` and `0x0b` put the
+register there and the memory operand in ModRM.rm (`or 0xacf59(%rip),%eax`), which is the direction gcc emits to fold a global into a
+value it already has rather than load it first. Only the first direction was decoded, so the second refused by name.
+
+Where it stops now: `+0x14e` into `0x40a360`, on `0f 01 d0`. That is `xgetbv`: the extended control register the processor uses to say
+which vector state its operating system has enabled, read with the register number in `%ecx`. It is not a memory instruction and not a
+branch, it is a question about the machine, and the answer decides whether libc takes an AVX path.
 
 The cost of the dispatcher is worth stating: a body with any backward branch takes that path, so even a clean loop is expressed by
 naming blocks rather than as a WASM `loop`. The structured path is kept for the bodies that are trees, which is most of the small

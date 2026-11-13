@@ -553,3 +553,26 @@ describe("the padding instructions", () => {
     expect(() => decode(hex("0f 18 c0"))).toThrow(/takes a memory operand/);
   });
 });
+
+describe("the two directions of and and or", () => {
+  /*
+   * Opcodes `0x21` and `0x09` put the memory operand in the ModRM destination, and `0x23` and `0x0b` put a register there and the
+   * memory operand in ModRM.rm. The second direction is what gcc emits to fold a global into a value it already has, and only the
+   * first was decoded, so `or 0xacf59(%rip),%eax` refused by name.
+   */
+  it("reads or's reverse direction into the register it names", () => {
+    // or 0xacf59(%rip),%eax
+    const [instruction] = decode(Uint8Array.from([0x0b, 0x05, 0x59, 0xcf, 0x0a, 0x00]));
+    expect(instruction!.op).toBe("or");
+    // the register is the destination and the memory operand the source, which is the direction this opcode encodes
+    expect(instruction!.operands.map((operand) => operand.kind)).toEqual(["reg", "memory"]);
+  });
+
+  it("reads and's reverse direction the same way, and keeps the forward one as it was", () => {
+    const reverse = decode(Uint8Array.from([0x23, 0x05, 0x59, 0xcf, 0x0a, 0x00]))[0]!;
+    expect(reverse.op).toBe("and");
+    expect(reverse.operands.map((operand) => operand.kind)).toEqual(["reg", "memory"]);
+    const forward = decode(Uint8Array.from([0x21, 0x00]))[0]!;
+    expect(forward.operands.map((operand) => operand.kind)).toEqual(["memory", "reg"]);
+  });
+});

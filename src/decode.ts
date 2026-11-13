@@ -899,10 +899,19 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
     const register = registerOperand(modrm.regField, rex.r, bits);
     return opcode === 0x19 ? finish("sbb", [modrm.rm, register]) : finish("sbb", [register, modrm.rm]);
   }
-  if (opcode === 0x21 || opcode === 0x09) {
+  if (opcode === 0x21 || opcode === 0x09 || opcode === 0x23 || opcode === 0x0b) {
+    /*
+     * The two directions of `and` and `or`. `0x21` and `0x09` put the memory operand in the ModRM destination (`and %eax,(%rbx)`),
+     * and `0x23` and `0x0b` put a register there and the memory operand in ModRM.rm (`or (%rbx),%eax`), which is the direction a
+     * read-modify-nothing produces: gcc emits `or 0xacf59(%rip),%eax` to fold a global into a value rather than load it first.
+     */
     const modrm = decodeModRm(cursor, rex, bits, segment);
     const register = registerOperand(modrm.regField, rex.r, bits);
-    return opcode === 0x21 ? finish("and", [modrm.rm, register]) : finish("or", [modrm.rm, register]);
+    const memoryDestination = opcode === 0x21 || opcode === 0x09;
+    return finish(opcode === 0x21 || opcode === 0x23 ? "and" : "or", [
+      memoryDestination ? modrm.rm : register,
+      memoryDestination ? register : modrm.rm,
+    ]);
   }
   const accumulatorByte = ACCUMULATOR_BYTE_OPS[opcode];
   if (accumulatorByte !== undefined) {

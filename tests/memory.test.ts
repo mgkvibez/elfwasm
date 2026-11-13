@@ -154,6 +154,28 @@ describe("stores and loads", () => {
     expect(result).toBe(0x30n);
   });
 
+  it("folds a global into a register with the reverse-direction or, which names the register as the destination", () => {
+    /*
+     * `or 0x..(%rip),%eax` is the direction gcc emits to fold a global into a value without loading it first: opcode `0x0b` puts the
+     * register in ModRM.reg, which is the destination, and the memory operand in ModRM.rm. Only `0x09`, the direction whose
+     * destination is the memory operand, was decoded.
+     *
+     * movq $0x0f000000, 0x400100 ; mov $0x00ff00ff, %eax ; or 0x400100,%eax ; ret
+     */
+    const { result } = run(
+      hex("48 c7 04 25 00 01 40 00 00 00 00 0f b8 ff 00 ff 00 0b 04 25 00 01 40 00 c3"),
+    );
+    expect(BigInt.asUintN(32, result)).toBe(0x0fff00ffn);
+  });
+
+  it("does the same for and, whose reverse direction is opcode 0x23", () => {
+    // movq $0x0f000000, 0x400100 ; mov $0xffffffff, %eax ; and 0x400100,%eax ; ret
+    const { result } = run(
+      hex("48 c7 04 25 00 01 40 00 00 00 00 0f b8 ff ff ff ff 23 04 25 00 01 40 00 c3"),
+    );
+    expect(BigInt.asUintN(32, result)).toBe(0x0f000000n);
+  });
+
   it("imports the memory rather than owning one, so the caller's buffer is the one written", () => {
     const module = translateBytes(
       hex("48 c7 04 25 00 01 40 00 2a 00 00 00 c3"),
