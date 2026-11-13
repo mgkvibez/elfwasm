@@ -28,8 +28,8 @@ const runtime = (
   }
 ).WebAssembly;
 
-const run = (bytes: Uint8Array): bigint => {
-  const instance = new runtime.Instance(new runtime.Module(translateBytes(bytes)));
+const run = (bytes: Uint8Array, options: Parameters<typeof translateBytes>[2] = {}): bigint => {
+  const instance = new runtime.Instance(new runtime.Module(translateBytes(bytes, "main", options)));
   const entry = instance.exports.main as () => bigint;
   return entry();
 };
@@ -234,5 +234,16 @@ describe("a jump whose target is a value", () => {
     // 0x13 is inside the second block rather than at its start, so there is no block to run
     const misaligned = hex("48 b8 13 00 00 00 00 00 00 00 ff e0 b8 01 00 00 00 c3 b8 02 00 00 00 c3");
     expect(() => run(misaligned)).toThrow();
+  });
+});
+
+describe("alignment padding", () => {
+  it("carries the nop an assembler pads a caller's callee with, which nothing reaches", () => {
+    /*
+     * `call` into a function that jumps over three bytes of `nop` to its answer. The padding is inside the callee's extent and nothing
+     * ever reaches it, so an extent that insists every byte inside a function is reached refuses a function the assembler wrote.
+     */
+    const bytes = hex("e8 01 00 00 00 c3 eb 03 90 90 90 b8 2a 00 00 00 c3");
+    expect(run(bytes, { code: { bytes, virtualAddress: 0n } })).toBe(42n);
   });
 });

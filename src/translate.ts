@@ -2147,10 +2147,27 @@ function functionExtent(bytes: Uint8Array, address: bigint): readonly Instructio
   let offset = 0;
   while (offset <= end) {
     if (!reachable.has(offset)) {
+      /*
+       * Alignment padding: an assembler pads a block out to a boundary so that the block after it starts where the processor likes to
+       * fetch, and nothing ever jumps to the padding itself. A `nop` is the only padding this decoder knows, so a `nop` that nothing
+       * reaches is carried along as the dead code it is; any other byte nothing reaches is still the refusal it was, because it may be
+       * data or the middle of another instruction.
+       */
+      let padding: Instruction | undefined;
+      try {
+        padding = decodeAt(offset);
+      } catch {
+        padding = undefined;
+      }
+      if (padding !== undefined && padding.op === "nop") {
+        ordered.push(padding);
+        offset += padding.length;
+        continue;
+      }
       throw new TranslateError(
         offset,
-        `nothing reaches the bytes at 0x${offset.toString(16)} inside the function at ${hex(address)}, so this is not where ` +
-          `a function starts, or a branch lands inside another instruction`,
+        `nothing reaches the bytes at 0x${offset.toString(16)} inside the function at ${hex(address)} and they are not padding, ` +
+          `so this is not where a function starts, or a branch lands inside another instruction`,
       );
     }
     const instruction = decodeAt(offset);

@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 252
+**Tests:** 253
 
 ```bash
 npm ci && npm run verify
@@ -462,10 +462,18 @@ A computed jump lands in a block of the same body, so it is a block number to ch
 body are already numbered for the dispatcher, so the target is compared against the address each block starts at, the match sets the
 block number, and the dispatcher runs it. A target that is not where a block starts is `unreachable`.
 
-Where it stops now: `+0x710` into `__libc_start_main`, where a `switch` compiled to a jump table leaves bytes at `+0x70b` that nothing
-reaches. The walk follows a computed jump by continuing where its bytes stop, which is where a compiler puts the cases, but a case that
-no branch names is reachable only through the table, and the table is data in the image. Reading it is the next piece, and it is a data
-question rather than an instruction.
+### Alignment padding
+
+An assembler pads a block out to a boundary so the block after it starts where the processor likes to fetch, and nothing ever jumps to
+the padding itself: `nopl 0x0(%rax,%rax,1)` sits between two blocks and is reached by no path. An extent that insisted every byte
+inside a function is reached refused a function the assembler wrote, and the walk now carries a `nop` that nothing reaches as the dead
+code it is. Any other unreachable byte is still refused, because it may be data or the middle of another instruction, and a `nop` is
+the only padding this decoder knows.
+
+Where it stops now: `+0x100c` into `__libc_start_main`, at a `switch` whose case body is `cmp $0x5,%eax; ja ...; jmp ...`. The bytes
+before it are reached by falling into them, and these are not: a case no branch names is reachable only through a jump table in the
+image, and reading that table is the next piece. It is a data question rather than an instruction, and it needs the image's bytes at
+translation time, which is why it is not in yet.
 
 The cost of the dispatcher is worth stating: a body with any backward branch takes that path, so even a clean loop is expressed by
 naming blocks rather than as a WASM `loop`. The structured path is kept for the bodies that are trees, which is most of the small
