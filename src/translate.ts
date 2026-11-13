@@ -2249,37 +2249,57 @@ function functionExtent(
     );
   }
 
-  const end = Math.max(...reachable);
+  /*
+   * The body is the instructions its entry reaches, and nothing else. It used to be the whole byte range from the entry to the
+   * furthest byte reached, with every byte inside it required to be reached or to be `nop` padding, and that stopped being true the
+   * first time a body was walked whose branches reach a cold block a long way off: the bytes in between belong to other functions,
+   * and a function is not the text it sits in the middle of.
+   *
+   * So a hole is skipped. Its bytes are not part of this body and are not translated, and a branch that names one of them is refused
+   * where the blocks are built, because an instruction this body does not hold is not an instruction it can go to. Padding stays,
+   * as the dead code it is: an assembler pads a block out to a boundary, and a `nop` that nothing reaches translates to nothing.
+   */
   const ordered: Instruction[] = [];
+  let skipped: number | undefined;
   let offset = 0;
-  while (offset <= end) {
-    if (!reachable.has(offset)) {
-      /*
-       * Alignment padding: an assembler pads a block out to a boundary so that the block after it starts where the processor likes to
-       * fetch, and nothing ever jumps to the padding itself. A `nop` is the only padding this decoder knows, so a `nop` that nothing
-       * reaches is carried along as the dead code it is; any other byte nothing reaches is still the refusal it was, because it may be
-       * data or the middle of another instruction.
-       */
+  for (const start of [...reachable].sort((left, right) => left - right)) {
+    while (offset < start) {
       let padding: Instruction | undefined;
       try {
         padding = decodeAt(offset);
       } catch {
         padding = undefined;
       }
-      if (padding !== undefined && padding.op === "nop") {
-        ordered.push(padding);
-        offset += padding.length;
-        continue;
-      }
+      if (padding === undefined || padding.op !== "nop" || offset + padding.length > start) break;
+      ordered.push(padding);
+      offset += padding.length;
+    }
+    if (offset < start && skipped === undefined) skipped = offset;
+    if (offset > start) {
       throw new TranslateError(
-        offset,
-        `nothing reaches the bytes at 0x${offset.toString(16)} inside the function at ${hex(address)} and they are not padding, ` +
-          `so this is not where a function starts, or a branch lands inside another instruction`,
+        start,
+        `${hex(address + BigInt(start))} is inside the instruction that ends at ${hex(address + BigInt(offset))}, so it is not ` +
+          "where an instruction starts",
       );
     }
-    const instruction = decodeAt(offset);
+    const instruction = decodeAt(start);
     ordered.push(instruction);
-    offset += instruction.length;
+    offset = start + instruction.length;
+  }
+  /*
+   * A jump through a register goes somewhere its bytes do not name, so the walk finds its destinations in a table. When the table is
+   * not readable the walk still reaches what falls after the jump, and the case bodies it missed are now holes: that is the one shape
+   * where a hole is evidence, because the body is telling us it goes places this walk could not enumerate. It is refused rather than
+   * translated into a dispatcher that would have no case to land in.
+   */
+  const computedJump = ordered.find((instruction) => instruction.op.startsWith("j") && instruction.operands[0]?.kind !== "immediate");
+  if (computedJump !== undefined && skipped !== undefined) {
+    throw new TranslateError(
+      skipped,
+      `nothing reaches the bytes at 0x${skipped.toString(16)} inside the function at ${hex(address)}, and the jump through a ` +
+        `register at ${hex(address + BigInt(computedJump.offset))} is the reason they were expected to be reached: its table ` +
+        "cannot be read, so the cases it names are unknown",
+    );
   }
   return ordered;
 }

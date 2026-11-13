@@ -142,15 +142,15 @@ describe("what a call will not do", () => {
     ).toThrow(/outside the code region/);
   });
 
-  it("no longer calls a byte in a hole of a callee \"inside this function\", because it is another function's start", () => {
+  it("calls a function that sits in a hole of a callee, which is another function's start and not the middle of this one", () => {
     /*
      * The callee jumps over a region and then calls into it, which is the shape a real binary has wherever a cold block lives a long
      * way from its function: the skipped bytes hold another function, and a call to one of them names a start rather than the middle
      * of anything.
      *
-     * What the walk used to say was that the target was "inside this function", because it was below the far end of the reachable
-     * set, and in a linked image that is most of the text. What it says now is the true thing: it has bytes in a body that nothing
-     * reaches, which is a question about the extent and not about the call.
+     * The walk used to report that target as "inside this function", because it lay below the far end of the reachable set, and in a
+     * linked image the far end is most of the text. A body is now the instructions its entry reaches rather than the bytes between its
+     * first and its last, so the skipped bytes belong to nobody and the call is a call.
      *
      * entry  at 0x00: call 0x20 ; ret
      * callee at 0x20: jmp 0x30 (over the region holding the function at 0x28) ; at 0x30: call 0x28 ; ret
@@ -165,7 +165,7 @@ describe("what a call will not do", () => {
       ],
       0x40,
     );
-    expect(() => run(code, 0x06)).toThrow(/nothing reaches the bytes at 0x28|nothing reaches the bytes/);
+    expect(run(code, 0x06)).toBe(0x2an);
   });
 
   it("refuses a call when no code region was given at all", () => {

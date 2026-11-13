@@ -524,9 +524,26 @@ cold blocks sit far from its hot ones, and the region between holds other functi
 answer from the bytes, which is whether one of *this body's instructions covers* the target. A call into the middle of an instruction
 still refuses and now names that instruction; a call to a byte inside a hole is a function start, and is translated as one.
 
-Where it stops now: `+0xcb0` into `0x43d330`, and the refusal is finally the structural one. Nothing reaches the bytes there and they are
-not padding: they are a one-byte `ret` at `0x43dfe0`, a thunk sitting between two other functions, with `push %r15` starting the next
-one. The body absorbed a far jump target, so its holes now hold other functions, and what bounds a body is the open question.
+### What bounds a body
+
+A body is the instructions its entry reaches, and nothing else.
+
+It used to be the whole byte range from the entry to the furthest byte reached, with every byte inside it required to be reached or to
+be `nop` padding. That held while the walk stopped early; it stopped holding the first time a body was walked whose branches reach a
+cold block a long way off, because the bytes in between belong to other functions and a function is not the text it sits in the middle
+of. The `0x43d330` body is exactly that: it absorbed a far jump target and its holes hold a one-byte `ret` thunk and the start of the
+function after it.
+
+So a hole is skipped, and its bytes are not translated. A branch that names one of them is refused where the blocks are built, since an
+instruction the body does not hold is not one it can go to. Padding still stays, as the dead code it is.
+
+There is one shape where a hole is evidence rather than a neighbour: a body containing a jump through a register. The walk finds that
+jump's destinations in a table, so when the table cannot be read the case bodies are unreached and the hole is the gap the jump would
+have filled. That is refused, naming the jump, rather than translated into a dispatcher with no case to land in.
+
+Where it stops now: `+0x4d` into `0x40a360`, on `0b 05 59 cf 0a 00`, which is `or 0xacf59(%rip),%eax`. It is the reverse-direction
+form of the ALU group, where the destination is the register and the source is the memory operand, and the decoder has only ever had
+the direction that reads memory into the ModRM destination. `0x43d330` translates end to end now.
 
 The cost of the dispatcher is worth stating: a body with any backward branch takes that path, so even a clean loop is expressed by
 naming blocks rather than as a WASM `loop`. The structured path is kept for the bodies that are trees, which is most of the small
