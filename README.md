@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 280
+**Tests:** 283
 
 ```bash
 npm ci && npm run verify
@@ -571,9 +571,18 @@ The second is that `Flags` now records what defined it. A bit test leaves the ze
 one is refused by name rather than answered from whatever comparison happened to leave its operands in those locals last. A join of
 two arms that learned their flags different ways refuses too, for the same reason: two kinds of carry live in the same two locals.
 
-Where it stops now: `+0x108` into a function `0x40a360` calls, on `or` with a memory destination. The instruction decodes and
-`translateBinary` refuses it, because the ALU's read-modify-write path was never needed before: every memory operand so far has been a
-source.
+### The read-modify-write direction
+
+Every memory operand until now was a source: read, folded into a register, done. `or %eax,(%rbx)` is the other direction, and it is
+what a compiled program does to build a word in place, which is why `0x40a360`'s callee stops on it.
+
+The address goes on the stack before the value, because that is the order `store` pops them, and the result is compared against zero in
+the same two locals a register-form `or` uses: its zero flag describes the value it just wrote, not the two operands. `sub` is the one
+that differs, and it differs the same way in both directions: its flags describe the word minus the register, which is exactly what a
+`cmp` computes, so its two operands are kept and the difference is rebuilt from them.
+
+Where it stops now: `+0x2f5` into the same function, on `sar`, a shift. Shifts were never needed before either, and unlike the ALU's
+other operations a shift's flags are a separate question from its result: `sar %rax` sets the carry from the last bit shifted out.
 
 The cost of the dispatcher is worth stating: a body with any backward branch takes that path, so even a clean loop is expressed by
 naming blocks rather than as a WASM `loop`. The structured path is kept for the bodies that are trees, which is most of the small

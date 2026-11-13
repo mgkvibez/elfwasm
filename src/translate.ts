@@ -1034,12 +1034,88 @@ function translateUnary(instruction: Instruction): { code: number[]; width?: 32 
   };
 }
 
+/**
+ * A binary operation whose destination is memory: read the word, fold the register into it, write it back.
+ *
+ * The address is pushed before the value every time, because that is the order `store` pops them in, and the flags are set the way
+ * the register form sets them: `sub` keeps its two operands, because its flags describe the difference the way a `cmp` does, and
+ * every other operation keeps its result against zero, because `or`'s zero flag describes the value it just wrote.
+ *
+ * A byte into memory refuses by name: a byte operand is sign-extended here for the sake of the flags, and a store that has to write
+ * one byte of a word it read the same way is a separate question from this one.
+ */
+function translateIntoMemory(
+  instruction: Instruction,
+  op: BinaryOp,
+  destination: Operand,
+  source: Operand,
+): number[] {
+  if (destination.kind !== "memory") {
+    throw new TranslateError(instruction.offset, `${instruction.op} into a ${destination.kind} is not a memory operation`);
+  }
+  const width = destination.bits;
+  if (width !== 32 && width !== 64) {
+    throw new TranslateError(instruction.offset, `a ${width}-bit ${instruction.op} into memory is not translated yet`);
+  }
+  const opcodes = BINARY[op];
+  const load = loadFromMemory(destination, width, instruction);
+  const address = (): number[] => addressOf(destination, instruction);
+  const store = width === 64 ? OP.i64Store : OP.i32Store;
+  // the value the store writes: a 32-bit store pops an i32, and everything here computes at 64
+  const stored = (code: number[]): number[] => (width === 64 ? code : [...code, NARROW_32]);
+  const combine =
+    width === 64
+      ? [...load, ...operandCode64(source, instruction), opcodes.bits64]
+      : [...load, NARROW_32, ...operandCode64(source, instruction), NARROW_32, opcodes.bits32, WIDEN_32];
+  if (!FLAG_SETTING.has(op)) return [...address(), ...stored(combine), store, ...memarg(0)];
+  if (op !== "sub") {
+    /*
+     * The result is kept in `CMP_A` and compared against zero the way the register form does, then written: what the stack holds at
+     * the `store` is the address and the value, in that order, and the comparison locals are already filled by then.
+     */
+    return [
+      ...combine,
+      ...localSet(CMP_A),
+      ...i64Const(0n),
+      ...localSet(CMP_B),
+      ...address(),
+      ...stored([...localGet(CMP_A)]),
+      store,
+      ...memarg(0),
+    ];
+  }
+  /*
+   * `sub %eax,(%rbx)` subtracts the register from the word, so its flags describe the word minus the register: the two are kept in the
+   * comparison locals first, the difference is rebuilt from them, and what is left behind is the pair a `cmp` would have kept.
+   */
+  /*
+   * The register is kept at its own 64-bit width, exactly as the register form keeps it: a comparison narrows both operands itself
+   * when it reads them back, so narrowing here would leave a 32-bit value in a 64-bit local and the module would not validate.
+   */
+  const operand = operandCode64(source, instruction);
+  return [
+    ...load,
+    ...localSet(CMP_A),
+    ...operand,
+    ...localSet(CMP_B),
+    ...address(),
+    ...stored([...localGet(CMP_A), ...localGet(CMP_B), OP.i64Sub]),
+    store,
+    ...memarg(0),
+  ];
+}
+
 function translateBinary(instruction: Instruction): number[] {
   const op = instruction.op as BinaryOp;
   const [destination, source] = instruction.operands;
   if (destination === undefined || source === undefined) {
     throw new TranslateError(instruction.offset, `${instruction.op} needs two operands`);
   }
+  /*
+   * The other direction of the same instruction: `or %eax,(%rbx)` folds a register into a word in memory. Until a program needed it,
+   * every memory operand here was a source, so the read-modify-write path did not exist and `0x40a360`'s callee stopped on it.
+   */
+  if (destination.kind === "memory") return translateIntoMemory(instruction, op, destination, source);
   if (destination.kind !== "reg") {
     throw new TranslateError(instruction.offset, `a ${instruction.op} into memory is not translated yet`);
   }

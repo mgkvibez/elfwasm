@@ -189,6 +189,24 @@ describe("stores and loads", () => {
     expect(result).toBe(1n);
   });
 
+  it("folds a register into a word in memory, which is the read-modify-write direction", () => {
+    // mov [0x400100],0 ; mov $5,%ecx ; or %ecx,[0x400100] ; mov %eax,[0x400100] ; ret
+    const { result } = run(hex("c7 04 25 00 01 40 00 00 00 00 00 b9 05 00 00 00 09 0c 25 00 01 40 00 8b 04 25 00 01 40 00 c3"));
+    expect(result).toBe(5n);
+  });
+
+  it("subtracts a register from a word in memory and keeps the flags the way a cmp would", () => {
+    // mov [0x400100],8 ; mov $8,%ecx ; sub %ecx,[0x400100] ; mov %eax,[0x400100] ; ret  ->  0, and the zero flag is set
+    const { result } = run(hex("c7 04 25 00 01 40 00 08 00 00 00 b9 08 00 00 00 29 0c 25 00 01 40 00 8b 04 25 00 01 40 00 c3"));
+    expect(result).toBe(0n);
+  });
+
+  it("folds an immediate into a word in memory, twice over, which is how a flags word is built", () => {
+    // mov [0x400100],0 ; or [0x400100],0x30 ; and [0x400100],0x10 ; mov %eax,[0x400100] ; ret
+    const { result } = run(hex("c7 04 25 00 01 40 00 00 00 00 00 83 0c 25 00 01 40 00 30 83 24 25 00 01 40 00 10 8b 04 25 00 01 40 00 c3"));
+    expect(result).toBe(0x10n);
+  });
+
   it("imports the memory rather than owning one, so the caller's buffer is the one written", () => {
     const module = translateBytes(
       hex("48 c7 04 25 00 01 40 00 2a 00 00 00 c3"),
