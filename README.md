@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 283
+**Tests:** 285
 
 ```bash
 npm ci && npm run verify
@@ -581,8 +581,23 @@ the same two locals a register-form `or` uses: its zero flag describes the value
 that differs, and it differs the same way in both directions: its flags describe the word minus the register, which is exactly what a
 `cmp` computes, so its two operands are kept and the difference is rebuilt from them.
 
-Where it stops now: `+0x2f5` into the same function, on `sar`, a shift. Shifts were never needed before either, and unlike the ALU's
-other operations a shift's flags are a separate question from its result: `sar %rax` sets the carry from the last bit shifted out.
+### Shifts, and a flag about bits that left
+
+`sar`, `shr` and `shl` translate at 32 and 64 bits, with the count from an immediate or from `%cl`. The count is masked to five bits
+at 32 and six at 64, because that is what the processor does with it: `sar %cl` with 33 in `%cl` shifts by one.
+
+A shift's flags are not one question but two. The result sets what a comparison of it against zero would, so `je`, `jne`, `js` and
+`jns` after a shift mean what they look like, which is the common way a compiler tests a value it has just shifted. The carry is the
+last bit shifted out, which is a fact about the bits that left rather than about the value that stayed, and nothing here computes it,
+so `jb` after a `sar` refuses by name. That is why the flag model records *how* flags were defined: `bt` writes the carry and leaves
+the rest undefined, a shift writes the rest and leaves the carry unmodelled, and a condition is answered only where it is defined.
+
+Where it stops now: a tail call out of a body into an earlier function. `0x40a830` calls `0x43b860` (`__tunable_set_val` in libc),
+which computes a tunable's address and ends in `jmp 0x43b760` (`do_tunable_update_val`), a function that starts *before* it. The walk
+that finds a body's extent was given a window beginning at the body, so a branch leaving that window backwards is refused rather than
+followed. The refusal names both readings, because from the bytes alone they look alike: a tail call into an earlier function, which
+needs the jump to become a call and a return, or a call that was aimed into the middle of another body. Following the evidence of the
+call itself, this one is the tail call.
 
 The cost of the dispatcher is worth stating: a body with any backward branch takes that path, so even a clean loop is expressed by
 naming blocks rather than as a WASM `loop`. The structured path is kept for the bodies that are trees, which is most of the small

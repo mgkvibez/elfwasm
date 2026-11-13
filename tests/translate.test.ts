@@ -90,6 +90,11 @@ describe("translating straight-line code", () => {
 });
 
 describe("refusals", () => {
+
+  it("refuses a condition that reads the bit a shift dropped, which is not the shifted value", () => {
+    // mov $0x80000000,%eax ; sar $31,%eax ; jb done ; ret ; done: ret
+    expect(() => run(hex("b8 00 00 00 80 c1 f8 1f 72 01 c3 c3"))).toThrow(/shift|carry|modelled/);
+  });
   const refuse = (bytes: Uint8Array): TranslateError => {
     try {
       translateBytes(bytes);

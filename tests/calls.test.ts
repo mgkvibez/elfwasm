@@ -60,6 +60,19 @@ function run(code: Uint8Array, entrySize: number, stackPages = 0): bigint {
 }
 
 describe("one function calling another", () => {
+  it("refuses a function whose first branch reaches a byte before its own start", () => {
+    /*
+     * call 0x0a ; ret ; nop nop nop nop ; jmp 0x06 ; ret
+     *
+     * The callee's own first branch reaches a byte four before its start, which is inside the caller: the address a call reached
+     * is the middle of another body rather than a function. A window that began at the callee would read that as the buffer
+     * ending, so the refusal names the address the branch reaches instead.
+     */
+    const code = Uint8Array.from(hex("e8 05 00 00 00 c3 90 90 90 90 e9 f7 ff ff ff c3"));
+    const options = { code: { bytes: code, virtualAddress: 0x400000n }, codeAddress: 0x400000n };
+    expect(() => translateProgram(code, "main", options)).toThrow(/before the function/);
+  });
+
   it("passes an argument in %rdi and reads the result out of %rax", () => {
     /*
      * entry at 0x401000:  mov $0x29, %rdi ; call 0x401020 ; ret

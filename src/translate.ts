@@ -189,7 +189,11 @@ export class TranslateError extends Error {
   readonly offset: number;
 
   constructor(offset: number, message: string) {
-    super(`at offset 0x${offset.toString(16)}: ${message}`);
+    /*
+     * A negative offset is a real thing here: a branch that reaches a byte before the function's start is that far before it, and
+     * printing it as `0x-100` would be neither the offset nor the address.
+     */
+    super(`at offset ${offset < 0 ? "-" : ""}0x${Math.abs(offset).toString(16)}: ${message}`);
     this.offset = offset;
   }
 }
@@ -944,6 +948,71 @@ const BINARY = {
 type BinaryOp = keyof typeof BINARY;
 
 /**
+ * The three shifts, which differ only in which direction the bits leave and whether the sign comes with them.
+ *
+ * `shl` moves them up, `shr` moves them down filling with zero, and `sar` moves them down filling with the sign bit, which is the one
+ * a compiler picks for a signed division by a power of two. All three take their count from an immediate or from `%cl`.
+ */
+const SHIFTS_TRANSLATED = {
+  shl: { bits64: OP.i64Shl, bits32: OP.i32Shl },
+  shr: { bits64: OP.i64ShrU, bits32: OP.i32ShrU },
+  sar: { bits64: OP.i64ShrS, bits32: OP.i32ShrS },
+} as const;
+
+type ShiftOp = keyof typeof SHIFTS_TRANSLATED;
+
+/**
+ * A shift of a register by an immediate or by `%cl`.
+ *
+ * The count is masked to five bits at 32 and six at 64, because that is what the processor does with it: `sar %cl` with 33 in `%cl`
+ * shifts by one. `wasm` masks a count the same way, so the masking here is stated rather than relied on, since the flags below are
+ * about what the processor's own definition says.
+ *
+ * The result sets the flags a comparison of it against zero would: `sar` of a word to zero is a common way to test the sign, and the
+ * zero and sign conditions read the value that was written. The carry is the last bit shifted out, which is a fact about the bits
+ * that left rather than about the result, so it is not modelled here and the conditions that read it refuse by name.
+ */
+function translateShift(instruction: Instruction): number[] {
+  const op = instruction.op as ShiftOp;
+  const [destination, count] = instruction.operands;
+  if (destination === undefined || count === undefined) {
+    throw new TranslateError(instruction.offset, `${instruction.op} needs two operands`);
+  }
+  if (destination.kind !== "reg") {
+    throw new TranslateError(instruction.offset, `a ${instruction.op} into ${destination.kind} is not translated yet`);
+  }
+  const width = destination.bits;
+  if (width !== 32 && width !== 64) {
+    throw new TranslateError(instruction.offset, `a ${width}-bit ${instruction.op} is not translated yet`);
+  }
+  if (count.kind === "memory") {
+    throw new TranslateError(instruction.offset, `a ${instruction.op} whose count is in memory is not translated yet`);
+  }
+  const opcodes = SHIFTS_TRANSLATED[op];
+  const masked = [...operandCode64(count, instruction), ...i64Const(BigInt(width - 1)), OP.i64And];
+  const shifted =
+    width === 64
+      ? [...read(destination, instruction), ...masked, opcodes.bits64]
+      : [
+          ...read(destination, instruction),
+          NARROW_32,
+          ...masked,
+          NARROW_32,
+          opcodes.bits32,
+          WIDEN_32,
+        ];
+  return [
+    ...shifted,
+    OP.localTee,
+    ...unsigned(CMP_A),
+    ...i64Const(0n),
+    OP.localSet,
+    ...unsigned(CMP_B),
+    ...write(destination, instruction),
+  ];
+}
+
+/**
  * An operand at the width the operation happens at, ready to sit next to the destination on the stack.
  *
  * A 32-bit register source must be narrowed as well as the destination. Narrowing only the destination is the bug this
@@ -1375,8 +1444,18 @@ function flagCondition(suffix: string, flags: Flags, instruction: Instruction): 
         "undefined, so only the carry conditions, jb and jae, can be read after it",
     );
   }
+  if (flags.kind === "shift" && !SHIFT_CONDITIONS.has(suffix)) {
+    throw new TranslateError(
+      instruction.offset,
+      `a ${instruction.op} after a shift reads a flag the shift does not define here: the zero and sign conditions describe the ` +
+        "shifted value, but the carry is the last bit shifted out, which is a fact about the bits that left and is not modelled",
+    );
+  }
   return conditionCode(suffix, flags.width);
 }
+
+/** The conditions a shift answers: what the result it wrote is, and not what left it. */
+const SHIFT_CONDITIONS: ReadonlySet<string> = new Set(["e", "ne", "z", "nz", "s", "ns"]);
 
 /** A region's exit points: the instruction index of its end, and how many blocks a `br` must cross to reach it. */
 type Scope = Map<number, number>;
@@ -1390,7 +1469,7 @@ interface Flags {
    * What defined them. A comparison defines every condition a compiler reads; a bit test defines the carry and leaves the rest
    * undefined, so the conditions that read them are refused instead of being answered from a value that is not there.
    */
-  kind?: "bit" | undefined;
+  kind?: "bit" | "shift" | undefined;
 }
 
 function indexOfOffset(instructions: readonly Instruction[], offset: number): number {
@@ -1862,10 +1941,12 @@ function translateRange(
       if (displacement === undefined || displacement.kind !== "immediate") {
         throw new TranslateError(instruction.offset, "call without a displacement is not something x86 encodes");
       }
-      const target =
-        (options.functionAddress ?? 0n) +
-        BigInt(instruction.offset + instruction.length) +
-        BigInt(displacement.value);
+      /*
+       * Measured from the body's own first byte, through the same fallback a RIP-relative operand uses: a body translated with only
+       * the program's address knows is the entry, and reading its displacement against zero would aim every call it makes at a
+       * number that is a displacement and not an address.
+       */
+      const target = bodyBase(options) + BigInt(instruction.offset + instruction.length) + BigInt(displacement.value);
       if (options.calls === undefined) {
         throw new TranslateError(
           instruction.offset,
@@ -2242,6 +2323,19 @@ function translateRange(
       index += 1;
       continue;
     }
+    if (instruction.op === "shl" || instruction.op === "shr" || instruction.op === "sar") {
+      /*
+       * A shift's flags describe its result the way an `or`'s do, and its carry describes a bit that has left, which nothing here
+       * computes: `kind: "shift"` is how a later condition is told which of the two it is asking about.
+       */
+      out.push(...translateShift(instruction));
+      flags.set = true;
+      const destination = instruction.operands[0];
+      flags.width = destination !== undefined && destination.kind === "reg" && destination.bits === 32 ? 32 : 64;
+      flags.kind = "shift";
+      index += 1;
+      continue;
+    }
     if (instruction.op in BINARY) {
       out.push(...translateBinary(instruction));
       if (FLAG_SETTING.has(instruction.op)) {
@@ -2290,6 +2384,19 @@ function functionExtent(
   const decodeAt = (offset: number): Instruction => {
     const known = decoded.get(offset);
     if (known !== undefined) return known;
+    /*
+     * A negative offset is a branch to a byte before the function's start, and the window the walk was given begins at the start,
+     * so reading it would look like the buffer ending rather than what it is: the function this walk began at is not a function,
+     * or the call that reached it was aimed into the middle of another body.
+     */
+    if (offset < 0) {
+      throw new TranslateError(
+        offset,
+        `a branch reaches ${hex(address + BigInt(offset))}, which is before the function at ${hex(address)}: either the body ends ` +
+          "in a tail call into an earlier function, which is not translated yet, or the call that reached it was aimed into the " +
+          "middle of another body",
+      );
+    }
     if (offset >= bytes.length) {
       throw new TranslateError(
         offset,
@@ -2660,7 +2767,7 @@ function translateAsBlocks(instructions: readonly Instruction[], options: Transl
       out.push(...(operand?.kind === "memory" ? loadFromMemory(operand, 64, last) : read(operand!, last)), ...localSet(INDIRECT));
       out.push(OP.block, OP.emptyBlockType);
       for (const [number, start] of starts.entries()) {
-        const address = (options.functionAddress ?? 0n) + BigInt(instructions[start]!.offset);
+        const address = bodyBase(options) + BigInt(instructions[start]!.offset);
         out.push(
           ...localGet(INDIRECT), ...i64Const(address), OP.i64Eq, OP.ifEmpty, OP.emptyBlockType,
           ...i64Const(BigInt(number)), ...localSet(PC),

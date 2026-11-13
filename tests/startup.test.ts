@@ -409,7 +409,8 @@ describe("the extent a resolver is translated from", () => {
       }
       if (refusal !== undefined) {
         expect(refusal).toBeInstanceOf(Error);
-        expect((refusal as Error).message).toMatch(/offset 0x[0-9a-f]+/);
+        // a branch before its function's start is located at a negative offset, which is still a location
+        expect((refusal as Error).message).toMatch(/offset -?0x[0-9a-f]+/);
       }
     } finally {
       rmSync(directory, { recursive: true, force: true });
