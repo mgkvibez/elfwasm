@@ -301,6 +301,15 @@ describe("the pieces a compiler leans on", () => {
     expect({ op: sign!.op, dst: sign!.operands[0] }).toEqual({ op: "movsx", dst: { kind: "reg", name: "rax", bits: 64 } });
   });
 
+  it("reads the word of a movzwl from memory as sixteen bits, not as the destination's thirty-two", () => {
+    // 0f b7 94 24 90 00 00 00 is `movzwl 0x90(%rsp),%edx`: the size of the read is in the opcode
+    const [instruction] = decode(hex("0f b7 94 24 90 00 00 00"));
+    expect({ op: instruction!.op, src: instruction!.operands[1] }).toEqual({
+      op: "movzx",
+      src: { kind: "memory", bits: 16, base: "rsp", scale: 1, displacement: 0x90n, ripRelative: false },
+    });
+  });
+
   it("refuses a 16-bit register source for movzx, which would need the prefix it does not decode", () => {
     expect(refuseBytes(hex("0f b7 c0")).message).toContain("needs a 0x66 prefix");
   });

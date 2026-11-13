@@ -597,7 +597,8 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
     if (second === 0xb7 || second === 0xbf) {
       // a word either way. From memory the size lives in the opcode; from a register it would need the 0x66 prefix,
       // which is refused above, so a register here means the bytes are not what they claim
-      const modrm = decodeModRm(cursor, rex, bits, segment);
+      // the word is the width of the operand, not of the destination: `movzwl 0x90(%rsp),%edx` reads sixteen bits
+      const modrm = decodeModRm(cursor, rex, 16, segment);
       if (modrm.rm.kind === "reg") {
         throw new DecodeError(
           offset,

@@ -362,15 +362,18 @@ describe("a switch compiled to a jump table", () => {
    *  40: jmp *%rdx
    *  42: case 0 answers 10, 48: case 1 answers 11, 54: case 2 answers 12, 60: case 3 answers 13, 66: default answers 99
    */
-  const code = (): Uint8Array =>
+  const code = (maskBounded = false): Uint8Array =>
     hex(
       "e8 0b 00 00 00 c3 90 90 90 90 90 90 90 90 90 90 " +
-        "ba 02 00 00 00 83 fa 03 77 28 48 8d 0d df 00 00 00 48 63 14 91 48 01 ca ff e2 " +
+        "ba 02 00 00 00 " +
+        // the bounds check, or the mask glibc's own helper uses instead: `and $0x3` is four entries and no `cmp` at all
+        (maskBounded ? "83 e2 03 90 90" : "83 fa 03 77 28") +
+        " 48 8d 0d df 00 00 00 48 63 14 91 48 01 ca ff e2 " +
         "b8 0a 00 00 00 c3 b8 0b 00 00 00 c3 b8 0c 00 00 00 c3 b8 0d 00 00 00 c3 b8 63 00 00 00 c3",
     );
 
   /** Runs the switch with the table at 0x400100, and with the image's data reader or without one. */
-  const runSwitch = (readable: boolean): bigint => {
+  const runSwitch = (readable: boolean, maskBounded = false): bigint => {
     const image = imageOf();
     const addresses = addressSpaceOf(image);
     const memory = new runtime.Memory({ initial: 1 });
@@ -386,7 +389,7 @@ describe("a switch compiled to a jump table", () => {
       for (let byte = width - 1; byte >= 0; byte -= 1) value = (value << 8n) | BigInt(buffer[start + byte]!);
       return value;
     };
-    const bytes = code();
+    const bytes = code(maskBounded);
     const module = translateBytes(bytes, "main", {
       addresses,
       memoryPages: 1,
@@ -400,6 +403,11 @@ describe("a switch compiled to a jump table", () => {
 
   it("runs the case the table names, which no branch in the bytes names", () => {
     expect(runSwitch(true)).toBe(12n);
+  });
+
+  it("reads a table whose length is a mask rather than a comparison", () => {
+    // `and $0x3,%edx` bounds the table the way a `cmp` does: four entries, and the case the value names runs
+    expect(runSwitch(true, true)).toBe(12n);
   });
 
   it("refuses the case bodies when the table cannot be read, because nothing else reaches them", () => {

@@ -1902,6 +1902,8 @@ function translateRange(
       flags.set = true;
       flags.width = translated.width;
       flags.borrows = instruction.op === "cmp";
+      // a comparison defines every condition a compiler reads, so what a shift or a bit test said about them is replaced
+      flags.kind = undefined;
       index += 1;
       continue;
     }
@@ -1924,6 +1926,41 @@ function translateRange(
         OP.end,
       );
       // the instruction leaves the flags exactly as it found them, so they stay usable after it
+      index += 1;
+      continue;
+    }
+    if (instruction.op.startsWith("set") && instruction.op !== "set") {
+      /*
+       * `sete %al` writes the condition as a byte: one when it holds, zero when it does not. The comparison locals already hold the
+       * operands the condition is about, so the byte is the condition itself, widened to the register the write expects.
+       */
+      const suffix = instruction.op.slice(3);
+      if (suffix === "o" || suffix === "no" || suffix === "p" || suffix === "np") {
+        throw new TranslateError(
+          instruction.offset,
+          `${instruction.op} reads the overflow or parity flag, which this does not compute`,
+        );
+      }
+      if (!flags.set) {
+        throw new TranslateError(instruction.offset, `${instruction.op} needs a cmp or test that every path reaching it goes through`);
+      }
+      const [operand] = instruction.operands;
+      if (operand === undefined) throw new TranslateError(instruction.offset, `${instruction.op} needs a place to write`);
+      const condition = flagCondition(suffix, flags, instruction);
+      if (operand.kind === "memory") {
+        if (operand.bits !== 8) {
+          throw new TranslateError(instruction.offset, `a ${operand.bits}-bit ${instruction.op} is not an encoding: a byte is what it writes`);
+        }
+        out.push(...addressOf(operand, instruction), ...condition, OP.i32Store8, ...memarg(0));
+      } else if (operand.kind === "reg" && operand.bits === 8) {
+        out.push(...condition, WIDEN_32, ...write(operand, instruction));
+      } else {
+        throw new TranslateError(
+          instruction.offset,
+          `a ${instruction.op} into a ${operand.kind === "reg" ? `${operand.bits}-bit register` : operand.kind} is not an encoding`,
+        );
+      }
+      // like `cmp`, the instruction leaves the flags exactly as it found them
       index += 1;
       continue;
     }
@@ -2089,6 +2126,43 @@ function translateRange(
       }
       const loaded = source.kind === "memory" ? loadFromMemory(source, 32, instruction) : read(source, instruction);
       out.push(...loaded, NARROW_32, OP.i64ExtendI32S, ...write(destination, instruction));
+      index += 1;
+      continue;
+    }
+    if (instruction.op === "movzx" || instruction.op === "movsx") {
+      /*
+       * `movzx` and `movsx` widen an 8- or 16-bit source into a 32- or 64-bit register: the zero form keeps only the source's bits,
+       * the sign form keeps its sign. That is how a compiled program reads a byte out of a structure, so the byte load has to carry
+       * its own sign rather than borrowing the sign-extending form every other byte operand uses.
+       */
+      const [destination, source] = instruction.operands;
+      if (destination?.kind !== "reg" || (destination.bits !== 32 && destination.bits !== 64)) {
+        throw new TranslateError(
+          instruction.offset,
+          `a ${instruction.op} into a ${destination?.kind ?? "missing"} operand is not an encoding: the destination is a 32- or 64-bit register`,
+        );
+      }
+      const sourceBits = source === undefined || source.kind === "immediate" ? undefined : source.bits;
+      if (source === undefined || source.kind === "immediate" || (sourceBits !== 8 && sourceBits !== 16)) {
+        throw new TranslateError(
+          instruction.offset,
+          `a ${instruction.op} from a ${sourceBits ?? "missing"} operand is not an encoding: the source is a byte or a word`,
+        );
+      }
+      const sign = instruction.op === "movsx";
+      const shift = 64n - BigInt(sourceBits);
+      const signed = (code: number[]): number[] => [...code, ...i64Const(shift), OP.i64Shl, ...i64Const(shift), OP.i64ShrS];
+      let loaded: number[];
+      if (source.kind === "memory") {
+        const load = source.bits === 8 ? (sign ? OP.i32Load8S : OP.i32Load8U) : sign ? OP.i32Load16S : OP.i32Load16U;
+        const widen = sign ? OP.i64ExtendI32S : WIDEN_32;
+        loaded = [...addressOf(source, instruction), load, ...memarg(0), widen];
+      } else {
+        // a register read is already masked to the byte or the word, so only the sign still has to be put back
+        loaded = read(source, instruction);
+        if (sign) loaded = signed(loaded);
+      }
+      out.push(...loaded, ...write(destination, instruction));
       index += 1;
       continue;
     }
@@ -2442,8 +2516,9 @@ function translateRange(
     if (instruction.op in BINARY) {
       out.push(...translateBinary(instruction));
       if (FLAG_SETTING.has(instruction.op)) {
-        // an arithmetic result sets the flags a branch can read
+        // an arithmetic result sets the flags a branch can read, the whole set of them rather than the carry alone
         flags.set = true;
+        flags.kind = undefined;
         const destination = instruction.operands[0];
         flags.width = destination !== undefined && destination.kind === "reg" && destination.bits === 32 ? 32 : 64;
       } else {
@@ -2849,20 +2924,32 @@ function jumpTableTargets(
   if (base?.kind !== "reg" || address?.kind !== "memory" || !address.ripRelative) return [];
   if (registerNumberOf(base.name) !== baseRegister) return [];
   /*
-   * How many entries there are comes from the bounds check the compiler put before the table, which compares the switch's value
-   * against the highest case: `cmp $0x22,%edx; ja default` means twenty-three entries. Without that comparison there is no bound to
-   * trust, and a table read past its end is a target in some other function, so an unmatched shape names no targets at all.
+   * How many entries there are comes from the bounds check the compiler put before the table: `cmp $0x22,%edx; ja default` means
+   * twenty-three entries, and `and $0xf,%edx` means sixteen. Without one there is no bound to trust, and a table read past its end is
+   * a target in some other function, so an unmatched shape names no targets at all.
    */
   const indexRegister = registerNumberOf(table.index);
   let count: number | undefined;
-  for (let back = index - 4; back >= 0 && index - back <= 10; back -= 1) {
+  /*
+   * The bound is searched for from the instruction before the jump rather than from before the load: a bounds check sits above the
+   * `lea`, but a mask is applied to the extracted index right under the load, three instructions from the jump.
+   */
+  for (let back = index - 1; back >= 0 && index - back <= 16; back -= 1) {
     const candidate = instructions[back]!;
-    if (candidate.op !== "cmp") continue;
+    if (candidate.op !== "cmp" && candidate.op !== "and") continue;
     const immediate = candidate.operands.find((operand) => operand.kind === "immediate");
     const compared = candidate.operands.find((operand) => operand.kind === "reg");
     if (immediate?.kind !== "immediate" || compared?.kind !== "reg") continue;
     if (registerNumberOf(compared.name) !== indexRegister) continue;
-    count = Number(immediate.value) + 1;
+    const bound = Number(immediate.value);
+    /*
+     * A `cmp` against the highest case is the shape gcc emits for a `switch` over a range, and `bound + 1` entries is what it names.
+     * A mask is the other shape: `and $0xf,%eax` keeps the low four bits, so sixteen entries, and it is what a compiler emits rather
+     * than a comparison when the value is a field being extracted, as it is in `cpuid` handling. Only a mask of low bits is a count:
+     * any other `and` is doing work on the value rather than bounding it.
+     */
+    if (candidate.op === "and" && ((bound + 1) & bound) !== 0) continue;
+    count = bound + 1;
     break;
   }
   if (count === undefined || count < 1 || count > 1024) return [];
@@ -2965,6 +3052,17 @@ function translateAsBlocks(instructions: readonly Instruction[], options: Transl
     }
     return number;
   };
+  /*
+   * The blocks a branch lands in, which are the ones whose flags are whatever the branch that reached them had. A block reached only
+   * by falling out of the block before it inherits that block's flags instead: `cmp $0x1c,%edx; je L1; jbe L2` is two branches on one
+   * comparison, and the second one is reached by the first one not being taken.
+   */
+  const targeted = new Set<number>();
+  for (const instruction of instructions) {
+    if (!instruction.op.startsWith("j") || instruction.operands[0]?.kind !== "immediate") continue;
+    targeted.add(indexOfOffset(instructions, branchTarget(instruction)));
+  }
+  let carried: { from: number; flags: Flags } | undefined;
   const out: number[] = [];
   out.push(...i64Const(0n), ...localSet(PC), OP.loop, OP.emptyBlockType);
   for (const [number, start] of starts.entries()) {
@@ -2972,9 +3070,13 @@ function translateAsBlocks(instructions: readonly Instruction[], options: Transl
     out.push(...localGet(PC), ...i64Const(BigInt(number)), OP.i64Eq, OP.ifEmpty, OP.emptyBlockType);
     const terminal = end - 1;
     const last = instructions[terminal]!;
-    const flags: Flags = { set: false, width: 64 };
+    const before = carried;
+    const flags: Flags = before !== undefined && before.from === start && !targeted.has(start)
+      ? { ...before.flags }
+      : { set: false, width: 64 };
     // everything before the block's last instruction is straight-line code, and the empty scope is what says so
     translateRange(instructions, start, terminal, new Map(), out, flags, new Map(), options);
+    carried = last.op.startsWith("j") && last.operands[0]?.kind === "immediate" ? { from: end, flags: { ...flags } } : undefined;
     if (last.op === "ret") {
       out.push(...globalGet(REGISTERS.indexOf("rax")), OP.returnOp);
     } else if (last.op === "jmp" && last.operands[0]?.kind !== "immediate") {
@@ -3260,7 +3362,7 @@ export function translateProgram(
 ): Uint8Array {
   const instructions = decode(bytes);
   refuseCallInsideBody(instructions, bytes.length, options.codeAddress ?? 0n);
-  return programOf(instructions, name, options);
+  return named(options, instructions, () => programOf(instructions, name, options));
 }
 
 /**
@@ -3312,5 +3414,26 @@ export function translate(
   // the same refusal a decoded byte slice gets, because a list of instructions can be walked into the middle of one too
   const length = instructions.reduce((furthest, instruction) => Math.max(furthest, instruction.offset + instruction.length), 0);
   refuseCallInsideBody(instructions, length, options.codeAddress ?? 0n);
-  return programOf(instructions, name, options);
+  return named(options, instructions, () => programOf(instructions, name, options));
+}
+
+/**
+ * Names the function a refusal happened in, which the offsets alone cannot: an offset is measured from the body's first byte, and a
+ * program translated body by body has dozens of them. A message that already names the function is left as it is.
+ */
+function named(
+  options: TranslateOptions,
+  instructions: readonly Instruction[],
+  translateBody: () => Uint8Array,
+): Uint8Array {
+  try {
+    return translateBody();
+  } catch (error) {
+    // the body being translated is the function's own address when it has one, which is where its offsets are measured from
+    const address = bodyBase(options);
+    if (!(error instanceof TranslateError) || address === undefined || error.message.includes("the function at")) throw error;
+    // an offset that is not one of this body's belongs to a callee, whose own translation names it
+    if (!instructions.some((instruction) => instruction.offset === error.offset)) throw error;
+    throw new TranslateError(error.offset, `in the function at ${hex(address)}: ${error.message}`);
+  }
 }

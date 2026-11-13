@@ -411,6 +411,9 @@ describe("the extent a resolver is translated from", () => {
         expect(refusal).toBeInstanceOf(Error);
         // a branch before its function's start is located at a negative offset, which is still a location
         expect((refusal as Error).message).toMatch(/offset -?0x[0-9a-f]+/);
+        // and it is not one of the shapes that used to stop the walk here: a second branch on one comparison, a bit scan, a
+        // condition written as a byte, or a widening read out of a structure
+        expect((refusal as Error).message).not.toMatch(/needs a cmp or test|\bbsf\b|\bbsr\b|set\w+ is not translated|mov[sz]x is not translated/);
       }
     } finally {
       rmSync(directory, { recursive: true, force: true });

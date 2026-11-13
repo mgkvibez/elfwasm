@@ -235,6 +235,50 @@ describe("the bit scans", () => {
   });
 });
 
+describe("what the flags are after an instruction", () => {
+  it("answers a condition a comparison set after a shift, which no longer describes the flags", () => {
+    /*
+     * mov $0xff,%eax ; shr $4,%eax ; mov $3,%edx ; cmp $3,%edx ; ja skip ; mov $1,%eax ; skip: ret
+     * the `ja` reads the comparison, not the shift: 3 is not above 3, so the branch is not taken and eax is 1
+     */
+    expect(run(hex("b8 ff 00 00 00 c1 e8 04 ba 03 00 00 00 83 fa 03 77 05 b8 01 00 00 00 c3"))).toBe(1n);
+  });
+
+  it("answers a second condition on the flags a branch kept, when the block is reached by falling out of the first", () => {
+    /*
+     * A graph body, because the `ja` is the first instruction of a block:
+     *   mov $0,%eax ; mov $7,%edx ; cmp $5,%edx ; je end ; ja end ; sub $1,%edx ; jmp back to the cmp ; nop ; end: mov %edx,%eax ; ret
+     * the `je` is not taken and the `ja` is, so eax is 7. Without carrying the flags along the fall-through the `ja` has no comparison
+     * behind it, because a block start used to mean "the flags are unknown".
+     */
+    expect(run(hex("b8 00 00 00 00 ba 07 00 00 00 83 fa 05 74 08 77 06 83 ea 01 eb f4 90 89 d0 c3"))).toBe(7n);
+  });
+});
+
+describe("the widenings a compiler reads a field with", () => {
+  it("zero-extends a byte register, which keeps the byte and drops the rest", () => {
+    // mov $0x2c,%eax ; movzbl %al,%ecx ; mov %ecx,%eax ; ret
+    expect(run(hex("b8 2c 00 00 00 0f b6 c8 89 c8 c3"))).toBe(0x2cn);
+  });
+
+  it("sign-extends a byte register, so 0x80 becomes -128 rather than 128", () => {
+    // mov $0x80,%eax ; movsbl %al,%ecx ; mov %ecx,%eax ; ret  ->  a 32-bit write zero-extends, so the answer is 0xffffff80
+    expect(run(hex("b8 80 00 00 00 0f be c8 89 c8 c3"))).toBe(0xffffff80n);
+  });
+});
+
+describe("a condition written as a byte", () => {
+  it("writes one when the condition holds", () => {
+    // mov $5,%eax ; cmp $5,%eax ; sete %cl ; movzbl %cl,%ecx ; mov %ecx,%eax ; ret
+    expect(run(hex("b8 05 00 00 00 83 f8 05 0f 94 c1 0f b6 c9 89 c8 c3"))).toBe(1n);
+  });
+
+  it("writes zero when it does not", () => {
+    // the same with 6 against 5: `sete` is false, so the answer is the byte it wrote
+    expect(run(hex("b8 06 00 00 00 83 f8 06 83 f8 05 0f 94 c1 0f b6 c9 89 c8 c3"))).toBe(0n);
+  });
+});
+
 describe("branches nest as structure", () => {
   it("nests one conditional branch inside another and branches out of both", () => {
     /*

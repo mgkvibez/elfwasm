@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 297
+**Tests:** 305
 
 ```bash
 npm ci && npm run verify
@@ -116,9 +116,9 @@ send a reader to different places in the architecture.
 ## The translator
 
 `translate` takes the decoder's instructions and emits one WASM function per x86-64 function: no parameters, one `i64`
-result, sixteen `i64` globals for the sixteen registers in encoding order. The subset is `mov`, `lea`, `add`, `sub`, `xor`,
-`and`, `or`, `imul` at 32 and 64 bits, `cmp` and `test`, the ten conditional branches that need only zf, sf, cf and of,
-`jmp` in both directions, loops, `call`, `syscall`, and `ret`, which returns `rax`.
+result, sixteen `i64` globals for the sixteen registers in encoding order. The subset is `mov`, `lea`, `movzx`, `movsx`,
+`movsxd`, `add`, `sub`, `xor`, `and`, `or`, `imul` at 32 and 64 bits, `cmp` and `test`, `setcc`, the ten conditional branches
+that need only zf, sf, cf and of, `jmp` in both directions, loops, `call`, `syscall`, and `ret`, which returns `rax`.
 
 Flags are never materialised as variables. `cmp` and `test` leave their operands in two extra locals and a `jcc` becomes
 the comparison itself, at the width the operands were: that is why `cmp $-1, %eax ; jl` and `cmp $-1, %rax ; jl` behave
@@ -175,7 +175,7 @@ here.
 
 Everything else is refused by name and offset: a segment override such as `%fs:` (WASM has no segments, and reading `0x28`
 as a plain address would silently load the wrong memory), a constant address no segment maps, `syscall` when the layer is
-off, `setcc` and the flags it needs, `jo` and its relatives, a `ret` with a stack adjustment, a block that does not return,
+off, `jo` and its relatives, a `ret` with a stack adjustment, a block that does not return,
 and code after `ret`.
 Refusing is the honest option while the rest of the machine does not exist: a translator that skipped an instruction would
 produce a module that runs and computes the wrong number.
@@ -570,6 +570,30 @@ reads, because `A < B` is a borrow and `1 - bit < 1` is exactly `bit == 1`. `jb`
 The second is that `Flags` now records what defined it. A bit test leaves the zero, sign and overflow flags undefined, so a `je` after
 one is refused by name rather than answered from whatever comparison happened to leave its operands in those locals last. A join of
 two arms that learned their flags different ways refuses too, for the same reason: two kinds of carry live in the same two locals.
+
+### The widenings, and the byte a condition writes
+
+`movzx` and `movsx` were in the decoder and not in the translator, which is the shape a compiler reads a field of a structure with:
+`movzwl 0x90(%rsp),%edx` is how glibc's own helper reads sixteen bits. The zero form masks what it read, the sign form keeps the
+sign, and a byte or a word from memory takes a load of its own sign (`i32.load8_u`, `i32.load16_s`) rather than the sign-extending
+form every other byte operand here uses. The word is the *source's* width, read from the opcode, not the destination's: decoding it
+as the destination's thirty-two bits made a `movzwl` from memory look like an encoding that does not exist.
+
+`setcc` writes one byte, so it is the condition itself widened to the register the write expects, and a store to memory when the
+destination is one. It leaves the flags exactly as it found them, as `cmp` does, so `cmp; sete; jne` is answerable.
+
+A comparison also has to *replace* what an earlier instruction said about the flags. `shl`, `shr`, `sar`, `bsf`, `bsr` and `bt` each
+define the carry and leave the rest undefined, which is recorded in `Flags.kind`; a `cmp` or an arithmetic result in between clears
+that record, because it defines every condition a branch reads. Without it, `shr $4,%eax; cmp $3,%edx; ja` was refused as "a `ja`
+after a shift", which is one instruction too late to be right.
+
+### Flags that a fall-through keeps
+
+A body translated as blocks used to start every block with the flags unknown, which is wrong for the one edge that carries them: the
+instruction after a conditional branch is reached by that branch not being taken, so `cmp $0x1c,%edx; je L1; jbe L2` is two branches
+on one comparison and the second one is answerable. A block now inherits the flags of the block before it when it is reached by
+falling out of it and nothing else branches into it; a block that is a branch target still starts with the flags unknown, because two
+paths reaching it need not agree about them.
 
 ### The read-modify-write direction
 

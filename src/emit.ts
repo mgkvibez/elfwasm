@@ -254,6 +254,8 @@ export const OP = {
   i32Load8S: 0x2c,
   i32Load8U: 0x2d,
   i32Load16U: 0x2f,
+  // the sign-extending half of a 16-bit load, which `movsx` from a word of memory is
+  i32Load16S: 0x2e,
   i64ExtendI32S: 0xac,
   i64Load: 0x29,
   i32Store: 0x36,
