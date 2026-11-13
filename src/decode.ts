@@ -536,6 +536,20 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
   if (opcode === 0x0f) {
     const second = byteAt(cursor);
     if (second === 0x05) return finish("syscall", []);
+    if (second === 0x01) {
+      /*
+       * `0f 01 /2` in its register form is `xgetbv`: it reports the extended control register the operating system has enabled for the
+       * processor's vector state, with the register number in `%ecx`. It is one fixed encoding, `0f 01 d0`, and the other `0f 01`
+       * forms are either privileged or loader instructions (`sgdt`, `lgdt`, `lidt`, `sgdt`), so they are refused by name rather than
+       * read as one of them.
+       */
+      const modrm = byteAt(cursor);
+      if (modrm === 0xd0) return finish("xgetbv", []);
+      throw new DecodeError(
+        offset,
+        `the 0f 01 instruction whose ModRM byte is 0x${modrm.toString(16)} is not in the decoded subset: only 0f 01 d0, xgetbv, is`,
+      );
+    }
     if (second === 0x0b) return finish("ud2", []);
     if (second >= 0x80 && second <= 0x8f) {
       return finish(`j${CONDITIONS[second - 0x80]!}`, [{ kind: "immediate", value: readImmediate(cursor, 4) }]);

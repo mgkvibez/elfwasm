@@ -576,3 +576,16 @@ describe("the two directions of and and or", () => {
     expect(forward.operands.map((operand) => operand.kind)).toEqual(["memory", "reg"]);
   });
 });
+
+describe("xgetbv", () => {
+  it("decodes 0f 01 d0 to the instruction it is", () => {
+    const [instruction] = decode(Uint8Array.from([0x0f, 0x01, 0xd0]));
+    expect(instruction!.op).toBe("xgetbv");
+    expect(instruction!.length).toBe(3);
+  });
+
+  it("refuses the other 0f 01 forms by name rather than reading one as xgetbv", () => {
+    // 0f 01 c9 is `sidt`, which reads the interrupt table into memory: a different instruction with the same opcode bytes
+    expect(() => decode(Uint8Array.from([0x0f, 0x01, 0xc9]))).toThrow(/only 0f 01 d0, xgetbv/);
+  });
+});

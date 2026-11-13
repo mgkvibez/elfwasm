@@ -196,3 +196,21 @@ describe("what a call will not do", () => {
     ).toThrow(/nothing reaches|is not an instruction|is not in the|is not an instruction start/);
   });
 });
+
+describe("what this machine says it can do", () => {
+  it("answers xgetbv with x87 and SSE and nothing above them, so a program takes the path without AVX", () => {
+    /*
+     * `xor %ecx,%ecx ; xgetbv ; ret` asks for extended control register 0, which is where the operating system says which vector
+     * state it enabled. The answer is 3: `x87` and SSE, no YMM state. Every AVX instruction sits behind the bit the answer leaves
+     * clear, and none of them is decoded here, so the honest answer is the one that keeps a program on instructions that exist.
+     */
+    const code = region(
+      [
+        // xor %ecx,%ecx ; xgetbv ; ret, which answers in %rax
+        { at: 0x00, bytes: hex("31 c9 0f 01 d0 c3") },
+      ],
+      0x20,
+    );
+    expect(run(code, 0x06)).toBe(3n);
+  });
+});

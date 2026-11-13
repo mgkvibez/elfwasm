@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 272
+**Tests:** 275
 
 ```bash
 npm ci && npm run verify
@@ -547,9 +547,19 @@ Opcodes `0x21` and `0x09` put the memory operand in the ModRM destination (`and 
 register there and the memory operand in ModRM.rm (`or 0xacf59(%rip),%eax`), which is the direction gcc emits to fold a global into a
 value it already has rather than load it first. Only the first direction was decoded, so the second refused by name.
 
-Where it stops now: `+0x14e` into `0x40a360`, on `0f 01 d0`. That is `xgetbv`: the extended control register the processor uses to say
-which vector state its operating system has enabled, read with the register number in `%ecx`. It is not a memory instruction and not a
-branch, it is a question about the machine, and the answer decides whether libc takes an AVX path.
+### A question about the machine
+
+`0f 01 d0` is `xgetbv`: it reports the extended control register `%ecx` names, which is the operating system's statement of which
+vector state it turned on. This machine answers 3, `x87` and SSE and nothing above them.
+
+That answer is not a placeholder. Every AVX instruction is behind the bit the answer leaves clear, and none of them is decoded here, so
+what a program does with it is take the path this translator can run, which is the same choice a real machine without AVX makes.
+Answering with the AVX bit set would send libc into instructions that would then refuse. The other `0f 01` forms are privileged or
+loader instructions (`sgdt`, `lgdt`, `lidt`) and are refused by name rather than read as this one.
+
+Where it stops now: `+0x258` into `0x40a360`, on `0f a3`, which is `bt`: a bit test, whose result is the carry flag and whose
+destination can be memory. The instruction is a shift and an `and`; the question it raises is how this translator records a flag that
+came from a bit rather than from a comparison.
 
 The cost of the dispatcher is worth stating: a body with any backward branch takes that path, so even a clean loop is expressed by
 naming blocks rather than as a WASM `loop`. The structured path is kept for the bodies that are trees, which is most of the small

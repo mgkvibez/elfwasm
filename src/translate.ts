@@ -1419,6 +1419,20 @@ function translateRange(
       flags.set = false;
       continue;
     }
+    if (instruction.op === "xgetbv") {
+      /*
+       * `xgetbv` answers with the extended control register `%ecx` names, which is the operating system's statement of which vector
+       * state it has turned on. This machine's answer is the one a processor with `x87` and SSE reports and nothing above it: 3.
+       *
+       * That is not a placeholder. Every AVX instruction this translator cannot decode sits behind the bit the answer leaves clear, so
+       * what a program does with it is take the path this translator can run, which is the same choice a real machine without AVX
+       * makes. Answering with the AVX bit set would send libc into instructions that would then refuse.
+       */
+      out.push(...i64Const(3n), ...globalSet(REGISTERS.indexOf("rax")), ...i64Const(0n), ...globalSet(REGISTERS.indexOf("rdx")));
+      flags.set = false;
+      index += 1;
+      continue;
+    }
     if (instruction.op === "cpuid") {
       /*
        * `cpuid` asks what this machine can do, and this machine's answer is nothing optional: the leaf in `%eax` is a question
