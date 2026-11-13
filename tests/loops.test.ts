@@ -196,3 +196,43 @@ describe("the vector logical operations", () => {
     expect(run(hex("b8 f0 f0 00 00 66 0f 6e c0 b8 ff ff 00 00 66 0f 6e c8 66 0f ef c1 66 0f 7e c0 c3"))).toBe(0x0f0fn);
   });
 });
+
+describe("a subtraction that borrows", () => {
+  it("turns a comparison's carry into a mask, which is what sbb of a register by itself is for", () => {
+    /*
+     * `mov $5,%eax ; mov $9,%ebx ; cmp %ebx,%eax ; sbb %rcx,%rcx ; mov %rcx,%rax ; ret`. The comparison borrows, because 5 is less
+     * than 9, so `%rcx` minus itself minus the carry is -1.
+     */
+    expect(run(hex("b8 05 00 00 00 bb 09 00 00 00 39 d8 48 19 c9 48 89 c8 c3"))).toBe(-1n);
+  });
+
+  it("leaves zero when the comparison did not borrow", () => {
+    // the same program with 9 against 5, where nothing is borrowed
+    expect(run(hex("b8 09 00 00 00 bb 05 00 00 00 39 d8 48 19 c9 48 89 c8 c3"))).toBe(0n);
+  });
+
+  it("refuses when no comparison reaches it, because the carry would be a guess", () => {
+    // `sbb %rcx,%rcx` with nothing before it
+    expect(() => run(hex("48 19 c9 48 89 c8 c3"))).toThrow(/carry flag/);
+  });
+});
+
+describe("a jump whose target is a value", () => {
+  /*
+   * `mov $0x12,%rax ; jmp *%rax`, and the block at 0x12 is the second of two: the first answers 1 and the one the jump names
+   * answers 2. The target is an address rather than a block number, so the body's blocks are compared against it.
+   */
+  const twoBlocks = hex(
+    "48 b8 12 00 00 00 00 00 00 00 ff e0 b8 01 00 00 00 c3 b8 02 00 00 00 c3",
+  );
+
+  it("runs the block whose address it names", () => {
+    expect(run(twoBlocks)).toBe(2n);
+  });
+
+  it("traps when the address is not where a block of this body starts", () => {
+    // 0x13 is inside the second block rather than at its start, so there is no block to run
+    const misaligned = hex("48 b8 13 00 00 00 00 00 00 00 ff e0 b8 01 00 00 00 c3 b8 02 00 00 00 c3");
+    expect(() => run(misaligned)).toThrow();
+  });
+});

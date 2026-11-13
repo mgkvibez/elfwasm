@@ -346,6 +346,8 @@ const BYTE_REGISTER_OPS: Readonly<Record<number, { op: string; intoRegister: boo
   0x02: { op: "add", intoRegister: true },
   0x08: { op: "or", intoRegister: false },
   0x0a: { op: "or", intoRegister: true },
+  0x18: { op: "sbb", intoRegister: false },
+  0x1a: { op: "sbb", intoRegister: true },
   0x20: { op: "and", intoRegister: false },
   0x22: { op: "and", intoRegister: true },
   0x28: { op: "sub", intoRegister: false },
@@ -835,6 +837,15 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
     const register = registerOperand(modrm.regField, rex.r, bits);
     return opcode === 0x03 ? finish("add", [register, modrm.rm]) : finish("sub", [register, modrm.rm]);
   }
+  if (opcode === 0x19 || opcode === 0x1b) {
+    /*
+     * `sbb`: a subtraction that also subtracts the carry. `sbb %rbx,%rbx` is how a compiler turns the carry into a mask, since a
+     * register minus itself is zero and zero minus a carry is all ones or zero.
+     */
+    const modrm = decodeModRm(cursor, rex, bits, segment);
+    const register = registerOperand(modrm.regField, rex.r, bits);
+    return opcode === 0x19 ? finish("sbb", [modrm.rm, register]) : finish("sbb", [register, modrm.rm]);
+  }
   if (opcode === 0x21 || opcode === 0x09) {
     const modrm = decodeModRm(cursor, rex, bits, segment);
     const register = registerOperand(modrm.regField, rex.r, bits);
@@ -915,6 +926,22 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
     return finish(mnemonic, [modrm.rm, { kind: "immediate", value: readImmediate(cursor, 1) }]);
   }
 
+  if (opcode === 0xff) {
+    /*
+     * The group whose instruction is named by the /reg field rather than by the opcode: `call`, `jmp` and `push` through an operand.
+     * A call or a jump through a register or a memory location is how a program reaches a target it computes rather than one the
+     * linker wrote down, so the operand is the target and there is no displacement in the bytes.
+     */
+    const modrm = decodeModRm(cursor, rex, 64, segment);
+    if (modrm.regField === 2) return finish("call", [modrm.rm]);
+    if (modrm.regField === 4) return finish("jmp", [modrm.rm]);
+    if (modrm.regField === 6) return finish("push", [modrm.rm]);
+    throw new DecodeError(
+      offset,
+      `0xff /${modrm.regField} is ${[ "inc", "dec", "a far call", "a far jump", "jmp", "a far jmp", "push", "invalid" ][modrm.regField]}, ` +
+        "which is not in the decoded subset",
+    );
+  }
   throw new DecodeError(offset, `opcode 0x${opcode.toString(16)} is not in the decoded subset`);
 }
 

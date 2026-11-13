@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 245
+**Tests:** 252
 
 ```bash
 npm ci && npm run verify
@@ -436,10 +436,36 @@ offset and the high half at the memarg's next one. Their register forms are refu
 The four integer logical operations are in as well: `pand`, `pandn`, `por` and `pxor`, each bitwise, each applied to both halves
 independently. `pandn` is the one that is not symmetric, computing `~destination & source`.
 
-Where it stops now: `+0x839` into `__libc_start_main`, on `42 ff 54 f5 00`, which is `call *0x0(%rbp,%r14,8)`: an indirect call
-through a function-pointer table. The callee's extent is a runtime value, so translating it ahead of time is not possible and the
-translator would have to translate a target it discovers while running. That is the next piece, and it is a structural one rather
-than an opcode.
+### A call whose target is a value
+
+`call *target` reads its target from a register or from memory, so which function runs is decided at run time and cannot be an index
+in the module's function list. What it can be is one of the functions this program translated: the target is compared against each of
+them and the one that matches is called. A target that matches nothing is `unreachable`, which is the trap a jump to garbage is.
+
+The set of candidates is the functions the translation knows, which is the entry plus everything a direct call reached. A function
+whose address reaches the program only as a pointer is in it only when the caller says so through `indirectTargets`, and that is not a
+detail of the implementation but a property of the question: `main`'s address is passed to `__libc_start_main` as an argument, so no
+call in the bytes names it.
+
+That makes the bodies of a program something to emit twice. An indirect call is a comparison against every function, so the list has to
+be complete before any body is written to, and translating the bodies is what completes it: the first pass grows the list and is thrown
+away, the second emits the same bodies against a list that cannot grow further, because the same bytes make the same decisions.
+
+`sbb` comes with it, because `sbb %rbx,%rbx` is how a compiler turns a comparison into a mask: a register minus itself is zero, and
+zero minus the borrow is all ones or zero. The borrow is read out of the comparison the flags still hold, since `a - b` borrows exactly
+when `a < b` as unsigned values, and a `test` borrows nothing at all. Every other flag `sbb` sets is dropped rather than computed, so
+what follows it knows nothing about what it left behind.
+
+### A jump whose target is a value
+
+A computed jump lands in a block of the same body, so it is a block number to choose rather than an address to call. The blocks of a
+body are already numbered for the dispatcher, so the target is compared against the address each block starts at, the match sets the
+block number, and the dispatcher runs it. A target that is not where a block starts is `unreachable`.
+
+Where it stops now: `+0x710` into `__libc_start_main`, where a `switch` compiled to a jump table leaves bytes at `+0x70b` that nothing
+reaches. The walk follows a computed jump by continuing where its bytes stop, which is where a compiler puts the cases, but a case that
+no branch names is reachable only through the table, and the table is data in the image. Reading it is the next piece, and it is a data
+question rather than an instruction.
 
 The cost of the dispatcher is worth stating: a body with any backward branch takes that path, so even a clean loop is expressed by
 naming blocks rather than as a WASM `loop`. The structured path is kept for the bodies that are trees, which is most of the small

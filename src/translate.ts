@@ -91,13 +91,22 @@ const DIV_SIGN_HI = 14;
 const DIV_FLAG = 15;
 const DIV_FLAG2 = 16;
 /**
+ * Where an indirect call keeps the target it read.
+ *
+ * The target is compared against every function this program translated, so it has to be somewhere a comparison can read it more
+ * than once, and a local is what a comparison reads.
+ */
+const INDIRECT = 17;
+/** The carry a `sbb` subtracts, worked out from the comparison the flags still hold. */
+const SBB_CARRY = 18;
+/**
  * Where the block a body is executing is recorded, for a body whose control flow is not a tree.
  *
  * Registers are globals and a comparison's operands are locals, so a block of instructions that begins anywhere needs no state of
  * its own beyond which block to run next. This local is that.
  */
 const PC = 3;
-const LOCAL_COUNT = 17;
+const LOCAL_COUNT = 19;
 
 /** The imported syscall's function index, which is 0: an import comes before every function the module defines. */
 const SYSCALL_INDEX = 0;
@@ -127,6 +136,13 @@ export interface TranslateOptions {
    */
   readonly code?: { readonly bytes: Uint8Array; readonly virtualAddress: bigint };
   /**
+   * Function addresses that nothing in the program calls directly, so that an indirect call can still be aimed at them.
+   *
+   * A function pointer handed to a program as an argument (`main`, whose address `_start` passes to `__libc_start_main`) never appears
+   * as a call target in the bytes, and the translation of a call through a pointer would have nothing to compare it against.
+   */
+  readonly indirectTargets?: readonly bigint[];
+  /**
    * Answer `syscall` through the imported host function, which is `Machine` in `src/syscalls.ts`.
    *
    * Off by default, like the stack, because it changes what the caller must supply: a module that can call the kernel needs an
@@ -153,6 +169,8 @@ export interface TranslateOptions {
 export interface CallRegistry {
   /** The module index of the function at this virtual address, decoding it on first sight. */
   indexOf(address: bigint, instruction: Instruction): number;
+  /** Every function translated so far, which is what an indirect call can be aimed at. */
+  candidates?(): readonly bigint[];
 }
 
 export class TranslateError extends Error {
@@ -1226,6 +1244,8 @@ type Scope = Map<number, number>;
 interface Flags {
   set: boolean;
   width: 32 | 64;
+  /** Whether the comparison was a subtraction, whose borrow is the carry `sbb` reads; a `test` has no carry to give. */
+  borrows?: boolean;
 }
 
 function indexOfOffset(instructions: readonly Instruction[], offset: number): number {
@@ -1279,6 +1299,8 @@ function findLoops(instructions: readonly Instruction[]): LoopHeads {
   for (let index = 0; index < instructions.length; index += 1) {
     const instruction = instructions[index]!;
     if (!instruction.op.startsWith("j")) continue;
+    // a jump through a value has no displacement, so it closes no loop this can see
+    if (instruction.operands[0]?.kind !== "immediate") continue;
     const target = branchTarget(instruction);
     const targetIndex = instructions.findIndex((entry) => entry.offset === target);
     if (targetIndex < 0 || targetIndex >= index) continue;
@@ -1487,7 +1509,7 @@ function translateRange(
       out.push(...condition, OP.i32Eqz, OP.ifEmpty, OP.emptyBlockType);
       const nested: Scope = new Map([...scope].map(([key, value]) => [key, value + 1] as const));
       nested.set(target, 0);
-      translateRange(instructions, index + 1, target, nested, out, { set: flags.set, width: flags.width }, loops, options);
+      translateRange(instructions, index + 1, target, nested, out, { ...flags }, loops, options);
       out.push(OP.end);
       // after the join, a comparison made on one side is not known to have happened on the other, so the flags are
       // dropped rather than assumed
@@ -1500,6 +1522,7 @@ function translateRange(
       out.push(...translated.code);
       flags.set = true;
       flags.width = translated.width;
+      flags.borrows = instruction.op === "cmp";
       index += 1;
       continue;
     }
@@ -1571,6 +1594,48 @@ function translateRange(
     if (instruction.op === "leave") {
       // `leave` moves two registers and no flags
       out.push(...translateLeave(instruction, options));
+      index += 1;
+      continue;
+    }
+    if (instruction.op === "call" && instruction.operands[0]?.kind !== "immediate") {
+      /*
+       * An indirect call: the target is a value the program computed, so which function runs is decided at run time and cannot be
+       * an index in the module's function list. What it *can* be is one of the functions this program has translated, so the target
+       * is compared against each of them and the one that matches is called. A target that matches nothing is `unreachable`, which
+       * is the trap a jump to garbage is.
+       *
+       * The set is the functions this translation knows: the entry, and everything a direct call reached. A function whose address
+       * reaches the program only as a pointer (`main`, whose address is passed to `__libc_start_main`) is not in it unless the
+       * caller says so through `indirectTargets`.
+       */
+      const operand = instruction.operands[0];
+      if (operand === undefined) throw new TranslateError(instruction.offset, "call needs a target");
+      if (options.calls === undefined) {
+        throw new TranslateError(
+          instruction.offset,
+          "an indirect call needs a program to call into: use translateProgram, which knows the functions it translated",
+        );
+      }
+      const candidates = options.calls.candidates?.() ?? [];
+      const known = [...candidates, ...(options.indirectTargets ?? [])].map((address) => ({
+        address,
+        index: options.calls!.indexOf(address, instruction),
+      }));
+      // read the target once, because every comparison below reads it again
+      out.push(...(operand.kind === "memory" ? loadFromMemory(operand, 64, instruction) : read(operand, instruction)));
+      out.push(...localSet(INDIRECT), OP.block, OP.emptyBlockType);
+      for (const candidate of known) {
+        out.push(
+          ...localGet(INDIRECT), ...i64Const(candidate.address), OP.i64Eq, OP.ifEmpty, OP.emptyBlockType,
+          OP.call, ...unsigned(candidate.index + (options.syscalls === true ? 1 : 0)),
+          ...globalSet(REGISTERS.indexOf("rax")),
+          // out of the block that holds the whole dispatch, past the comparisons that have not run
+          OP.br, ...unsigned(1),
+          OP.end,
+        );
+      }
+      out.push(OP.unreachable, OP.end);
+      flags.set = false;
       index += 1;
       continue;
     }
@@ -1884,7 +1949,48 @@ function translateRange(
       if (translated.width !== undefined) {
         flags.set = true;
         flags.width = translated.width;
+        // `neg` is zero minus a value, so its borrow is a carry; `not` sets no flag at all and has no width
+        flags.borrows = instruction.op === "neg";
       }
+      index += 1;
+      continue;
+    }
+    if (instruction.op === "sbb") {
+      /*
+       * A subtraction that also subtracts the carry, which is how a compiler turns a comparison into a number: `sbb %rbx,%rbx` is
+       * zero minus the borrow, so `%rbx` becomes all ones when the comparison borrowed and zero when it did not.
+       *
+       * The borrow is read out of the comparison the flags still hold: `a - b` borrows exactly when `a < b` as unsigned values. After
+       * a `test` there is no borrow at all, because a test subtracts nothing.
+       */
+      if (!flags.set || flags.borrows === undefined) {
+        throw new TranslateError(
+          instruction.offset,
+          "sbb reads the carry flag, which needs a cmp or test that every path reaching it goes through",
+        );
+      }
+      const [destination, source] = instruction.operands;
+      if (destination === undefined || source === undefined) {
+        throw new TranslateError(instruction.offset, "sbb needs two operands");
+      }
+      const carry =
+        flags.borrows === false
+          ? [...i64Const(0n)]
+          : flags.width === 32
+            ? [...comparisonOperands(32), OP.i32LtU, OP.i64ExtendI32U]
+            : [...comparisonOperands(64), OP.i64LtU, OP.i64ExtendI32U];
+      out.push(
+        ...carry,
+        ...localSet(SBB_CARRY),
+        ...read(destination, instruction),
+        ...read(source, instruction),
+        OP.i64Sub,
+        ...localGet(SBB_CARRY),
+        OP.i64Sub,
+        ...write(destination, instruction),
+      );
+      // the arithmetic flags it sets are not modelled, so the comparison it inherited is spent
+      flags.set = false;
       index += 1;
       continue;
     }
@@ -1951,7 +2057,24 @@ function functionExtent(bytes: Uint8Array, address: bigint): readonly Instructio
     // a ret has no successor, which is what stops the walk before the next function's bytes
     if (instruction.op === "ret") continue;
     if (instruction.op === "jmp") {
-      work.push(branchTarget(instruction));
+      const operand = instruction.operands[0];
+      if (operand?.kind === "immediate") {
+        work.push(branchTarget(instruction));
+        continue;
+      }
+      /*
+       * A computed jump: the target is a value, so the walk cannot follow it. What it can do is continue where the instruction's
+       * bytes stop, which is where a compiler puts the cases of the switch such a jump usually ends, and stop where there is no code
+       * to continue into: a tail call through a register has the linker's padding after it, and following that would decode zeros.
+       */
+      const afterJump = offset + instruction.length;
+      if (afterJump >= bytes.length || bytes[afterJump] === 0) continue;
+      try {
+        decodeAt(afterJump);
+      } catch {
+        continue;
+      }
+      work.push(afterJump);
       continue;
     }
     if (instruction.op.startsWith("j")) work.push(branchTarget(instruction));
@@ -2008,6 +2131,8 @@ function functionExtent(bytes: Uint8Array, address: bigint): readonly Instructio
   for (const start of starts) {
     const instruction = decodeAt(start);
     if (instruction.op !== "call") continue;
+    // a call through a register has no target in the bytes to be in the middle of an instruction
+    if (instruction.operands[0]?.kind !== "immediate") continue;
     const target = branchTarget(instruction);
     if (target >= 0 && target < extentEnd && !reachable.has(target)) {
       throw new TranslateError(
@@ -2039,6 +2164,8 @@ function functionExtent(bytes: Uint8Array, address: bigint): readonly Instructio
 function needsDispatcher(instructions: readonly Instruction[]): boolean {
   return instructions.some((instruction, index) => {
     if (!instruction.op.startsWith("j")) return false;
+    // a jump whose target is a value lands in a block, and which one is decided by that value
+    if (instruction.operands[0]?.kind !== "immediate") return true;
     const target = indexOfOffset(instructions, branchTarget(instruction));
     return target >= 0 && target <= index;
   });
@@ -2056,6 +2183,14 @@ function blockStarts(instructions: readonly Instruction[]): number[] {
       continue;
     }
     if (!instruction.op.startsWith("j")) continue;
+    /*
+     * A jump through a value has no target in the bytes, so the only block start it implies is the instruction after it: the bytes
+     * from there on can be reached by falling into them, or not at all, but they are not the middle of the block that jumped.
+     */
+    if (instruction.operands[0]?.kind !== "immediate") {
+      starts.add(index + 1);
+      continue;
+    }
     const target = indexOfOffset(instructions, branchTarget(instruction));
     if (target >= 0) starts.add(target);
     starts.add(index + 1);
@@ -2097,6 +2232,28 @@ function translateAsBlocks(instructions: readonly Instruction[], options: Transl
     translateRange(instructions, start, terminal, new Map(), out, flags, new Map(), options);
     if (last.op === "ret") {
       out.push(...globalGet(REGISTERS.indexOf("rax")), OP.returnOp);
+    } else if (last.op === "jmp" && last.operands[0]?.kind !== "immediate") {
+      /*
+       * A jump whose target is a value: the blocks this body knows are the blocks it can land in, so the target is compared against
+       * each block's address and the one that matches becomes the block to run. A target that matches nothing is `unreachable`,
+       * which is the trap a jump to an address that is not an instruction is.
+       *
+       * This is not how a `switch` is translated yet: its cases are reached only through a table in the image, which the walk does
+       * not read, so the case bodies are not blocks here and a jump into one traps.
+       */
+      const operand = last.operands[0];
+      out.push(...(operand?.kind === "memory" ? loadFromMemory(operand, 64, last) : read(operand!, last)), ...localSet(INDIRECT));
+      out.push(OP.block, OP.emptyBlockType);
+      for (const [number, start] of starts.entries()) {
+        const address = (options.functionAddress ?? 0n) + BigInt(instructions[start]!.offset);
+        out.push(
+          ...localGet(INDIRECT), ...i64Const(address), OP.i64Eq, OP.ifEmpty, OP.emptyBlockType,
+          ...i64Const(BigInt(number)), ...localSet(PC),
+          OP.br, ...unsigned(1),
+          OP.end,
+        );
+      }
+      out.push(OP.unreachable, OP.end);
     } else if (last.op === "jmp") {
       out.push(...i64Const(BigInt(blockAt(indexOfOffset(instructions, branchTarget(last))))), ...localSet(PC));
     } else if (last.op.startsWith("j")) {
@@ -2233,6 +2390,7 @@ function programOf(
   };
 
   const calls: CallRegistry = {
+    candidates: () => order.map((body) => body.address),
     indexOf(address, instruction) {
       const seen = known.get(address.toString());
       if (seen !== undefined) return seen;
@@ -2259,9 +2417,17 @@ function programOf(
   register(entryAddress, entryInstructions);
   const withCalls: TranslateOptions = { ...options, calls };
   const bodies: number[][] = [];
-  for (let index = 0; index < order.length; index += 1) {
-    const body = order[index]!;
-    bodies.push(bodyOf(body.instructions, { ...withCalls, functionAddress: body.address }));
+  /*
+   * Twice: an indirect call is a comparison against every function this program translated, so the list has to be complete before
+   * any body is emitted, and translating the bodies is what completes it. The first pass grows the list and is thrown away; the
+   * second emits the same bodies against a list that cannot grow any further, because the same bytes make the same decisions.
+   */
+  for (let pass = 0; pass < 2; pass += 1) {
+    bodies.length = 0;
+    for (let index = 0; index < order.length; index += 1) {
+      const body = order[index]!;
+      bodies.push(bodyOf(body.instructions, { ...withCalls, functionAddress: body.address }));
+    }
   }
 
   const all = order.flatMap((body) => [...body.instructions]);

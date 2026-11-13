@@ -57,7 +57,15 @@ interface Run {
 }
 
 /** Translate, instantiate against a memory this test fills, call, and hand back both the result and the buffer. */
-function run(bytes: Uint8Array, options: { codeAddress?: bigint; fill?: number } = {}): Run {
+function run(
+  bytes: Uint8Array,
+  options: {
+    codeAddress?: bigint;
+    fill?: number;
+    code?: { readonly bytes: Uint8Array; readonly virtualAddress: bigint };
+    indirectTargets?: readonly bigint[];
+  } = {},
+): Run {
   const image = imageOf();
   const memory = new runtime.Memory({ initial: 1 });
   const buffer = new Uint8Array(memory.buffer);
@@ -66,6 +74,8 @@ function run(bytes: Uint8Array, options: { codeAddress?: bigint; fill?: number }
     addresses: addressSpaceOf(image),
     memoryPages: 1,
     ...(options.codeAddress === undefined ? {} : { codeAddress: options.codeAddress }),
+    ...(options.code === undefined ? {} : { code: options.code }),
+    ...(options.indirectTargets === undefined ? {} : { indirectTargets: options.indirectTargets }),
   });
   const instance = new runtime.Instance(new runtime.Module(module), { env: { memory } });
   return { result: instance.exports.main!(), buffer };
@@ -211,5 +221,36 @@ describe("the 16-byte moves", () => {
     // and a byte filled in by the test itself comes back through the vector register
     const filled = run(hex("0f 28 04 25 00 01 40 00 66 0f 7e c0 c3"), { fill: 0x11 });
     expect(filled.result).toBe(0x11111111n);
+  });
+});
+
+describe("an indirect call", () => {
+  /*
+   * The target is a value the program reads rather than one the linker wrote down, so which function runs is decided at run time.
+   * `call *0x400100` reads a pointer the program stored, and the function it names is one nothing calls directly, which is what
+   * `indirectTargets` is for: without it there would be nothing to compare the pointer against.
+   */
+  const program = hex(
+    [
+      "48 c7 04 25 00 01 40 00 40 00 40 00", // movq $0x400040, 0x400100
+      "ff 14 25 00 01 40 00", // call *0x400100
+      "c3", // ret
+      ...Array.from({ length: 0x40 - 19 }, () => "90"), // nop padding out to the callee
+      "b8 2a 00 00 00", // mov $42,%eax
+      "c3", // ret
+    ].join(" "),
+  );
+
+  it("calls the function the pointer names", () => {
+    const { result } = run(program, {
+      code: { bytes: program, virtualAddress: 0x400000n },
+      indirectTargets: [0x400040n],
+    });
+    expect(result).toBe(0x2an);
+  });
+
+  it("traps when the pointer names something that is not a function this program translated", () => {
+    // the same program with no target list: nothing to compare the pointer against, so the call is the trap a jump to garbage is
+    expect(() => run(program, { code: { bytes: program, virtualAddress: 0x400000n } })).toThrow();
   });
 });
