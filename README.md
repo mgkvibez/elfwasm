@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 285
+**Tests:** 286
 
 ```bash
 npm ci && npm run verify
@@ -592,12 +592,23 @@ last bit shifted out, which is a fact about the bits that left rather than about
 so `jb` after a `sar` refuses by name. That is why the flag model records *how* flags were defined: `bt` writes the carry and leaves
 the rest undefined, a shift writes the rest and leaves the carry unmodelled, and a condition is answered only where it is defined.
 
-Where it stops now: a tail call out of a body into an earlier function. `0x40a830` calls `0x43b860` (`__tunable_set_val` in libc),
-which computes a tunable's address and ends in `jmp 0x43b760` (`do_tunable_update_val`), a function that starts *before* it. The walk
-that finds a body's extent was given a window beginning at the body, so a branch leaving that window backwards is refused rather than
-followed. The refusal names both readings, because from the bytes alone they look alike: a tail call into an earlier function, which
-needs the jump to become a call and a return, or a call that was aimed into the middle of another body. Following the evidence of the
-call itself, this one is the tail call.
+### A jump out of a body is a call and a return
+
+A compiler emits `jmp` where the source had a call at the end of a function: the arguments are already where SysV puts them, so
+reusing the frame is cheaper than making a new one. Such a jump reaches a function that starts *before* the body that jumps, so its
+bytes are not that body's and the extent walk, whose window begins at the body, cannot follow it.
+
+What it does instead is record it: the walk reaches the jump, sees a target outside its own window, and notes the address. The body's
+instruction list holds the jump as its last instruction, and the translator emits a `call` to the function at that address followed by
+`return`, which is what the two instructions together did. The target is then translated as a body of its own, like any other callee.
+
+Only a `jmp` is read this way. A conditional branch to a byte before the function's start still refuses by name, because a jump that
+might not be taken is not a handover: it means the extent is wrong, and translating it as a tail call would invent a return the
+program does not have.
+
+Where it stops now: `0x69e` into the function at `0x43c370`, which the tail call at `0x43b860` reaches. It is a jump through a register whose table cannot be read, the
+one shape where a hole in a body is evidence rather than a neighbour's bytes: the walk knows the body goes places it could not
+enumerate. Reading the table is the next piece.
 
 The cost of the dispatcher is worth stating: a body with any backward branch takes that path, so even a clean loop is expressed by
 naming blocks rather than as a WASM `loop`. The structured path is kept for the bodies that are trees, which is most of the small

@@ -60,17 +60,38 @@ function run(code: Uint8Array, entrySize: number, stackPages = 0): bigint {
 }
 
 describe("one function calling another", () => {
-  it("refuses a function whose first branch reaches a byte before its own start", () => {
+  it("refuses a conditional branch to a byte before the function's start", () => {
     /*
-     * call 0x0a ; ret ; nop nop nop nop ; jmp 0x06 ; ret
+     * call 0x0a ; ret ; nop nop nop nop ; jne 0x07 ; ret
      *
-     * The callee's own first branch reaches a byte four before its start, which is inside the caller: the address a call reached
-     * is the middle of another body rather than a function. A window that began at the callee would read that as the buffer
-     * ending, so the refusal names the address the branch reaches instead.
+     * A conditional branch reaches a byte before the callee's own start, which is inside the caller. Only a `jmp` out of a body is a
+     * tail call: a conditional branch out of it means the extent is wrong, so this refuses rather than translating. A window that
+     * began at the callee would read that as the buffer ending, so the refusal names the address the branch reaches instead.
      */
-    const code = Uint8Array.from(hex("e8 05 00 00 00 c3 90 90 90 90 e9 f7 ff ff ff c3"));
+    const code = Uint8Array.from(hex("e8 05 00 00 00 c3 90 90 90 90 75 fb c3"));
     const options = { code: { bytes: code, virtualAddress: 0x400000n }, codeAddress: 0x400000n };
     expect(() => translateProgram(code, "main", options)).toThrow(/before the function/);
+  });
+
+  it("translates a jump out of a body as a call and a return", () => {
+    /*
+     * A tail call: the body computes an argument and jumps to a function that starts earlier, which is what a compiler emits where
+     * the source had a call at the end of a function. The jumped-to function is its own body, reached only by that jump.
+     *
+     * 0x00: call 0x10 ; ret
+     * 0x08: mov %edi,%rax ; ret        <- the tail call's target, an earlier function
+     * 0x10: mov $7,%edi ; jmp 0x08
+     */
+    const code = region(
+      [
+        { at: 0x00, bytes: hex("e8 0b 00 00 00 c3 90 90") },
+        { at: 0x08, bytes: hex("89 f8 c3") },
+        { at: 0x0b, bytes: hex("90 90 90 90 90") },
+        { at: 0x10, bytes: hex("bf 07 00 00 00 e9 ee ff ff ff") },
+      ],
+      0x20,
+    );
+    expect(run(code, 0x06)).toBe(7n);
   });
 
   it("passes an argument in %rdi and reads the result out of %rax", () => {

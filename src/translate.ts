@@ -154,6 +154,15 @@ export interface TranslateOptions {
    * as a call target in the bytes, and the translation of a call through a pointer would have nothing to compare it against.
    */
   readonly indirectTargets?: readonly bigint[];
+
+  /**
+   * Jumps in this body that leave its own bytes, by instruction offset, holding the address each one reaches.
+   *
+   * A `jmp` out of a body is a call followed by a return: what it reaches is a function that starts elsewhere, and its answer is this
+   * function's answer. The body's instruction list cannot hold that target, because the target's bytes are not this body's, so the
+   * walk records it here.
+   */
+  readonly tailCalls?: ReadonlyMap<number, bigint>;
   /**
    * Answer `syscall` through the imported host function, which is `Machine` in `src/syscalls.ts`.
    *
@@ -1659,6 +1668,11 @@ function translateRange(
       continue;
     }
     if (instruction.op === "jmp") {
+      if (options.tailCalls?.has(instruction.offset) === true) {
+        out.push(...translateTailCall(instruction, options));
+        // a call and a return end the region as surely as the `ret` this jump replaced
+        return to;
+      }
       const target = indexOfOffset(instructions, branchTarget(instruction));
       const exit = scope.get(target);
       if (exit !== undefined) {
@@ -2359,6 +2373,8 @@ function translateRange(
 interface Body {
   readonly address: bigint;
   readonly instructions: readonly Instruction[];
+  /** The jumps in this body that leave its bytes, by offset, and where each one goes. */
+  readonly tailCalls: ReadonlyMap<number, bigint>;
 }
 
 /**
@@ -2377,7 +2393,7 @@ function functionExtent(
   bytes: Uint8Array,
   address: bigint,
   options: TranslateOptions = {},
-): readonly Instruction[] {
+): { readonly instructions: readonly Instruction[]; readonly tailCalls: ReadonlyMap<number, bigint> } {
   const decoded = new Map<number, Instruction>();
   // which instruction fell into which, which is how the three that build a jump table's address are found
   const previous = new Map<number, number>();
@@ -2409,6 +2425,8 @@ function functionExtent(
   };
 
   const reachable = new Set<number>();
+  // jumps out of the body, by offset, holding the address each one reaches
+  const tailCalls = new Map<number, bigint>();
   const work: number[] = [0];
   while (work.length > 0) {
     const offset = work.pop()!;
@@ -2420,7 +2438,17 @@ function functionExtent(
     if (instruction.op === "jmp") {
       const operand = instruction.operands[0];
       if (operand?.kind === "immediate") {
-        work.push(branchTarget(instruction));
+        const target = branchTarget(instruction);
+        if (target < 0) {
+          /*
+           * A jump to a byte before this body's first one. The window the walk was given begins at the body, so the target is not
+           * in it, and the function this body reached is one that starts earlier: a tail call. It is recorded and not followed,
+           * because its bytes belong to another function and walking them here would make this body claim them.
+           */
+          tailCalls.set(offset, address + BigInt(target));
+          continue;
+        }
+        work.push(target);
         continue;
       }
       /*
@@ -2579,15 +2607,17 @@ function functionExtent(
         "cannot be read, so the cases it names are unknown",
     );
   }
-  return ordered;
+  return { instructions: ordered, tailCalls };
 }
 
 /** True when a branch in the list goes to itself or backwards, which no nesting of blocks can express. */
-function needsDispatcher(instructions: readonly Instruction[]): boolean {
+function needsDispatcher(instructions: readonly Instruction[], options: TranslateOptions = {}): boolean {
   return instructions.some((instruction, index) => {
     if (!instruction.op.startsWith("j")) return false;
     // a jump whose target is a value lands in a block, and which one is decided by that value
     if (instruction.operands[0]?.kind !== "immediate") return true;
+    // a jump out of the body is a call and a return, which nests like a `ret` rather than like a branch
+    if (options?.tailCalls?.has(instruction.offset) === true) return false;
     const target = indexOfOffset(instructions, branchTarget(instruction));
     return target >= 0 && target <= index;
   });
@@ -2687,6 +2717,33 @@ function jumpTableTargets(
   return targets;
 }
 
+/**
+ * A `jmp` that leaves the body's own bytes, as a call and a return.
+ *
+ * A compiler emits exactly this for a function whose whole body is a call with the same arguments, and for a stub that computes an
+ * argument and hands over to a worker: there is a `jmp` where the source had a call at the end of a function, because reusing the
+ * frame is cheaper than making a new one. The two instructions do what the one did: the arguments are already where SysV puts them,
+ * the callee's answer lands in `%rax`, and returning it is the return the `jmp` replaced.
+ */
+function translateTailCall(instruction: Instruction, options: TranslateOptions): number[] {
+  const target = options.tailCalls?.get(instruction.offset);
+  if (target === undefined) {
+    throw new TranslateError(instruction.offset, "a tail call needs the address its jump reaches");
+  }
+  if (options.calls === undefined) {
+    throw new TranslateError(
+      instruction.offset,
+      "a tail call needs a program to call into: use translateProgram, which follows the target and translates it",
+    );
+  }
+  return [
+    OP.call,
+    ...unsigned(options.calls.indexOf(target, instruction) + (options.syscalls === true ? 1 : 0)),
+    ...globalGet(REGISTERS.indexOf("rax")),
+    OP.returnOp,
+  ];
+}
+
 /** The offset of the last instruction, which with its length is how many bytes the body covers. */
 function lastOffset(instructions: readonly Instruction[]): number {
   return instructions.at(-1)?.offset ?? 0;
@@ -2711,6 +2768,11 @@ function blockStarts(instructions: readonly Instruction[], bodyAddress: bigint, 
         const targetIndex = instructions.findIndex((entry) => entry.offset === target);
         if (targetIndex >= 0) starts.add(targetIndex);
       }
+      continue;
+    }
+    // a jump out of the body lands in no block of it: what it reaches is a function of its own, called and returned from
+    if (options.tailCalls?.has(instruction.offset) === true) {
+      starts.add(index + 1);
       continue;
     }
     const target = indexOfOffset(instructions, branchTarget(instruction));
@@ -2776,6 +2838,8 @@ function translateAsBlocks(instructions: readonly Instruction[], options: Transl
         );
       }
       out.push(OP.unreachable, OP.end);
+    } else if (last.op === "jmp" && options.tailCalls?.has(last.offset) === true) {
+      out.push(...translateTailCall(last, options));
     } else if (last.op === "jmp") {
       out.push(...i64Const(BigInt(blockAt(indexOfOffset(instructions, branchTarget(last))))), ...localSet(PC));
     } else if (last.op.startsWith("j")) {
@@ -2847,7 +2911,7 @@ function bodyOf(
     }
 
   }
-  if (needsDispatcher(resolved)) {
+  if (needsDispatcher(resolved, options)) {
     // a graph rather than a tree: blocks and a block number, not nesting. That body ends in `unreachable`, so it is complete.
     body.push(...translateAsBlocks(resolved, options));
     return body;
@@ -2906,13 +2970,17 @@ function programOf(
   const order: Body[] = [];
   const known = new Map<string, number>();
 
-  const register = (address: bigint, instructions: readonly Instruction[]): number => {
+  const register = (
+    address: bigint,
+    instructions: readonly Instruction[],
+    tailCalls: ReadonlyMap<number, bigint> = new Map(),
+  ): number => {
     const key = address.toString();
     const seen = known.get(key);
     if (seen !== undefined) return seen;
     const index = order.length;
     known.set(key, index);
-    order.push({ address, instructions });
+    order.push({ address, instructions, tailCalls });
     return index;
   };
 
@@ -2938,7 +3006,8 @@ function programOf(
       }
       const body = region.bytes.subarray(Number(offset));
       try {
-        return register(address, functionExtent(body, address, options));
+        const walked = functionExtent(body, address, options);
+        return register(address, walked.instructions, walked.tailCalls);
       } catch (error) {
         /*
          * The walk's own refusals name the function they are about, but one thrown while decoding a byte does not: the offset it
@@ -2966,7 +3035,9 @@ function programOf(
     bodies.length = 0;
     for (let index = 0; index < order.length; index += 1) {
       const body = order[index]!;
-      bodies.push(bodyOf(body.instructions, { ...withCalls, functionAddress: body.address }));
+      bodies.push(
+        bodyOf(body.instructions, { ...withCalls, functionAddress: body.address, tailCalls: body.tailCalls }),
+      );
     }
   }
 
