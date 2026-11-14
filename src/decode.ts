@@ -201,7 +201,7 @@ interface Rex {
  * The prefix is what makes them vector instructions rather than the MMX or packed-float instructions the same bytes name without
  * it, so a byte that is not in this set is refused by name rather than read as something it is not.
  */
-const VECTOR_WITH_66 = new Set([0x62, 0x6c, 0x6e, 0x7e, 0xd6, 0x6f, 0x7f, 0x28, 0x29, 0xdb, 0xdf, 0xeb, 0xef]);
+const VECTOR_WITH_66 = new Set([0x62, 0x6c, 0x6e, 0x76, 0x7e, 0xd6, 0x6f, 0x7f, 0x28, 0x29, 0xdb, 0xdf, 0xeb, 0xef]);
 
 function isSseOpcode(second: number): boolean {
   return (
@@ -731,6 +731,20 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
         throw new DecodeError(offset, "punpcklqdq from memory is not in the decoded subset: only a vector register source is");
       }
       return finish("punpcklqdq", [
+        vectorOperand(modrm.regField, rex.r, "lo", 64),
+        vectorOperand(modrm.rmField ?? 0, rex.b, "lo", 64),
+      ]);
+    }
+    if (vector && second === 0x76) {
+      /*
+       * `pcmpeqd`: four dword lanes compared, each becoming all ones when the pair was equal and zero when it was not. The source
+       * is a vector register and not memory, since 16 bytes read from memory would have to be two loads this decoder does not emit.
+       */
+      const modrm = decodeModRm(cursor, rex, 64, segment);
+      if (modrm.rm.kind === "memory") {
+        throw new DecodeError(offset, "pcmpeqd from memory is not in the decoded subset: only a vector register source is");
+      }
+      return finish("pcmpeqd", [
         vectorOperand(modrm.regField, rex.r, "lo", 64),
         vectorOperand(modrm.rmField ?? 0, rex.b, "lo", 64),
       ]);

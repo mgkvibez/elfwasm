@@ -105,6 +105,10 @@ describe("refusals", () => {
     throw new Error("expected the translator to refuse these bytes");
   };
 
+  it("refuses a pcmpeqd whose source is memory, since sixteen bytes are two loads", () => {
+    expect(() => run(hex("66 0f 76 45 00 c3"))).toThrow(/pcmpeqd from memory/);
+  });
+
   it("refuses an adc with no comparison before it, since there is no carry to add", () => {
     expect(refuse(hex("48 83 d1 00 c3")).message).toContain("adc reads the carry");
   });
@@ -297,6 +301,36 @@ describe("the exchange", () => {
     // mov $1,%eax ; cmp $1,%eax ; xchg %ecx,%eax ; jne skip ; mov $42,%eax ; ret
     // the comparison is still the last thing that wrote the flags, so the jump is not taken and the answer is 42
     expect(run(hex("b8 01 00 00 00 83 f8 01 87 c8 75 05 b8 2a 00 00 00 c3"))).toBe(0x2an);
+  });
+});
+
+describe("a dword compare on sixteen bytes", () => {
+  /*
+   * `pcmpeqd` compares four dword lanes and makes each all ones or zero, which is how a compiler turns sixteen bytes into a mask. A
+   * vector register here is two i64 halves, so the comparison is two halves, each an exclusive or: a lane is equal exactly where that
+   * lane of the xor is zero. `movq` carries a half out so the test can see it.
+   */
+  const compare = (left: string, right: string): Uint8Array =>
+    hex(`48 b8 ${left} 48 b9 ${right} 66 48 0f 6e c0 66 48 0f 6e c9 66 0f 76 c1 66 48 0f 7e c0 c3`);
+
+  it("makes a lane all ones when the two dwords are equal", () => {
+    // the four zero bytes are the high dword of each half: 5 against 5 in both lanes, so both are all ones and the half reads -1
+    expect(run(compare("05 00 00 00 05 00 00 00", "05 00 00 00 05 00 00 00"))).toBe(-1n);
+  });
+
+  it("makes a lane zero when they differ", () => {
+    // low lanes 5 and 6 differ, high lanes 5 and 5 are equal: the low dword is zero and the high one is all ones
+    expect(run(compare("05 00 00 00 05 00 00 00", "06 00 00 00 05 00 00 00"))).toBe(-4294967296n);
+  });
+
+  it("answers each lane on its own, so one difference does not clear the other", () => {
+    // low lanes both 5, high lanes 1 and 2: the equal low lane stays all ones while the other lane goes to zero
+    expect(run(compare("05 00 00 00 01 00 00 00", "05 00 00 00 02 00 00 00"))).toBe(0xffffffffn);
+  });
+
+  it("makes a lane all ones when its low dword is all ones on both sides", () => {
+    // 0xffffffff against 0xffffffff: a mask computed from the sign rather than from equality would answer zero here
+    expect(run(compare("ff ff ff ff 00 00 00 00", "ff ff ff ff 00 00 00 00"))).toBe(-1n);
   });
 });
 

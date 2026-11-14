@@ -80,6 +80,13 @@ const ADDR = 2;
 const SSE_A = 4;
 const SSE_B = 5;
 /**
+ * Where `pcmpeqd` keeps the exclusive or of two halves it is comparing.
+ *
+ * A dword lane is equal exactly where the corresponding lane of `a ^ b` is zero, so one xor per half is the whole comparison: the two
+ * halves go into `SSE_A` and `SSE_B`, the xor into this, and each lane is then tested for zero on its own.
+ */
+const SSE_C = 21;
+/**
  * Where a division keeps its long-division state.
  *
  * `%rdx:%rax` is a 128-bit dividend and WASM has no divide at that width, so `div` and `idiv` are a bit at a time: the remaining
@@ -122,7 +129,7 @@ const EXCH_B = 20;
  * its own beyond which block to run next. This local is that.
  */
 const PC = 3;
-const LOCAL_COUNT = 21;
+const LOCAL_COUNT = 22;
 
 /** The imported syscall's function index, which is 0: an import comes before every function the module defines. */
 const SYSCALL_INDEX = 0;
@@ -2624,6 +2631,47 @@ function translateRange(
       index += 1;
       continue;
     }
+    if (instruction.op === "pcmpeqd") {
+      /*
+       * Four dword lanes compared: each becomes all ones when the pair was equal and zero when it was not, which is how a compiler
+       * turns sixteen bytes into a mask.
+       *
+       * The halves are compared one at a time, each as a single xor: a lane is equal exactly where that lane of the xor is zero, so
+       * the comparison is two lane tests per half rather than four separate dword extractions. The low half is written before the
+       * high half is read, which is safe because a write to one half leaves the other alone, and the source is never written.
+       */
+      const [destination, source] = instruction.operands;
+      if (destination === undefined || source === undefined || !isVectorHalf(destination) || !isVectorHalf(source)) {
+        throw new TranslateError(instruction.offset, "pcmpeqd takes two vector registers");
+      }
+      // zero minus the comparison, which is all ones when the lanes were equal: the zero has to be pushed first, or the subtraction
+      // reads the other way round and answers one for equal
+      const lane = (shift: bigint): number[] => [
+        ...i64Const(0n),
+        ...localGet(SSE_C),
+        ...(shift === 0n ? [] : [...i64Const(shift), OP.i64ShrU]),
+        ...i64Const(0xffffffffn),
+        OP.i64And,
+        OP.i64Eqz,
+        OP.i64ExtendI32U,
+        OP.i64Sub,
+        ...i64Const(0xffffffffn),
+        OP.i64And,
+      ];
+      for (const half of [destination, otherHalf(destination, instruction)]) {
+        const from = half === destination ? source : otherHalf(source, instruction);
+        out.push(
+          ...read(half, instruction), ...localSet(SSE_A),
+          ...read(from, instruction), ...localSet(SSE_B),
+          ...localGet(SSE_A), ...localGet(SSE_B), OP.i64Xor, ...localSet(SSE_C),
+          ...lane(0n),
+          ...lane(32n), ...i64Const(32n), OP.i64Shl, OP.i64Or,
+          ...write(half, instruction),
+        );
+      }
+      index += 1;
+      continue;
+    }
     if (instruction.op === "punpcklqdq") {
       /*
        * `punpcklqdq %xmm1, %xmm0` interleaves the low quadwords, and since a quadword is exactly a half of the register, that is a
@@ -3083,6 +3131,7 @@ function registerNumberOf(name: string): number | undefined {
 /** The operations whose first operand is the register they write, which is what makes one instruction the definition of another. */
 const WRITING_OPERATIONS = new Set([
   "mov", "movsxd", "movzx", "movsx", "lea", "add", "sub", "and", "or", "xor", "adc", "sbb", "shl", "shr", "sar", "imul", "inc",
+  "pcmpeqd",
   "dec", "neg", "not", "pop", "xchg",
 ]);
 

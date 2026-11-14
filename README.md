@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 338
+**Tests:** 343
 
 ```bash
 npm ci && npm run verify
@@ -104,14 +104,15 @@ decoder to place every one of the fixture's 68 instructions at the offset objdum
 wrong instruction length cannot pass: a decoder that is one byte out still returns plausible looking instructions, just
 not the ones the compiler emitted, and everything after that point is out of phase.
 
-Everything outside the subset is refused by offset, never skipped: an SSE opcode, a 16-bit operand size, a lock or repeat
-prefix, `mul`/`div` (which read and write implicit registers), the rotates, `movzx` from a 16-bit register, a truncated
-instruction, and the `lea` form that cannot exist are each named.
+Everything outside the subset is refused by offset, never skipped: an SSE opcode that is not in the subset, a 16-bit operand
+size, a repeat prefix, the rotates, `movzx` from a 16-bit register, a truncated instruction, and the `lea` form that cannot
+exist are each named.
 
-Measured on `/bin/ls`, the decoder accounts for the first 57 instructions of `.text` and then refuses at offset `0x10a` on
-`66 0f 6f`, which is `movdqa`: the first SSE instruction in glibc's startup path. That refusal is the claim. Every byte
-before it is decoded, and the instruction it stops on is named as SSE rather than as a 16-bit operand size, because those
-send a reader to different places in the architecture.
+Measured on `/bin/ls`, the decoder accounts for the first 4530 instructions of `.text` and then refuses at offset `0x49a8` on
+`f3 48 ab`, which is `rep stos %rax,(%rdi)`: the repeat prefix is the part outside the subset. That refusal is the claim.
+Every byte before it is decoded, and the instruction it stops on is named as a repeat prefix rather than as something else,
+because a reader sent to the wrong part of the architecture will not find it. Two earlier measurements stood in this
+paragraph and both are gone: `movdqa` at `0x10a` was the first, and the vector moves are in the subset now.
 
 ## The translator
 
@@ -391,7 +392,7 @@ they sit after the general file in the global section. Naming a half is what mak
 register is a register that holds 64 bits, so `movq %xmm0, 0x20(%rsp)` is the store it looks like and goes through the existing
 `mov`-to-memory path with no new address arithmetic.
 
-Four encodings are in the subset, and they are the ones a startup uses:
+Encodings in the subset, and they are the ones a startup uses:
 
 1. `66 0f 6e`, `movd` into a vector register: 32 bits, or 64 with REX.W, from a general register or memory. The whole 128 bits are
    written, because the upper half is cleared, which is a second write of zero rather than a special case.
@@ -400,6 +401,11 @@ Four encodings are in the subset, and they are the ones a startup uses:
    own low half or'ed with a dword of the source's, shifted up. Both halves are read into scratch locals first, because the
    destination's low half is written after its high half has been computed from it.
 4. `66 0f d6`, `movq` out to memory: the low 64 bits of a vector register.
+5. `66 0f 76`, `pcmpeqd`: four dword lanes compared, each becoming all ones when the pair was equal and zero when it was not. A lane
+   is equal exactly where that lane of `a ^ b` is zero, so one exclusive or per half is the whole comparison, and the answer is two
+   lane tests per half rather than four dword extractions. The zero a lane tests against has to be pushed before the comparison, or
+   the subtraction reads the other way round and answers one for equal. This is the first of the compare-and-mask family, and the
+   first SSE instruction the walk over glibc reached outside the startup.
 
 `f3 0f 7e` is the load that mirrors it: `movq` into a vector register from memory or from another one, with the upper half cleared.
 The same two opcode bytes under `0x66` are the store, so the prefix is what decides which direction is meant.
