@@ -107,13 +107,22 @@ const INDIRECT = 17;
 /** The carry a `sbb` subtracts, worked out from the comparison the flags still hold. */
 const SBB_CARRY = 18;
 /**
+ * Where an `xchg` keeps the two values it is about to swap.
+ *
+ * Neither may be `CMP_A` or `CMP_B`. A branch is not decided where the comparison is, it is decided where the branch is, out of those
+ * two locals: so an exchange that borrowed them would change what a `jne` after an earlier `cmp` answers. That is the bug the first
+ * test written for this caught, and the swap is not a comparison in any case.
+ */
+const EXCH_A = 19;
+const EXCH_B = 20;
+/**
  * Where the block a body is executing is recorded, for a body whose control flow is not a tree.
  *
  * Registers are globals and a comparison's operands are locals, so a block of instructions that begins anywhere needs no state of
  * its own beyond which block to run next. This local is that.
  */
 const PC = 3;
-const LOCAL_COUNT = 19;
+const LOCAL_COUNT = 21;
 
 /** The imported syscall's function index, which is 0: an import comes before every function the module defines. */
 const SYSCALL_INDEX = 0;
@@ -1409,6 +1418,57 @@ function translateConditionalMove(instruction: Instruction): number[] {
 const ACCUMULATOR: Readonly<Record<16 | 32 | 64, RegisterName>> = { 16: "ax", 32: "rax", 64: "rax" };
 
 /**
+ * `xchg`: both operands are written, and each one's old value.
+ *
+ * The two values have to be read before either is written, so both go into locals first and are then written back in the opposite
+ * places: a register exchange done the obvious way, `write a (read b)`, passes its operand through `%rax` and destroys the value that
+ * was on its way to the other side. The flags are not touched, which is the other half of what makes this the write half of a guard.
+ *
+ * There is no fault for the pair to be non-swappable: `xchg` cannot name two memory operands, because the encoding has one memory
+ * operand at most, so a memory destination always comes with a register source.
+ */
+function translateExchange(instruction: Instruction): number[] {
+  const [destination, source] = instruction.operands;
+  if (destination === undefined || source === undefined) {
+    throw new TranslateError(instruction.offset, "xchg needs two operands");
+  }
+  if (destination.kind !== "memory" && destination.kind !== "reg") {
+    throw new TranslateError(instruction.offset, `xchg with a ${destination.kind} destination is not an encoding`);
+  }
+  if (source.kind !== "reg") {
+    throw new TranslateError(instruction.offset, `xchg with a ${source.kind} source is not an encoding`);
+  }
+  // the register always carries the width; a memory destination only does when the encoding said so, and the register's is the
+  // same one, since the two operands of an exchange are the same size by definition
+  const width = destination.bits ?? source.bits;
+  const mask = (code: number[]): number[] => (width === 16 ? [...code, ...i64Const(0xffffn), OP.i64And] : code);
+  const stored = (code: number[]): number[] => (width === 64 ? code : [...code, NARROW_32]);
+  // a byte of memory is read through the byte load, which sign-extends: the low eight bits are what a byte store writes back, and
+  // nothing here reads any of the others
+  const current =
+    destination.kind !== "memory"
+      ? mask(read(destination, instruction))
+      : width === 8
+        ? loadByteFromMemory(destination, instruction)
+        : loadFromMemory(destination, width, instruction);
+  return [
+    // the destination's value first, because the write below overwrites it
+    ...current,
+    ...localSet(EXCH_A),
+    ...mask(read(source, instruction)),
+    ...localSet(EXCH_B),
+    // the register's old value goes into the destination, and the destination's old value into the register. The memory write comes
+    // first on purpose: `xchg %rcx,(%rcx)` computes its address from the register's old value, which is still there when the store is
+    // emitted and gone by the time the register is written.
+    ...(destination.kind === "memory"
+      ? storeToMemory(destination, stored([...localGet(EXCH_B)]), width, instruction)
+      : [...localGet(EXCH_B), ...write(destination, instruction)]),
+    ...localGet(EXCH_A),
+    ...write(source, instruction),
+  ];
+}
+
+/**
  * `cmpxchg`: one instruction that is a comparison and a choice.
  *
  * It compares the accumulator with the destination, and then exactly one of two writes happens. Equal, the source goes where the
@@ -1978,6 +2038,12 @@ function translateRange(
       flags.width = width;
       flags.borrows = false;
       flags.kind = "bit";
+      index += 1;
+      continue;
+    }
+    if (instruction.op === "xchg") {
+      // the flags survive it, so whatever the branch model knew before it is still true after it
+      out.push(...translateExchange(instruction));
       index += 1;
       continue;
     }

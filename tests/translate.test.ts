@@ -278,6 +278,24 @@ describe("a comparison at sixteen bits", () => {
   });
 });
 
+describe("the exchange", () => {
+  it("swaps two registers, each getting the other's old value", () => {
+    // mov $1,%eax ; mov $2,%ecx ; xchg %ecx,%eax ; sub %ecx,%eax ; ret -> 2 - 1, which is 1 and not -1
+    expect(run(hex("b8 01 00 00 00 b9 02 00 00 00 87 c8 29 c8 c3"))).toBe(1n);
+  });
+
+  it("swaps the accumulator with the register the opcode names", () => {
+    // mov $1,%eax ; mov $2,%ecx ; xchg %eax,%ecx (0x91) ; mov %ecx,%eax ; ret -> the accumulator's old value
+    expect(run(hex("b8 01 00 00 00 b9 02 00 00 00 91 89 c8 c3"))).toBe(1n);
+  });
+
+  it("leaves the flags alone, so a branch before it still answers", () => {
+    // mov $1,%eax ; cmp $1,%eax ; xchg %ecx,%eax ; jne skip ; mov $42,%eax ; ret
+    // the comparison is still the last thing that wrote the flags, so the jump is not taken and the answer is 42
+    expect(run(hex("b8 01 00 00 00 83 f8 01 87 c8 75 05 b8 2a 00 00 00 c3"))).toBe(0x2an);
+  });
+});
+
 describe("the compare and swap", () => {
   /*
    * The shape a one-time guard is written in: compare, and write only if nothing has claimed it yet. The register form is used

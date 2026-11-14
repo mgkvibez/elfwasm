@@ -71,7 +71,7 @@ function vectorOperand(code: number, extended: boolean, half: "lo" | "hi", bits:
  * else: on a register destination, or on an instruction that only reads, it is an invalid-opcode fault on the processor. Refused
  * rather than dropped, because dropping it would translate a program that cannot run.
  */
-const LOCKABLE: ReadonlySet<string> = new Set(["cmpxchg", "xadd", "add", "sub", "and", "or", "xor", "inc", "dec"]);
+const LOCKABLE: ReadonlySet<string> = new Set(["cmpxchg", "xadd", "xchg", "add", "sub", "and", "or", "xor", "inc", "dec"]);
 
 export type Operand =
   | { readonly kind: "reg"; readonly name: RegisterName; readonly bits: 8 | 16 | 32 | 64 }
@@ -571,7 +571,12 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
     return { offset, length: cursor.index - offset, op, operands, ...(locked ? { lock: true as const } : {}) };
   };
 
-  if (opcode === 0x90) return finish("nop", []);
+  if (opcode === 0x90) {
+    // `nop` is `xchg %eax,%eax` with nothing to swap, and the same encoding with REX.B is `xchg %eax,%r8d`: the one byte that means
+    // two things, told apart by whether the register extension was set
+    if (!rex.b) return finish("nop", []);
+    return finish("xchg", [registerOperand(0, false, bits), registerOperand(8, false, bits)]);
+  }
   if (opcode === 0xc3) return finish("ret", []);
   if (opcode === 0x0f) {
     const second = byteAt(cursor);
@@ -887,6 +892,23 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
     const modrm = decodeModRm(cursor, rex, bits, segment);
     const register = registerOperand(modrm.regField, rex.r, bits);
     return opcode === 0x89 ? finish("mov", [modrm.rm, register]) : finish("mov", [register, modrm.rm]);
+  }
+  if (opcode === 0x86 || opcode === 0x87) {
+    /*
+     * `xchg`, which is `mov` with both directions at once: the r/m operand and the register field swap their values, and neither
+     * is a destination in the sense the moves have one. The operand size picks the widths `0x86` being bytes and `0x87` taking the
+     * prefix, and nothing about the flags changes, which is what makes it usable as the store half of a guard.
+     */
+    const modrm = decodeModRm(cursor, rex, opcode === 0x86 ? 8 : bits, segment);
+    const register =
+      opcode === 0x86
+        ? registerOperand(modrm.regField, rex.r, 8, rex.present)
+        : registerOperand(modrm.regField, rex.r, bits);
+    return finish("xchg", [modrm.rm, register]);
+  }
+  if (opcode >= 0x91 && opcode <= 0x97) {
+    // `xchg %eax,%ecx` and its six siblings: the accumulator and the register the opcode names, at the operand size
+    return finish("xchg", [registerOperand(0, false, bits), registerOperand(opcode - 0x90, rex.b, bits)]);
   }
   if (opcode === 0x31 || opcode === 0x33) {
     const modrm = decodeModRm(cursor, rex, bits, segment);

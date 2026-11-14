@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 315
+**Tests:** 318
 
 ```bash
 npm ci && npm run verify
@@ -117,7 +117,7 @@ send a reader to different places in the architecture.
 
 `translate` takes the decoder's instructions and emits one WASM function per x86-64 function: no parameters, one `i64`
 result, sixteen `i64` globals for the sixteen registers in encoding order. The subset is `mov`, `lea`, `movzx`, `movsx`,
-`movsxd`, `add`, `sub`, `xor`, `and`, `or`, `imul` at 32 and 64 bits, `cmp` and `test`, `cmpxchg`, `setcc`, the ten conditional branches
+`movsxd`, `add`, `sub`, `xor`, `and`, `or`, `imul` at 32 and 64 bits, `cmp` and `test`, `cmpxchg`, `xchg`, `setcc`, the ten conditional branches
 that need only zf, sf, cf and of, `jmp` in both directions, loops, `call`, `syscall`, and `ret`, which returns `rax`.
 
 Flags are never materialised as variables. `cmp` and `test` leave their operands in two extra locals and a `jcc` becomes
@@ -531,6 +531,14 @@ neither is speculative.
 The flags are the comparison's own, so the two operands are left in the comparison locals and the mismatch arm reads its value from the
 second of them: `jne` after it says which of the two happened, and so do `ja` and `js`, because Intel defines the whole flag set from the
 comparison rather than the zero flag alone.
+
+`xchg` is the other half of the same idiom, and the one thing it needs that the other two-operand instructions do not: both values have
+to be read before either is written, so they go into two locals first and are then written back into the opposite places. A swap spelled
+the obvious way, `write a (read b)`, routes its value through `%rax` and destroys the one on its way to the other side.
+
+Those two locals had to be their own. A branch is not decided where the comparison is, it is decided where the branch is, out of the two
+comparison locals: an exchange that borrowed those would change what a `jne` after an earlier `cmp` answers. The first test written for
+`xchg` caught exactly that, and the rule it broke is now written next to the locals it protects.
 
 The `lock` prefix is read and recorded rather than thrown away, and there is one thread here, so it changes no answer: nothing can run
 between the comparison and the write it belongs to. What it is not allowed to do is land on an instruction it cannot belong to, since that
