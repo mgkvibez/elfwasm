@@ -93,6 +93,47 @@ function refusal(bytes: Uint8Array, options: { codeAddress?: bigint } = {}): str
   throw new Error("expected a refusal, and the translation succeeded");
 }
 
+describe("the read-modify-write of a byte or a word", () => {
+  /*
+   * The narrow forms of `or %eax,(%rbx)`, which a walk of glibc needed next: a byte or a word is read, folded together with a register,
+   * and written back to the same place. The width is what makes these different from the word and doubleword forms, and the mask is what
+   * makes the flags right afterwards.
+   */
+  it("folds a byte register into a byte of memory and writes the byte back", () => {
+    // mov $1,%al ; or %al,0x400100 ; ret, with the byte there holding 0x40
+    const { result, buffer } = run(hex("b0 01 08 04 25 00 01 40 00 c3"), { fill: 0x40 });
+    expect(buffer[0x100]).toBe(0x41);
+    // the register is the source, so it is the one thing this write leaves alone
+    expect(result).toBe(1n);
+  });
+
+  it("reads a byte without its sign, so a byte result of zero is zero", () => {
+    // mov $0x80,%al ; xor %al,0x400100 ; jne +5 ; mov $0x2a,%eax ; ret, with the byte holding 0x80
+    // the answer is 42 only if the two equal bytes cancelled: a sign-extended operand pair would leave 0xffffff00 and take the jump
+    expect(run(hex("b0 80 30 04 25 00 01 40 00 75 05 b8 2a 00 00 00 c3"), { fill: 0x80 }).result).toBe(0x2an);
+  });
+
+  it("takes the sign of a byte difference from bit 7 of the byte", () => {
+    // mov $1,%al ; sub %al,0x400100 ; js +5 ; mov $0x2a,%eax ; ret, with the byte holding 0x80
+    // 0x80 minus 1 is 0x7f, which is positive, so the jump is not taken and the answer is 42. Computing the difference at 64 bits from
+    // sign-extended operands would answer -129 and take it.
+    const { result, buffer } = run(hex("b0 01 28 04 25 00 01 40 00 78 05 b8 2a 00 00 00 c3"), { fill: 0x80 });
+    expect(result).toBe(0x2an);
+    expect(buffer[0x100]).toBe(0x7f);
+  });
+
+  it("writes a word back as two bytes and leaves the bytes above it alone", () => {
+    // movw $0x1234,0x400100 ; mov $1,%cx ; add %cx,0x400100 ; ret
+    // the word becomes 0x1235, and the byte above it is still 0x40: a two-byte store writes two bytes
+    const { buffer } = run(hex("66 c7 04 25 00 01 40 00 34 12 66 b9 01 00 66 01 0c 25 00 01 40 00 c3"), {
+      fill: 0x40,
+    });
+    expect(buffer[0x100]).toBe(0x35);
+    expect(buffer[0x101]).toBe(0x12);
+    expect(buffer[0x102]).toBe(0x40);
+  });
+});
+
 describe("stores and loads", () => {
   it("writes through the caller's memory and reads the value back into a register", () => {
     // movq $0x2a, 0x400100 ; mov 0x400100, %rax ; ret

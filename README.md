@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 318
+**Tests:** 322
 
 ```bash
 npm ci && npm run verify
@@ -519,7 +519,9 @@ signed opcodes answer it: `jl` after `cmpw $0,%ax` with `0x8000` is taken, which
 `js` after a `testw` of the same value is taken for the same reason. Reading two bytes from memory for such an operand, rather than eight,
 matters for more than correctness: a word at the end of a page is a fault to a processor that read eight.
 
-16-bit arithmetic is still refused by name, because its flags are 16 bits wide and this translator computes them at 64.
+16-bit arithmetic is still refused by name in a register, because its flags are 16 bits wide and this translator computes them at 64.
+In memory it is translated, through the read-modify-write path, where the result is masked to its own width and the conditions were
+taught to read a word at the width the memory left behind.
 
 ### The compare and swap
 
@@ -637,6 +639,16 @@ The address goes on the stack before the value, because that is the order `store
 the same two locals a register-form `or` uses: its zero flag describes the value it just wrote, not the two operands. `sub` is the one
 that differs, and it differs the same way in both directions: its flags describe the word minus the register, which is exactly what a
 `cmp` computes, so its two operands are kept and the difference is rebuilt from them.
+
+A byte or a word in that direction is the same shape with three width-dependent parts, and the width is the whole difficulty. The load
+does *not* sign-extend, because this is a value about to be computed on rather than compared: `xor` of a byte `0x80` with a register
+holding `0x80` is zero, and a sign-extended pair says 0xffffff00, which is not. The result is then masked to its own width before it is
+written, and the same mask is what the flags are read from afterwards.
+
+That makes the flags narrower than every other flag set here, so a condition learned to answer at eight bits: both operands masked for
+the unsigned conditions, where `0xff` is above `0x01`, and sign-extended from bit 7 for the signed ones. The sign of a byte difference
+takes one more step than the sign of a byte value does: the difference is masked to eight bits *before* its sign is read, because
+`0x80` minus 1 is `0x7f`, which is positive, and subtracting at 64 bits from sign-extended operands would answer -129 instead.
 
 ### Shifts, and a flag about bits that left
 

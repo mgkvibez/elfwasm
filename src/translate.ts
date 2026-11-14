@@ -1188,8 +1188,10 @@ function translateUnary(instruction: Instruction): { code: number[]; width?: 16 
  * the register form sets them: `sub` keeps its two operands, because its flags describe the difference the way a `cmp` does, and
  * every other operation keeps its result against zero, because `or`'s zero flag describes the value it just wrote.
  *
- * A byte into memory refuses by name: a byte operand is sign-extended here for the sake of the flags, and a store that has to write
- * one byte of a word it read the same way is a separate question from this one.
+ * A byte or a word into memory is the narrower version of the same thing, and the width decides three things rather than one: the load
+ * does not sign-extend (this is a value being computed on, not a value being compared), the result is masked to its own width before it
+ * is written, and the mask is also what the flags are then read from. Sign-extending instead would be right for `or` and wrong for `xor`:
+ * `xor` of `0x80` with `0x80` is zero, and a sign-extended operand pair says the sign is set.
  */
 function translateIntoMemory(
   instruction: Instruction,
@@ -1201,19 +1203,34 @@ function translateIntoMemory(
     throw new TranslateError(instruction.offset, `${instruction.op} into a ${destination.kind} is not a memory operation`);
   }
   const width = destination.bits;
-  if (width !== 32 && width !== 64) {
+  if (width !== 8 && width !== 16 && width !== 32 && width !== 64) {
     throw new TranslateError(instruction.offset, `a ${width}-bit ${instruction.op} into memory is not translated yet`);
   }
   const opcodes = BINARY[op];
-  const load = loadFromMemory(destination, width, instruction);
+  // a byte is read masked rather than sign-extended, which is the one place a byte operand is not read for its sign: the value is
+  // about to be computed on and then masked again, so the sign would only be a fact about the byte above it
+  const load =
+    width === 8
+      ? [...loadByteFromMemory(destination, instruction), ...i64Const(0xffn), OP.i64And]
+      : loadFromMemory(destination, width, instruction);
   const address = (): number[] => addressOf(destination, instruction);
-  const store = width === 64 ? OP.i64Store : OP.i32Store;
-  // the value the store writes: a 32-bit store pops an i32, and everything here computes at 64
+  const store = { 8: OP.i32Store8, 16: OP.i32Store16, 32: OP.i32Store, 64: OP.i64Store }[width];
+  // the value the store writes: every store below 64 bits pops an i32, and everything here computes at 64
   const stored = (code: number[]): number[] => (width === 64 ? code : [...code, NARROW_32]);
+  /** The result kept at its own width, which is what both the store and the flags are read from. */
+  const truncated = (code: number[]): number[] =>
+    width === 8 ? [...code, ...i64Const(0xffn), OP.i64And] : width === 16 ? [...code, ...i64Const(0xffffn), OP.i64And] : code;
   const combine =
     width === 64
       ? [...load, ...operandCode64(source, instruction), opcodes.bits64]
-      : [...load, NARROW_32, ...operandCode64(source, instruction), NARROW_32, opcodes.bits32, WIDEN_32];
+      : width === 8 || width === 16
+        ? truncated([
+            ...load,
+            ...operandCode64(source, instruction),
+            ...(width === 8 ? [...i64Const(0xffn), OP.i64And] : [...i64Const(0xffffn), OP.i64And]),
+            opcodes.bits64,
+          ])
+        : [...load, NARROW_32, ...operandCode64(source, instruction), NARROW_32, opcodes.bits32, WIDEN_32];
   if (!FLAG_SETTING.has(op)) return [...address(), ...stored(combine), store, ...memarg(0)];
   if (op !== "sub") {
     /*
@@ -1246,7 +1263,9 @@ function translateIntoMemory(
     ...operand,
     ...localSet(CMP_B),
     ...address(),
-    ...stored([...localGet(CMP_A), ...localGet(CMP_B), OP.i64Sub]),
+    // the difference is truncated to the destination's own width before it is written; the flags are read back from the two operands
+    // themselves, so this mask is about the byte or the word and not about the comparison
+    ...stored(truncated([...localGet(CMP_A), ...localGet(CMP_B), OP.i64Sub])),
     store,
     ...memarg(0),
   ];
@@ -1600,6 +1619,9 @@ function signExtend16(value: number[]): number[] {
   return [...value, ...i64Const(48n), OP.i64Shl, ...i64Const(48n), OP.i64ShrS];
 }
 
+/** The widths a comparison is made at. A byte is the narrowest, and it arrives from a byte read-modify-write. */
+type CompareWidth = 8 | 16 | 32 | 64;
+
 /**
  * Both operands of the last comparison, at the width it was made, ready for one comparison opcode.
  *
@@ -1607,8 +1629,16 @@ function signExtend16(value: number[]): number[] {
  * `0x7fff` and both are below every value a wider register holds. A signed condition needs the sign of bit 15 and not of bit 63, so
  * the two bits are swapped first and the 64-bit signed opcodes then answer it.
  */
-function comparisonOperands(width: 16 | 32 | 64, signed = false): number[] {
+function comparisonOperands(width: CompareWidth, signed = false): number[] {
   if (width === 64) return [...localGet(CMP_A), ...localGet(CMP_B)];
+  if (width === 8) {
+    // a byte is masked to eight bits for the unsigned conditions, the same rule a word follows at bit 15: `0xff` is above `0x01`
+    // and neither is negative until a signed condition asks for the sign of bit 7
+    const mask = (code: number[]): number[] => [...code, ...i64Const(0xffn), OP.i64And];
+    const left = mask([...localGet(CMP_A)]);
+    const right = mask([...localGet(CMP_B)]);
+    return signed ? [...signExtend8(left), ...signExtend8(right)] : [...left, ...right];
+  }
   if (width === 16) {
     const left = [...localGet(CMP_A)];
     const right = [...localGet(CMP_B)];
@@ -1623,12 +1653,16 @@ function comparisonOperands(width: 16 | 32 | 64, signed = false): number[] {
  * `js` and `jns` are the only two that need the subtraction rather than a comparison, because the sign flag is the sign
  * of the difference: `a - b` is pushed and compared against zero, which is the definition rather than a shortcut.
  */
-function conditionCode(suffix: string, width: 16 | 32 | 64): number[] {
+function conditionCode(suffix: string, width: CompareWidth): number[] {
   if (suffix === "s" || suffix === "ns") {
     const difference =
       width === 64
         ? [...comparisonOperands(64), OP.i64Sub, ...i64Const(0n), OP.i64LtS]
-        : width === 16
+        : width === 8
+          ? // the sign flag is bit 7 of the difference the byte arithmetic left behind, so the difference is masked before its own
+            // sign is read: `0x80` minus 1 is `0x7f`, which is positive, and computing the subtraction at 64 would say otherwise
+            [...comparisonOperands(8), OP.i64Sub, ...signExtend8([]), ...i64Const(0n), OP.i64LtS]
+          : width === 16
           ? [...comparisonOperands(16, true), OP.i64Sub, ...i64Const(0n), OP.i64LtS]
           : [...comparisonOperands(32), OP.i32Sub, ...i32Const(0), OP.i32LtS];
     return suffix === "s" ? difference : [...difference, OP.i32Eqz];
@@ -1685,7 +1719,7 @@ type Scope = Map<number, number>;
 
 interface Flags {
   set: boolean;
-  width: 16 | 32 | 64;
+  width: CompareWidth;
   /** Whether the comparison was a subtraction, whose borrow is the carry `sbb` reads; a `test` has no carry to give. */
   borrows?: boolean;
   /**
@@ -2683,7 +2717,17 @@ function translateRange(
         flags.set = true;
         flags.kind = undefined;
         const destination = instruction.operands[0];
-        flags.width = destination !== undefined && destination.kind === "reg" && destination.bits === 32 ? 32 : 64;
+        /*
+         * A byte or a word written to memory says its own width, because that is the width the memory path leaves behind for the
+         * flags and the conditions mask it. A byte written to a *register* does not: that path keeps its value sign-extended, and a
+         * condition reads it at 64 the way it reads any register, which is the rule a sign-extended byte has always followed here.
+         */
+        flags.width =
+          destination?.kind === "memory" && (destination.bits === 8 || destination.bits === 16)
+            ? destination.bits
+            : destination !== undefined && destination.kind === "reg" && destination.bits === 32
+              ? 32
+              : 64;
       } else {
         // a multiplication sets the flags too, to values this does not compute, so what was known before it is gone
         flags.set = false;
