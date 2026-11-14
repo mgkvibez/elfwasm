@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 322
+**Tests:** 331
 
 ```bash
 npm ci && npm run verify
@@ -645,6 +645,11 @@ does *not* sign-extend, because this is a value about to be computed on rather t
 holding `0x80` is zero, and a sign-extended pair says 0xffffff00, which is not. The result is then masked to its own width before it is
 written, and the same mask is what the flags are read from afterwards.
 
+A byte's sign has to be moved to *bit 63* before an arithmetic shift can read it, and that is a bug this work found: the extension
+masked the byte, shifted it left 24 and shifted it right arithmetically, which puts bit 7 at bit 31 and reads the sign of a lane that
+is 64 bits wide, so the answer was always positive. `neg %al` leaving 0x80 did not take a `js`. The shift is 56 bits now, and the two
+tests that pin it negate and mask a byte and require the jump.
+
 That makes the flags narrower than every other flag set here, so a condition learned to answer at eight bits: both operands masked for
 the unsigned conditions, where `0xff` is above `0x01`, and sign-extended from bit 7 for the signed ones. The sign of a byte difference
 takes one more step than the sign of a byte value does: the difference is masked to eight bits *before* its sign is read, because
@@ -652,8 +657,16 @@ takes one more step than the sign of a byte value does: the difference is masked
 
 ### Shifts, and a flag about bits that left
 
-`sar`, `shr` and `shl` translate at 32 and 64 bits, with the count from an immediate or from `%cl`. The count is masked to five bits
-at 32 and six at 64, because that is what the processor does with it: `sar %cl` with 33 in `%cl` shifts by one.
+`sar`, `shr` and `shl` translate at 8, 32 and 64 bits, in all six encodings the group has: `0xd0` to `0xd3` for the byte forms and
+`0xc0`/`0xc1` for an immediate count. The opcode picks the width, not a prefix, which is why `0xd1` and `0xd0` are the same instruction
+at two widths.
+
+The count is masked to five bits below 64 and six at 64, because that is what the processor does with it: `sar %cl` with 33 in `%cl`
+shifts by one. It is *not* masked to the operand's width, which is the mistake that looks right: `shr $9,%al` shifts the byte by nine
+and leaves zero, where masking to three bits would shift it by one and leave half of it.
+
+A byte shift is done at 64 bits and masked back, so it wraps at eight bits rather than at 64. `sar` reads the sign first, because the
+byte arrives masked to its low eight bits and an arithmetic shift of a positive number stays positive.
 
 A shift's flags are not one question but two. The result sets what a comparison of it against zero would, so `je`, `jne`, `js` and
 `jns` after a shift mean what they look like, which is the common way a compiler tests a value it has just shifted. The carry is the

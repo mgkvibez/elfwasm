@@ -351,9 +351,11 @@ function signExtend8(code: number[]): number[] {
     ...code,
     ...i64Const(0xffn),
     OP.i64And,
-    ...i64Const(24n),
+    // 56 and not 24: the lane here is 64 bits wide, so the byte's sign has to be moved to bit 63 for an arithmetic shift to read it.
+    // 24 puts it at bit 31, which is inside the lane, and the shift then leaves the byte positive.
+    ...i64Const(56n),
     OP.i64Shl,
-    ...i64Const(24n),
+    ...i64Const(56n),
     OP.i64ShrS,
   ];
 }
@@ -1059,16 +1061,35 @@ function translateShift(instruction: Instruction): number[] {
     throw new TranslateError(instruction.offset, `a ${instruction.op} into ${destination.kind} is not translated yet`);
   }
   const width = destination.bits;
-  if (width !== 32 && width !== 64) {
+  if (width !== 8 && width !== 32 && width !== 64) {
     throw new TranslateError(instruction.offset, `a ${width}-bit ${instruction.op} is not translated yet`);
   }
   if (count.kind === "memory") {
     throw new TranslateError(instruction.offset, `a ${instruction.op} whose count is in memory is not translated yet`);
   }
   const opcodes = SHIFTS_TRANSLATED[op];
-  const masked = [...operandCode64(count, instruction), ...i64Const(BigInt(width - 1)), OP.i64And];
+  /*
+   * The count is masked the way the processor masks it, which is five bits below 64 and six at 64, and *not* to the width of the
+   * operand: `shr $9,%al` shifts the byte by nine and leaves zero, where masking to three bits would shift it by one and leave the
+   * wrong half of it.
+   */
+  const masked = [...operandCode64(count, instruction), ...i64Const(width === 64 ? 63n : 31n), OP.i64And];
+  /*
+   * A byte shift is done at 64 bits and masked back, which is what makes its wrap the byte's own. `sar` reads the sign first: the
+   * byte arrives masked to eight bits, so without extending it the arithmetic shift would shift a positive number.
+   */
+  const byte =
+    width === 8
+      ? (() => {
+          const value = [...read(destination, instruction)];
+          const arithmetic = op === "sar" ? signExtend8(value) : value;
+          return [...arithmetic, ...masked, opcodes.bits64, ...i64Const(0xffn), OP.i64And];
+        })()
+      : [];
   const shifted =
-    width === 64
+    width === 8
+      ? byte
+      : width === 64
       ? [...read(destination, instruction), ...masked, opcodes.bits64]
       : [
           ...read(destination, instruction),
@@ -2705,7 +2726,14 @@ function translateRange(
       out.push(...translateShift(instruction));
       flags.set = true;
       const destination = instruction.operands[0];
-      flags.width = destination !== undefined && destination.kind === "reg" && destination.bits === 32 ? 32 : 64;
+      /*
+       * The shift keeps its own result in the comparison locals, masked to the width it wrote: a byte shift leaves a byte there, so
+       * its conditions are read at eight bits, exactly as a byte read-modify-write's are.
+       */
+      flags.width =
+        destination !== undefined && destination.kind === "reg" && (destination.bits === 8 || destination.bits === 32)
+          ? destination.bits
+          : 64;
       flags.kind = "shift";
       index += 1;
       continue;

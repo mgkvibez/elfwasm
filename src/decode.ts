@@ -1079,8 +1079,14 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
         "the decoded subset yet",
     );
   }
-  if (opcode === 0xd1 || opcode === 0xd3 || opcode === 0xc1) {
-    const modrm = decodeModRm(cursor, rex, bits, segment);
+  /*
+   * The shift group, in all six encodings: `0xd0` to `0xd3` for the byte forms, `0xc0` and `0xc1` for a count written in the bytes
+   * after the instruction, and the three ways a count arrives at all: one, a byte in `%cl`, or an immediate. The opcode picks the
+   * width rather than a prefix, which is why `0xd1` and `0xd0` are the same instruction at two widths.
+   */
+  if (opcode === 0xd0 || opcode === 0xd1 || opcode === 0xd2 || opcode === 0xd3 || opcode === 0xc0 || opcode === 0xc1) {
+    const byteForm = opcode === 0xd0 || opcode === 0xd2 || opcode === 0xc0;
+    const modrm = decodeModRm(cursor, rex, byteForm ? 8 : bits, segment);
     const mnemonic = SHIFTS[modrm.regField];
     if (mnemonic === undefined) {
       throw new DecodeError(
@@ -1088,8 +1094,8 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
         `shift group /${modrm.regField} is a rotate or an undefined encoding, and neither is in the decoded subset`,
       );
     }
-    if (opcode === 0xd1) return finish(mnemonic, [modrm.rm, { kind: "immediate", value: 1n }]);
-    if (opcode === 0xd3) return finish(mnemonic, [modrm.rm, registerOperand(1, false, 8, rex.present)]);
+    if (opcode === 0xd0 || opcode === 0xd1) return finish(mnemonic, [modrm.rm, { kind: "immediate", value: 1n }]);
+    if (opcode === 0xd2 || opcode === 0xd3) return finish(mnemonic, [modrm.rm, registerOperand(1, false, 8, rex.present)]);
     return finish(mnemonic, [modrm.rm, { kind: "immediate", value: readImmediate(cursor, 1) }]);
   }
 

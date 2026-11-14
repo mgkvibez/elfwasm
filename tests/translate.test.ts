@@ -296,6 +296,65 @@ describe("the exchange", () => {
   });
 });
 
+describe("a shift of a byte", () => {
+  /*
+   * The byte encodings of the shift group, `0xc0`, `0xd0` and `0xd2`, which a walk of glibc needed and which differ from the wider
+   * forms in the count rather than in the shift: the processor masks a count to five bits whatever the operand's width, so `shr $9,%al`
+   * shifts by nine and leaves zero.
+   */
+  it("shifts a byte right by an immediate", () => {
+    // mov $0xff,%al ; shr $4,%al ; ret
+    expect(run(hex("b0 ff c0 e8 04 c3"))).toBe(0x0fn);
+  });
+
+  it("wraps a byte shift at eight bits", () => {
+    // mov $0x80,%al ; shl $1,%al ; jne skip ; mov $42,%eax ; ret: 0x80 doubled is 0x100, which a byte holds as zero
+    expect(run(hex("b0 80 c0 e0 01 75 05 b8 2a 00 00 00 c3"))).toBe(0x2an);
+  });
+
+  it("keeps the sign through an arithmetic shift of a byte", () => {
+    // mov $0x80,%al ; sar $1,%al ; ret: shifting a negative byte right gives 0xc0, and a logical shift would give 0x40
+    expect(run(hex("b0 80 c0 f8 01 c3"))).toBe(0xc0n);
+  });
+
+  it("masks the count the way the processor does, to five bits and not to the operand's width", () => {
+    // mov $0xff,%al ; shr $9,%al ; ret: nine bits out of eight leaves nothing, where a count masked to three bits would leave 0x7f
+    expect(run(hex("b0 ff c0 e8 09 c3"))).toBe(0x00n);
+  });
+
+  it("takes its count from %cl and its flags from the byte it wrote", () => {
+    // mov $0xff,%al ; mov $8,%cl ; shl %cl,%al ; jne skip ; mov $42,%eax ; ret: eight bits out of a byte is zero
+    expect(run(hex("b0 ff b1 08 d2 e0 75 05 b8 2a 00 00 00 c3"))).toBe(0x2an);
+  });
+
+  it("shifts a byte by one through the short encoding", () => {
+    // mov $0x01,%al ; shl $1,%al (0xd0) ; ret
+    expect(run(hex("b0 01 d0 e0 c3"))).toBe(0x02n);
+  });
+
+  it("answers a sign condition from the byte it shifted", () => {
+    // mov $0x80,%al ; sar $1,%al ; js skip ; mov $42,%eax ; ret: 0xc0 is negative at eight bits, so the jump is taken
+    expect(run(hex("b0 80 c0 f8 01 78 05 b8 2a 00 00 00 c3"))).toBe(0xc0n);
+  });
+});
+
+describe("the sign of a byte", () => {
+  /*
+   * A byte is sign-extended for the sake of its flags, and the extension has to reach bit 63 of the lane it is kept in: a shift by
+   * 24 puts bit 7 at bit 31 instead, which is inside a 64-bit lane, so the arithmetic shift that follows leaves the byte positive and
+   * `js` never fires. Every byte whose sign mattered was answering this way until a byte shift had to read one.
+   */
+  it("takes js after negating a byte that came out negative", () => {
+    // mov $0x80,%al ; neg %al ; js skip ; mov $42,%eax ; ret: negating -128 leaves 0x80, whose sign bit is set
+    expect(run(hex("b0 80 f6 d8 78 05 b8 2a 00 00 00 c3"))).toBe(0x80n);
+  });
+
+  it("takes js after an and leaves a byte negative", () => {
+    // mov $0xff,%al ; and $0x80,%al ; js skip ; mov $42,%eax ; ret: 0xff and 0x80 is 0x80, which is negative at eight bits
+    expect(run(hex("b0 ff 24 80 78 05 b8 2a 00 00 00 c3"))).toBe(0x80n);
+  });
+});
+
 describe("the compare and swap", () => {
   /*
    * The shape a one-time guard is written in: compare, and write only if nothing has claimed it yet. The register form is used
