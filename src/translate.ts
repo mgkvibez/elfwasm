@@ -877,6 +877,21 @@ function divideUnsigned(): number[] {
   return code;
 }
 
+/**
+ * The width an arithmetic result leaves its flags at.
+ *
+ * A byte or a word written to memory says its own width, because that is the width the memory path leaves behind for the flags and
+ * the conditions mask it. A byte written to a *register* does not: that path keeps its value sign-extended, and a condition reads it
+ * at 64 the way it reads any register, which is the rule a sign-extended byte has always followed here.
+ */
+function arithmeticFlagsWidth(destination: Operand | undefined): CompareWidth {
+  if (destination?.kind === "memory" && (destination.bits === 8 || destination.bits === 16)) return destination.bits;
+  // a word register is masked to its own width and not sign-extended, so sixteen is the width its flags describe
+  if (destination !== undefined && destination.kind === "reg" && destination.bits === 16) return 16;
+  if (destination !== undefined && destination.kind === "reg" && destination.bits === 32) return 32;
+  return 64;
+}
+
 /** True for a register name that is one half of a vector register, as opposed to a general or byte register. */
 function isVectorHalf(operand: Operand): boolean {
   return operand.kind === "reg" && (operand.name.endsWith(".lo") || operand.name.endsWith(".hi"));
@@ -1314,7 +1329,7 @@ function translateBinary(instruction: Instruction): number[] {
     throw new TranslateError(instruction.offset, `a ${instruction.op} into memory is not translated yet`);
   }
   const width = destination.bits;
-  if (width !== 8 && width !== 32 && width !== 64) {
+  if (width !== 8 && width !== 16 && width !== 32 && width !== 64) {
     throw new TranslateError(instruction.offset, `a ${width}-bit ${instruction.op} is not translated yet`);
   }
   refuseByteMemory(source, instruction);
@@ -1352,6 +1367,32 @@ function translateBinary(instruction: Instruction): number[] {
       ...unsigned(CMP_A),
       ...i64Const(0n),
       ...localSet(CMP_B),
+      ...write(destination, instruction),
+    ];
+  }
+  if (width === 16) {
+    /*
+     * A word operation is done at 64 bits and masked back to sixteen, so it wraps where the processor wraps. The flags are read at
+     * sixteen, which is the width the mask leaves behind: unlike a byte, a word result is not sign-extended anywhere, so there is no
+     * extension to undo.
+     */
+    const value = [...read(destination, instruction), ...operandCode64(source, instruction), opcodes.bits64];
+    const word = [...value, ...i64Const(0xffffn), OP.i64And];
+    if (!FLAG_SETTING.has(op)) return [...word, ...write(destination, instruction)];
+    if (op === "sub") {
+      // `sub` keeps its operands, because its flags are the difference's and the difference is what `cmp` computes
+      const operand = operandCode64(source, instruction);
+      return [
+        ...read(destination, instruction), ...localSet(CMP_A),
+        ...operand, ...localSet(CMP_B),
+        ...localGet(CMP_A), ...localGet(CMP_B), OP.i64Sub, ...i64Const(0xffffn), OP.i64And,
+        ...write(destination, instruction),
+      ];
+    }
+    // everything else sets its flags from the result, so the result is what a branch reads, against a zero
+    return [
+      ...word, OP.localTee, ...unsigned(CMP_A),
+      ...i64Const(0n), OP.localSet, ...unsigned(CMP_B),
       ...write(destination, instruction),
     ];
   }
@@ -1749,7 +1790,7 @@ interface Flags {
   set: boolean;
   width: CompareWidth;
   /** Whether the comparison was a subtraction, whose borrow is the carry `sbb` reads; a `test` has no carry to give. */
-  borrows?: boolean;
+  borrows?: boolean | undefined;
   /**
    * What defined them. A comparison defines every condition a compiler reads; a bit test defines the carry and leaves the rest
    * undefined, so the conditions that read them are refused instead of being answered from a value that is not there.
@@ -2788,24 +2829,46 @@ function translateRange(
       index += 1;
       continue;
     }
+    if (instruction.op === "inc" || instruction.op === "dec") {
+      /*
+       * `inc` is `add $1` and `dec` is `sub $1`, so both go through the arithmetic path rather than beside it, including the memory
+       * form and the byte and word widths.
+       *
+       * The one thing they do not share with an add is the carry: the processor leaves it alone, so a carry from an earlier comparison
+       * is still there afterwards. This translator cannot carry it across, because the arithmetic replaces the two operands a carry is
+       * read from with its own result and zero, so the flag is cleared here and an `adc` after an `inc` is refused by name rather than
+       * answered from the wrong pair.
+       */
+      const [destination] = instruction.operands;
+      if (destination === undefined) {
+        throw new TranslateError(instruction.offset, `${instruction.op} needs an operand`);
+      }
+      const asArithmetic: Instruction = {
+        ...instruction,
+        op: instruction.op === "inc" ? "add" : "sub",
+        operands: [destination, { kind: "immediate", value: 1n }],
+      };
+      out.push(...translateBinary(asArithmetic));
+      flags.set = true;
+      flags.kind = undefined;
+      flags.width = arithmeticFlagsWidth(destination);
+      flags.borrows = undefined;
+      index += 1;
+      continue;
+    }
     if (instruction.op in BINARY) {
       out.push(...translateBinary(instruction));
       if (FLAG_SETTING.has(instruction.op)) {
         // an arithmetic result sets the flags a branch can read, the whole set of them rather than the carry alone
         flags.set = true;
         flags.kind = undefined;
-        const destination = instruction.operands[0];
+        flags.width = arithmeticFlagsWidth(instruction.operands[0]);
         /*
-         * A byte or a word written to memory says its own width, because that is the width the memory path leaves behind for the
-         * flags and the conditions mask it. A byte written to a *register* does not: that path keeps its value sign-extended, and a
-         * condition reads it at 64 the way it reads any register, which is the rule a sign-extended byte has always followed here.
+         * The carry is not modelled for any of these, and it cannot be left over from an earlier comparison either: the operands that
+         * comparison left behind are replaced by this instruction's own result and zero, so reading a carry from them now would answer
+         * from the wrong pair. Cleared, so an `adc` or `sbb` after an arithmetic instruction refuses by name.
          */
-        flags.width =
-          destination?.kind === "memory" && (destination.bits === 8 || destination.bits === 16)
-            ? destination.bits
-            : destination !== undefined && destination.kind === "reg" && destination.bits === 32
-              ? 32
-              : 64;
+        flags.borrows = undefined;
       } else {
         // a multiplication sets the flags too, to values this does not compute, so what was known before it is gone
         flags.set = false;

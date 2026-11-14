@@ -1119,14 +1119,32 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
      * A call or a jump through a register or a memory location is how a program reaches a target it computes rather than one the
      * linker wrote down, so the operand is the target and there is no displacement in the bytes.
      */
-    const modrm = decodeModRm(cursor, rex, 64, segment);
+    const modrm = decodeModRm(cursor, rex, bits, segment);
+    if (modrm.regField === 0) return finish("inc", [modrm.rm]);
+    if (modrm.regField === 1) return finish("dec", [modrm.rm]);
     if (modrm.regField === 2) return finish("call", [modrm.rm]);
     if (modrm.regField === 4) return finish("jmp", [modrm.rm]);
     if (modrm.regField === 6) return finish("push", [modrm.rm]);
     throw new DecodeError(
       offset,
       `0xff /${modrm.regField} is ${[ "inc", "dec", "a far call", "a far jump", "jmp", "a far jmp", "push", "invalid" ][modrm.regField]}, ` +
-        "which is not in the decoded subset",
+        `which is not in the decoded subset: ${
+          modrm.regField === 3 || modrm.regField === 5 ? "this machine has one code segment and one offset width" : "no operand of that kind is decoded"
+        }`,
+    );
+  }
+  if (opcode === 0xfe) {
+    /*
+     * The same group at a byte's width, which is only its two increments: nothing else in group 4 reaches memory through this
+     * opcode, since a call, a jump and a push are all the width of the stack and the instruction pointer.
+     */
+    const modrm = decodeModRm(cursor, rex, 8, segment);
+    if (modrm.regField === 0) return finish("inc", [modrm.rm]);
+    if (modrm.regField === 1) return finish("dec", [modrm.rm]);
+    throw new DecodeError(
+      offset,
+      `0xfe /${modrm.regField} is ${modrm.regField === 7 ? "an undefined encoding" : "not a call, a jump or a push at a byte's width"}, ` +
+        "so it is not in the decoded subset",
     );
   }
   throw new DecodeError(offset, `opcode 0x${opcode.toString(16)} is not in the decoded subset`);

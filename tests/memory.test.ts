@@ -122,6 +122,23 @@ describe("the read-modify-write of a byte or a word", () => {
     expect(buffer[0x100]).toBe(0x7f);
   });
 
+  it("increments what is in memory, at the width the opcode names", () => {
+    // movq $5,0x400100 ; incq 0x400100 ; mov 0x400100,%rax ; ret
+    const qword = run(hex("48 c7 04 25 00 01 40 00 05 00 00 00 48 ff 04 25 00 01 40 00 48 8b 04 25 00 01 40 00 c3"));
+    expect(qword.result).toBe(6n);
+    expect(qword.buffer[0x100]).toBe(6);
+    // movw $0x40ff,0x400100 ; incw 0x400100 ; ret: the carry runs out of the low byte into the one above it, and no further
+    const word = run(hex("66 c7 04 25 00 01 40 00 ff 40 66 ff 04 25 00 01 40 00 c3"), { fill: 0x40 });
+    expect(word.buffer[0x100]).toBe(0x00);
+    expect(word.buffer[0x101]).toBe(0x41);
+    expect(word.buffer[0x102]).toBe(0x40);
+    // movw $0xffff,0x400100 ; incw 0x400100 ; ret: all ones wraps to zero, which is where a sixteen-bit increment stops
+    const wraps = run(hex("66 c7 04 25 00 01 40 00 ff ff 66 ff 04 25 00 01 40 00 c3"), { fill: 0x40 });
+    expect(wraps.buffer[0x100]).toBe(0x00);
+    expect(wraps.buffer[0x101]).toBe(0x00);
+    expect(wraps.buffer[0x102]).toBe(0x40);
+  });
+
   it("writes a word back as two bytes and leaves the bytes above it alone", () => {
     // movw $0x1234,0x400100 ; mov $1,%cx ; add %cx,0x400100 ; ret
     // the word becomes 0x1235, and the byte above it is still 0x40: a two-byte store writes two bytes

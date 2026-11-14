@@ -304,6 +304,42 @@ describe("the exchange", () => {
   });
 });
 
+describe("the two increments", () => {
+  /*
+   * `inc` and `dec` are `add $1` and `sub $1` at every width, including a byte and a word in memory. The one thing they do not share
+   * with an add is the carry, which the processor leaves alone: that is stated in the refusals below, since the operands a carry is
+   * read from are replaced by the increment's own result.
+   */
+  it("increments and decrements a register", () => {
+    // mov $5,%rax ; inc %rax ; ret
+    expect(run(hex("48 c7 c0 05 00 00 00 48 ff c0 c3"))).toBe(6n);
+    // mov $5,%ecx ; dec %ecx ; mov %ecx,%eax ; ret, which also checks the 32-bit write zeroes the upper half
+    expect(run(hex("b9 05 00 00 00 ff c9 89 c8 c3"))).toBe(4n);
+  });
+
+  it("increments a byte and decrements one past zero", () => {
+    // mov $5,%al ; inc %al ; ret
+    expect(run(hex("b0 05 fe c0 c3"))).toBe(6n);
+    // mov $0,%al ; dec %al ; ret: a byte decremented below zero wraps to all ones
+    expect(run(hex("b0 00 fe c8 c3"))).toBe(0xffn);
+  });
+
+  it("increments a word without touching the rest of the register", () => {
+    // mov $7,%ax ; inc %ax ; ret: the write is sixteen bits wide, and nothing above it is disturbed
+    expect(run(hex("66 b8 07 00 66 ff c0 c3"))).toBe(8n);
+  });
+
+  it("sets the flags a branch reads, so an increment that reaches zero is a jump", () => {
+    // mov $-1,%rax ; inc %rax ; je skip ; inc %rax ; ret: the first increment reaches zero and the branch is taken over the second
+    expect(run(hex("48 c7 c0 ff ff ff ff 48 ff c0 74 03 48 ff c0 c3"))).toBe(0n);
+  });
+
+  it("refuses an adc after an increment, whose carry the processor leaves alone and this translator replaces", () => {
+    // mov $1,%al ; cmp $2,%al ; inc %al ; adc $0,%rcx ; ret
+    expect(() => run(hex("b0 01 80 f8 02 fe c0 48 83 d1 00 c3"))).toThrow(/adc reads the carry/);
+  });
+});
+
 describe("a dword compare on sixteen bytes", () => {
   /*
    * `pcmpeqd` compares four dword lanes and makes each all ones or zero, which is how a compiler turns sixteen bytes into a mask. A

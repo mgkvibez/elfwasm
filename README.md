@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 343
+**Tests:** 349
 
 ```bash
 npm ci && npm run verify
@@ -118,8 +118,9 @@ paragraph and both are gone: `movdqa` at `0x10a` was the first, and the vector m
 
 `translate` takes the decoder's instructions and emits one WASM function per x86-64 function: no parameters, one `i64`
 result, sixteen `i64` globals for the sixteen registers in encoding order. The subset is `mov`, `lea`, `movzx`, `movsx`,
-`movsxd`, `add`, `sub`, `xor`, `and`, `or`, `imul` at 32 and 64 bits, `cmp` and `test`, `cmpxchg`, `xchg`, `setcc`, the ten conditional branches
-that need only zf, sf, cf and of, `jmp` in both directions, loops, `call`, `syscall`, and `ret`, which returns `rax`.
+`movsxd`, `add`, `sub`, `xor`, `and` and `or` at every width from a byte to a qword, `adc` and `sbb` in the group 1 and group 3
+forms, `imul` at 32 and 64 bits, `inc` and `dec` at every width, `cmp` and `test`, `cmpxchg`, `xchg`, `setcc`, `pcmpeqd`, the ten
+conditional branches that need only zf, sf, cf and of, `jmp` in both directions, loops, `call`, `syscall`, and `ret`, which returns `rax`.
 
 Flags are never materialised as variables. `cmp` and `test` leave their operands in two extra locals and a `jcc` becomes
 the comparison itself, at the width the operands were: that is why `cmp $-1, %eax ; jl` and `cmp $-1, %rax ; jl` behave
@@ -530,9 +531,32 @@ signed opcodes answer it: `jl` after `cmpw $0,%ax` with `0x8000` is taken, which
 `js` after a `testw` of the same value is taken for the same reason. Reading two bytes from memory for such an operand, rather than eight,
 matters for more than correctness: a word at the end of a page is a fault to a processor that read eight.
 
-16-bit arithmetic is still refused by name in a register, because its flags are 16 bits wide and this translator computes them at 64.
-In memory it is translated, through the read-modify-write path, where the result is masked to its own width and the conditions were
-taught to read a word at the width the memory left behind.
+Arithmetic at that width follows the same rule as the comparison: `add`, `sub`, `xor`, `and` and `or` on a word register are computed at
+64 and masked back to sixteen, and their flags are read at sixteen, which is the width the mask leaves behind rather than an extension
+that has to be undone. In memory the word forms were already translated through the read-modify-write path, and they mask the same way.
+What a word still does not have is the operations whose own encodings the decoder does not read: `imulw` (`66 0f af`) is refused at
+decode, and the `66` form of the carry pair (`66 11`, `66 19`) is refused as an opcode outside the subset. The refusal for `66 0f af`
+calls it an SSE instruction, which is the wrong reason for a right refusal and is worth correcting: a reader sent to the vector unit will
+not find an integer multiply there.
+
+### The increments
+
+`inc` and `dec` are group 4 and group 5, `0xfe` at a byte's width and `0xff` at the operand size, which is how a compiler writes `++` on a
+variable it has already addressed. Both are translated as what the architecture defines them to be, `add $1` and `sub $1`, so the memory
+form, the byte and the word come along through the arithmetic path instead of a second implementation beside it.
+
+The one thing an increment does not share with an add is the carry, which the processor leaves exactly as it found it: `cmp $2,%al ; inc
+%al ; adc $0,%rcx` counts the bytes below two, and the `inc` in the middle is not part of that count. This translator cannot preserve it,
+because an arithmetic instruction replaces the two locals a carry is read from with its own result and a zero, so the flag is recorded as
+gone and an `adc` or `sbb` after an increment refuses by name. The same clearing applies to every arithmetic instruction now, which is a
+correctness fix rather than a new rule: before it, an `adc` after an `add` read a carry out of the add's own result and zero and could
+answer silently wrong.
+
+The four slots group 5 spends on a far call, a far jump and their immediate forms stay refused, and the message says why in this
+machine's terms: one code segment, one offset width, so there is nothing for them to select.
+
+`tests/memory.test.ts` pins the widths where the answer is visible in the buffer: `incq` on five is six, a word at `0x40ff` becomes
+`0x4100` with the carry running into the byte above it and no further, and a word of all ones wraps to zero.
 
 ### The compare and swap
 
