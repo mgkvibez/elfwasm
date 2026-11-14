@@ -357,7 +357,7 @@ function decodeModRm(
 
 // group 1 by /reg field: 0 add, 1 or, 2 adc, 3 sbb, 4 and, 5 sub, 6 xor, 7 cmp. The carry forms are left out on
 // purpose: nothing a compiler emits for C code needs them, and a translator that ignored the carry would be wrong.
-const ARITHMETIC: readonly (string | undefined)[] = ["add", "or", undefined, undefined, "and", "sub", "xor", "cmp"];
+const ARITHMETIC: readonly (string | undefined)[] = ["add", "or", "adc", "sbb", "and", "sub", "xor", "cmp"];
 /** `jcc` and `setcc` share one condition order, which is the encoding's and not a coincidence. */
 const CONDITIONS = [
   "o", "no", "b", "ae", "e", "ne", "be", "a",

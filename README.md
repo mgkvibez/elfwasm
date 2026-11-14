@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 331
+**Tests:** 338
 
 ```bash
 npm ci && npm run verify
@@ -455,6 +455,11 @@ away, the second emits the same bodies against a list that cannot grow further, 
 zero minus the borrow is all ones or zero. The borrow is read out of the comparison the flags still hold, since `a - b` borrows exactly
 when `a < b` as unsigned values, and a `test` borrows nothing at all. Every other flag `sbb` sets is dropped rather than computed, so
 what follows it knows nothing about what it left behind.
+
+`adc` is its mirror and the other half of the same idea: `cmp $2,%al; adc $0,%rcx` adds one to a counter when the byte was below two,
+which is how `strspn` counts the characters in a range. It adds the same carry `sbb` subtracts, read the same way, and drops the flags
+it sets for the same reason. Both are decoded in every form the arithmetic group has, including `/2` and `/3` with a byte immediate,
+which is the encoding `48 83 d1 00` is: `adc $0`, and then the carry does the counting.
 
 ### A jump whose target is a value
 

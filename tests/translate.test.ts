@@ -105,6 +105,10 @@ describe("refusals", () => {
     throw new Error("expected the translator to refuse these bytes");
   };
 
+  it("refuses an adc with no comparison before it, since there is no carry to add", () => {
+    expect(refuse(hex("48 83 d1 00 c3")).message).toContain("adc reads the carry");
+  });
+
   it("refuses a branch with no comparison before it, rather than deciding what the flags were", () => {
     expect(refuse(hex("48 c7 c0 01 00 00 00 75 00 c3")).message).toContain("needs a cmp or test");
   });
@@ -293,6 +297,52 @@ describe("the exchange", () => {
     // mov $1,%eax ; cmp $1,%eax ; xchg %ecx,%eax ; jne skip ; mov $42,%eax ; ret
     // the comparison is still the last thing that wrote the flags, so the jump is not taken and the answer is 42
     expect(run(hex("b8 01 00 00 00 83 f8 01 87 c8 75 05 b8 2a 00 00 00 c3"))).toBe(0x2an);
+  });
+});
+
+describe("the two instructions that carry between steps", () => {
+  /*
+   * `adc` and `sbb` add or subtract the carry as well as their operand, which is how a compiler counts the things it has just
+   * compared: `cmp $2,%al; adc $0,%rcx` adds one to a counter when the byte was below two. The carry is not kept as a flag but read
+   * out of the comparison the flags still hold, which is the same borrow `sbb` uses and the same one a `jb` would read.
+   */
+  it("adds the carry when the comparison borrowed", () => {
+    // mov $1,%al ; mov $5,%ecx ; cmp $2,%al ; adc $0,%rcx ; mov %rcx,%rax ; ret: 1 is below 2, so the counter gains one
+    expect(run(hex("b0 01 b9 05 00 00 00 3c 02 48 83 d1 00 48 89 c8 c3"))).toBe(6n);
+  });
+
+  it("adds nothing when the comparison did not borrow", () => {
+    // the same program comparing 3 against 2, which is not below it
+    expect(run(hex("b0 03 b9 05 00 00 00 3c 02 48 83 d1 00 48 89 c8 c3"))).toBe(5n);
+  });
+
+  it("adds the carry and its immediate both", () => {
+    // mov $1,%al ; mov $5,%ecx ; cmp $2,%al ; adc $0x10,%rcx ; mov %rcx,%rax ; ret
+    expect(run(hex("b0 01 b9 05 00 00 00 3c 02 48 83 d1 10 48 89 c8 c3"))).toBe(0x16n);
+  });
+
+  it("adds no carry after a test, which subtracts nothing", () => {
+    // mov $1,%al ; mov $5,%ecx ; test %al,%al ; adc $0,%rcx ; mov %rcx,%rax ; ret
+    expect(run(hex("b0 01 b9 05 00 00 00 84 c0 48 83 d1 00 48 89 c8 c3"))).toBe(5n);
+  });
+
+  it("carries at the width it writes, so a byte adc stays inside the byte", () => {
+    // mov $1,%al ; cmp $2,%al ; adc $0,%al ; ret: one plus the carry is two, at eight bits
+    expect(run(hex("b0 01 3c 02 80 d0 00 c3"))).toBe(2n);
+  });
+
+  it("counts the characters of a string that fall in a range, which is the loop it was written for", () => {
+    /*
+     * The shape glibc's `strspn` uses: subtract the range's start, compare against its width, add the carry.
+     * mov $1,%ecx ; the three bytes "0:;" counted one at a time ; mov %rcx,%rax ; ret
+     */
+    const count = (byte: number): bigint => {
+      const body =
+        `b9 00 00 00 00 b0 ${byte.toString(16)} 80 e8 30 80 f8 0a 48 83 d1 00 48 89 c8 c3`;
+      return run(hex(body));
+    };
+    expect(count(0x30)).toBe(1n);
+    expect(count(0x3a)).toBe(0n);
   });
 });
 

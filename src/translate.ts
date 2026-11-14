@@ -2657,30 +2657,31 @@ function translateRange(
       index += 1;
       continue;
     }
-    if (instruction.op === "sbb") {
+    if (instruction.op === "sbb" || instruction.op === "adc") {
       /*
-       * A subtraction that also subtracts the carry, which is how a compiler turns a comparison into a number: `sbb %rbx,%rbx` is
-       * zero minus the borrow, so `%rbx` becomes all ones when the comparison borrowed and zero when it did not.
+       * The two arithmetic instructions that carry between steps: `sbb` subtracts the borrow and `adc` adds the carry, which is how a
+       * compiler turns a comparison into a number (`sbb %rbx,%rbx` is all ones when the comparison borrowed) and how it counts things
+       * it has just compared (`cmp $2,%al; adc $0,%rcx` adds one to a counter when the byte was below two).
        *
-       * The borrow is read out of the comparison the flags still hold: `a - b` borrows exactly when `a < b` as unsigned values. After
-       * a `test` there is no borrow at all, because a test subtracts nothing.
+       * The carry is read out of the comparison the flags still hold: `a - b` borrows exactly when `a < b` as unsigned values, and
+       * that borrow is the carry an `adc` adds. After a `test` there is no borrow at all, because a test subtracts nothing.
        */
       if (!flags.set || flags.borrows === undefined) {
         throw new TranslateError(
           instruction.offset,
-          "sbb reads the carry flag, which needs a cmp or test that every path reaching it goes through",
+          `${instruction.op} reads the carry flag, which needs a cmp or test that every path reaching it goes through`,
         );
       }
       if (flags.kind === "shift" || flags.kind === "zero") {
         throw new TranslateError(
           instruction.offset,
-          `sbb after a ${flags.kind === "zero" ? "bit scan" : "shift"} reads the carry, which it does not define: a shift's carry is ` +
-            "the bit that left and a scan's is not defined at all, so neither is a borrow to subtract here",
+          `${instruction.op} after a ${flags.kind === "zero" ? "bit scan" : "shift"} reads the carry, which it does not define: a ` +
+            "shift's carry is the bit that left and a scan's is not defined at all, so neither is a carry to use here",
         );
       }
       const [destination, source] = instruction.operands;
       if (destination === undefined || source === undefined) {
-        throw new TranslateError(instruction.offset, "sbb needs two operands");
+        throw new TranslateError(instruction.offset, `${instruction.op} needs two operands`);
       }
       const carry =
         flags.borrows === false
@@ -2690,14 +2691,15 @@ function translateRange(
             : flags.width === 16
               ? [...comparisonOperands(16), OP.i64LtU, OP.i64ExtendI32U]
               : [...comparisonOperands(64), OP.i64LtU, OP.i64ExtendI32U];
+      const combining = instruction.op === "sbb" ? OP.i64Sub : OP.i64Add;
       out.push(
         ...carry,
         ...localSet(SBB_CARRY),
         ...read(destination, instruction),
-        ...read(source, instruction),
-        OP.i64Sub,
+        ...operandCode64(source, instruction),
+        combining,
         ...localGet(SBB_CARRY),
-        OP.i64Sub,
+        combining,
         ...write(destination, instruction),
       );
       // the arithmetic flags it sets are not modelled, so the comparison it inherited is spent
