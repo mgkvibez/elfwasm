@@ -71,6 +71,9 @@ function vectorOperand(code: number, extended: boolean, half: "lo" | "hi", bits:
  * else: on a register destination, or on an instruction that only reads, it is an invalid-opcode fault on the processor. Refused
  * rather than dropped, because dropping it would translate a program that cannot run.
  */
+/** The string instructions whose repeated form this translator runs: `movs`, `stos` and `lods`, byte and operand-size forms. */
+const STRING_OPCODES = [0xa4, 0xa5, 0xaa, 0xab, 0xac, 0xad] as const;
+
 const LOCKABLE: ReadonlySet<string> = new Set(["cmpxchg", "xadd", "xchg", "add", "sub", "and", "or", "xor", "inc", "dec"]);
 
 export type Operand =
@@ -133,6 +136,14 @@ export interface Instruction {
    * surprise.
    */
   readonly lock?: true;
+  /**
+   * True when a `0xf3` prefix asked for the instruction to be repeated `%rcx` times.
+   *
+   * Kept apart from the opcode because the repetition belongs to the prefix, not to the instruction: `f3 48 ab` is a `stos` that
+   * writes the whole run, and `48 ab` is one store. It is not a hint to be dropped, which is why the decoder only accepts it in
+   * front of an instruction that has a defined repeated form.
+   */
+  readonly repeat?: "rep";
 }
 
 export class DecodeError extends Error {
@@ -410,6 +421,8 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
   let operandSize16 = false;
   // set by 0xf0: the access is meant to be indivisible, which is a fact about the instruction rather than about its operands
   let locked = false;
+  // `0xf3` in front of a string instruction, which is the one place the prefix repeats rather than changing the opcode
+  let repeat: "rep" | undefined;
 
   for (;;) {
     const next = bytes[cursor.index];
@@ -481,6 +494,20 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
           "nothing: in front of a memory operand it asks for a 32-bit address",
       );
     }
+    if (next === 0xfc || next === 0xfd) {
+      /*
+       * `cld` clears the direction flag and `std` sets it. Only the clear one is translated, and as nothing at all: the flag is clear
+       * when a function is entered, this machine has no way to set it, and everything here that copies in bulk moves upward.
+       */
+      if (next === 0xfd) {
+        throw new DecodeError(
+          offset,
+          "std is not in the decoded subset: the string instructions here move upward, and a downward copy would write before the " +
+            "address it was given",
+        );
+      }
+      return { offset, length: 1, op: "cld", operands: [] };
+    }
     if (next === 0xf4) {
       // `hlt`, which ends the entry point after its call into `__libc_start_main`: a privileged instruction, so a machine that
       // reaches it traps
@@ -533,6 +560,23 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
             "decoded subset: it counts zeros rather than scanning for a set bit, and it writes the carry as well as the zero flag",
         );
       }
+      /*
+       * The four string instructions this translator runs under a repeat: `movs`, `stos` and `lods`. `scas` and `cmps` are named
+       * rather than read as these, because their repeated form stops early on the zero flag, so the count is not the answer.
+       */
+      const stringOpcode = bytes[afterPrefix];
+      if (stringOpcode !== undefined && (STRING_OPCODES as readonly number[]).includes(stringOpcode)) {
+        repeat = "rep";
+        cursor.index += 1;
+        continue;
+      }
+      if (stringOpcode === 0xa6 || stringOpcode === 0xa7 || stringOpcode === 0xae || stringOpcode === 0xaf) {
+        throw new DecodeError(
+          offset,
+          `0xf3 0x${stringOpcode.toString(16)} is a repeated ${stringOpcode === 0xa6 || stringOpcode === 0xa7 ? "cmps" : "scas"}, ` +
+            "which stops early on the zero flag rather than counting down, so it is not in the decoded subset",
+        );
+      }
       throw new DecodeError(offset, "a lock or repeat prefix is not in the decoded subset");
     }
     if (next === 0xf0) {
@@ -568,9 +612,50 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
           `${operands[0] === undefined ? "has no destination" : `writes a ${operands[0].kind}`}`,
       );
     }
-    return { offset, length: cursor.index - offset, op, operands, ...(locked ? { lock: true as const } : {}) };
+    return {
+      offset,
+      length: cursor.index - offset,
+      op,
+      operands,
+      ...(locked ? { lock: true as const } : {}),
+      ...(repeat === undefined ? {} : { repeat }),
+    };
   };
 
+  // 0xa8 and 0xa9 sit in the middle of that range and are `test`, not a string instruction, which the fixture caught
+  if ((0xa4 <= opcode && opcode <= 0xa7) || (0xaa <= opcode && opcode <= 0xaf)) {
+    /*
+     * The string instructions: `movs`, `cmps`, `stos`, `lods` and `scas`, each with the byte form at the even opcode and the
+     * operand-size form at the odd one. What they address is implied rather than encoded: `%rdi` is where `stos` and `movs` write,
+     * `%rsi` where `movs` and `lods` read, and the direction flag decides whether the register moves up or down.
+     */
+    const width: 8 | 16 | 32 | 64 = (opcode & 1) === 0 ? 8 : bits;
+    const at = (base: Register): Operand => ({
+      kind: "memory",
+      base,
+      scale: 1,
+      displacement: 0n,
+      ripRelative: false,
+      bits: width,
+    });
+    if (opcode === 0xa6 || opcode === 0xa7 || opcode === 0xae || opcode === 0xaf) {
+      throw new DecodeError(
+        offset,
+        `0x${opcode.toString(16)} is ${opcode === 0xa6 || opcode === 0xa7 ? "cmps" : "scas"}, which sets the flags from each ` +
+          "element rather than leaving them alone, and is only ever written under a repeat prefix",
+      );
+    }
+    if (repeat === undefined) {
+      throw new DecodeError(
+        offset,
+        `0x${opcode.toString(16)} is a string instruction without a repeat prefix, which moves one element: not in the decoded subset, ` +
+          "because every one a compiler emits is repeated",
+      );
+    }
+    if (opcode === 0xa4 || opcode === 0xa5) return finish("movs", [at("rdi"), at("rsi")]);
+    if (opcode === 0xaa || opcode === 0xab) return finish("stos", [at("rdi"), registerOperand(0, false, width)]);
+    return finish("lods", [registerOperand(0, false, width), at("rsi")]);
+  }
   if (opcode === 0x90) {
     // `nop` is `xchg %eax,%eax` with nothing to swap, and the same encoding with REX.B is `xchg %eax,%r8d`: the one byte that means
     // two things, told apart by whether the register extension was set

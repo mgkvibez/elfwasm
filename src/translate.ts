@@ -1894,6 +1894,94 @@ function translateLoop(
 }
 
 /**
+ * A load at a string instruction's own width, zero-extended.
+ *
+ * Unlike a byte comparison's load this one must not sign-extend: `movs` copies the bits it was given, and a byte of `0x80` copied
+ * as `-128` and stored back as a byte would be the same byte, but a word or a dword widened with its sign and then masked on the
+ * way out is a value that has been through two conversions to arrive where it started.
+ */
+function loadString(operand: Operand, width: 8 | 16 | 32 | 64, instruction: Instruction): number[] {
+  const address = addressOf(operand, instruction);
+  if (width === 64) return [...address, OP.i64Load, ...memarg(0)];
+  const load = width === 32 ? OP.i32Load : width === 16 ? OP.i32Load16U : OP.i32Load8U;
+  return [...address, load, ...memarg(0), WIDEN_32];
+}
+
+/** A value on its way to a store: the i64 register narrowed to a width the store opcode accepts. */
+function storeValue(value: number[], width: 8 | 16 | 32 | 64): number[] {
+  return width === 64 ? value : [...value, NARROW_32];
+}
+
+/**
+ * One of the string instructions under a `0xf3` prefix: `movs`, `stos` or `lods`, repeated `%rcx` times.
+ *
+ * WASM has no repeat prefix and does not need one: the count is a structured loop, checked before the first element so that a zero
+ * count copies nothing, which is the case a `rep` in front of an already-full buffer always hits. The direction flag is clear by
+ * assumption rather than by measurement: it is clear when a function is entered, `std` is refused by name at the decoder, so nothing
+ * translated can set it, and every advance here is an addition.
+ *
+ * The flags are left alone, which is what the architecture says: `movs`, `stos` and `lods` write no flag, so a branch after one reads
+ * whatever the comparison before it left. A `rep` that retires zero times is not a special case here for the same reason.
+ */
+function translateString(instruction: Instruction): number[] {
+  const [first, second] = instruction.operands;
+  if (first === undefined || second === undefined) {
+    throw new TranslateError(instruction.offset, `${instruction.op} needs two operands, and the decoder did not supply them`);
+  }
+  const destination = instruction.op === "lods" ? undefined : first;
+  const width = first.kind === "memory" ? first.bits : first.kind === "reg" ? first.bits : undefined;
+  if (width !== 8 && width !== 16 && width !== 32 && width !== 64) {
+    throw new TranslateError(instruction.offset, `a repeated ${instruction.op} at ${String(width)} bits is not translated`);
+  }
+  const step = BigInt(width / 8);
+  const counter = localOfRegister("rcx", instruction);
+  /** One register moved by one element, which is the only thing the direction flag decides. */
+  const advance = (name: string): number[] => {
+    const local = localOfRegister(name, instruction);
+    return [...globalGet(local), ...i64Const(step), OP.i64Add, ...globalSet(local)];
+  };
+
+  const body: number[] = [];
+  const advanced: number[][] = [];
+  if (instruction.op === "stos") {
+    if (destination?.kind !== "memory") {
+      throw new TranslateError(instruction.offset, "stos needs its destination in memory");
+    }
+    body.push(...storeToMemory(destination, storeValue(read(second, instruction), width), width, instruction));
+    advanced.push(advance("rdi"));
+  } else if (instruction.op === "movs") {
+    if (destination?.kind !== "memory" || second.kind !== "memory") {
+      throw new TranslateError(instruction.offset, "movs needs both of its operands in memory");
+    }
+    body.push(...storeToMemory(destination, storeValue(loadString(second, width, instruction), width), width, instruction));
+    advanced.push(advance("rdi"), advance("rsi"));
+  } else if (instruction.op === "lods") {
+    if (second.kind !== "memory") {
+      throw new TranslateError(instruction.offset, "lods needs its source in memory");
+    }
+    body.push(...loadString(second, width, instruction), ...write(first, instruction));
+    advanced.push(advance("rsi"));
+  } else {
+    throw new TranslateError(instruction.offset, `a repeated ${instruction.op} is not translated`);
+  }
+
+  return [
+    // a block to branch out of, so the loop's own exit is one `br_if` rather than a second condition
+    OP.block, OP.emptyBlockType,
+    OP.loop, OP.emptyBlockType,
+    // the count is checked before the first element: `rep stos` with `%rcx` zero writes nothing at all
+    ...globalGet(counter), OP.i64Eqz, OP.brIf, 1,
+    ...body.flat(),
+    ...advanced.flat(),
+    ...globalGet(counter), ...i64Const(1n), OP.i64Sub, ...globalSet(counter),
+    OP.br, 0,
+    OP.end,
+    OP.end,
+  ];
+}
+
+
+/**
  * Translates `[from, to)` into `out`, returning where it stopped.
  *
  * Branches become structure rather than jumps, because WASM has no jump: a forward conditional branch is an `if` around
@@ -1966,6 +2054,16 @@ function translateRange(
     if (instruction.op === "nop" || instruction.op === "endbr64" || instruction.op === "prefetch") {
       // nothing observable: no register, no flag, and no memory is read even when the operand names an address, which is why a
       // nop inside a function whose image was not supplied still translates
+      index += 1;
+      continue;
+    }
+    if (instruction.op === "movs" || instruction.op === "stos" || instruction.op === "lods") {
+      out.push(...translateString(instruction));
+      index += 1;
+      continue;
+    }
+    if (instruction.op === "cld") {
+      // the direction flag is clear already, so the instruction has nothing to change; only `std` would, and it is refused at decode
       index += 1;
       continue;
     }

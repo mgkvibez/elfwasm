@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 349
+**Tests:** 358
 
 ```bash
 npm ci && npm run verify
@@ -105,14 +105,14 @@ wrong instruction length cannot pass: a decoder that is one byte out still retur
 not the ones the compiler emitted, and everything after that point is out of phase.
 
 Everything outside the subset is refused by offset, never skipped: an SSE opcode that is not in the subset, a 16-bit operand
-size, a repeat prefix, the rotates, `movzx` from a 16-bit register, a truncated instruction, and the `lea` form that cannot
-exist are each named.
+size, a rotate, `movzx` from a 16-bit register, a truncated instruction, and the `lea` form that cannot exist are each named.
 
-Measured on `/bin/ls`, the decoder accounts for the first 4530 instructions of `.text` and then refuses at offset `0x49a8` on
-`f3 48 ab`, which is `rep stos %rax,(%rdi)`: the repeat prefix is the part outside the subset. That refusal is the claim.
-Every byte before it is decoded, and the instruction it stops on is named as a repeat prefix rather than as something else,
-because a reader sent to the wrong part of the architecture will not find it. Two earlier measurements stood in this
-paragraph and both are gone: `movdqa` at `0x10a` was the first, and the vector moves are in the subset now.
+Measured on `/bin/ls`, the decoder accounts for the first 8438 instructions of `.text` and then refuses at offset `0x8891` on
+`66 0f c6`, which is `shufps`: a shuffle across the four lanes of a vector register, the first SSE instruction the walk has
+reached that is not one this decoder reads. Every byte before it is decoded, and the instruction it stops on is named by what
+it is rather than as something else, because a reader sent to the wrong part of the architecture will not find it. Earlier
+measurements stood in this paragraph and each one is gone as its instruction landed: `movdqa` at `0x10a`, then `f3 48 ab`
+at `0x49a8`, which was `rep stos %rax,(%rdi)` and is now translated.
 
 ## The translator
 
@@ -120,7 +120,8 @@ paragraph and both are gone: `movdqa` at `0x10a` was the first, and the vector m
 result, sixteen `i64` globals for the sixteen registers in encoding order. The subset is `mov`, `lea`, `movzx`, `movsx`,
 `movsxd`, `add`, `sub`, `xor`, `and` and `or` at every width from a byte to a qword, `adc` and `sbb` in the group 1 and group 3
 forms, `imul` at 32 and 64 bits, `inc` and `dec` at every width, `cmp` and `test`, `cmpxchg`, `xchg`, `setcc`, `pcmpeqd`, the ten
-conditional branches that need only zf, sf, cf and of, `jmp` in both directions, loops, `call`, `syscall`, and `ret`, which returns `rax`.
+conditional branches that need only zf, sf, cf and of, `jmp` in both directions, loops, `movs`, `stos` and `lods` under a `rep`
+prefix, `cld`, `call`, `syscall`, and `ret`, which returns `rax`.
 
 Flags are never materialised as variables. `cmp` and `test` leave their operands in two extra locals and a `jcc` becomes
 the comparison itself, at the width the operands were: that is why `cmp $-1, %eax ; jl` and `cmp $-1, %rax ; jl` behave
@@ -557,6 +558,30 @@ machine's terms: one code segment, one offset width, so there is nothing for the
 
 `tests/memory.test.ts` pins the widths where the answer is visible in the buffer: `incq` on five is six, a word at `0x40ff` becomes
 `0x4100` with the carry running into the byte above it and no further, and a word of all ones wraps to zero.
+
+### The repeat prefix
+
+`f3 48 ab` is `rep stos %rax,(%rdi)`, and it stopped both walks: the decoder refused the prefix outright, and the translator
+had no way to say "this many times" at all. Both halves are now the same decision, that the repetition belongs to the prefix
+rather than to the instruction, so the instruction carries it and the translator turns it into structure.
+
+WASM has no repeat, and it does not need one: the count is a `block` around a `loop`, and the first thing inside the loop is
+`%rcx` against zero with a `br_if` out. Checking before the element rather than after it is what makes a zero count do
+nothing at all, which is the case a `rep` in front of a buffer that is already full always hits: no move, no store, and no
+pointer advanced past where it started.
+
+The direction flag is clear by assumption rather than by measurement, and the assumption is stated rather than hidden: it is
+clear when a function is entered, `std` is refused by name at the decoder, so nothing translated can set it, and every advance
+here is an addition. `cld` decodes and translates as nothing, since the flag is already in the state it asks for.
+
+Two refusals are about the architecture rather than about effort. `rep cmps` and `rep scas` stop early when the zero flag says
+so, which makes their count an answer about the data instead of the number of elements, so they are named rather than read as
+the instructions they share six of their eight opcodes with. And `movs`, `stos` and `lods` without a prefix move one element
+and are named for that reason: every one a compiler emits is repeated.
+
+The tests pin the three things that are easy to get wrong: three qwords written and a fourth left alone, a byte count of zero
+that writes nothing and leaves `%rdi` where it was, and a `jne` after a `rep stos` that still reads the `cmp` before it, since
+a repeat writes no flag.
 
 ### The compare and swap
 

@@ -517,6 +517,49 @@ describe("a real ELF64 binary from the host", () => {
   });
 });
 
+describe("the repeat prefix on a string instruction", () => {
+  it("decodes rep stos and rep movs at the width their own opcode carries", () => {
+    // f3 48 ab is `rep stos %rax,(%rdi)`, which is where a walk of /bin/ls and the translation of a glibc function both stopped
+    const stos = decode(hex("f3 48 ab"))[0]!;
+    expect(stos.op).toBe("stos");
+    expect(stos.repeat).toBe("rep");
+    expect(stos.operands[0]).toMatchObject({ kind: "memory", base: "rdi", bits: 64, displacement: 0n, scale: 1 });
+    expect(stos.operands[1]).toMatchObject({ kind: "reg", name: "rax", bits: 64 });
+
+    // the even opcode is the byte form, whatever REX says
+    const bytes = decode(hex("f3 aa"))[0]!;
+    expect(bytes.op).toBe("stos");
+    expect(bytes.operands[0]).toMatchObject({ kind: "memory", base: "rdi", bits: 8 });
+    expect(bytes.operands[1]).toMatchObject({ kind: "reg", name: "al", bits: 8 });
+
+    // movs names both addresses, and a 0x66 prefix makes the element a word
+    const movs = decode(hex("66 f3 a5"))[0]!;
+    expect(movs.op).toBe("movs");
+    expect(movs.operands).toMatchObject([
+      { kind: "memory", base: "rdi", bits: 16 },
+      { kind: "memory", base: "rsi", bits: 16 },
+    ]);
+    // lods into %rax without REX.W is a dword, since the width is the operand size the encoding settled on
+    expect(decode(hex("f3 ad"))[0]!.operands).toMatchObject([{ kind: "reg", name: "rax", bits: 32 }, { kind: "memory", base: "rsi" }]);
+  });
+
+  it("names what it will not repeat, and why", () => {
+    // scas and cmps answer with the zero flag rather than the count, so their repeated form is a different instruction
+    expect(() => decode(hex("f3 a6"))).toThrow(/cmps/);
+    expect(() => decode(hex("f3 af"))).toThrow(/scas/);
+    // without the prefix it is a single element, which no compiler emits and this translator does not run
+    expect(() => decode(hex("aa"))).toThrow(/without a repeat prefix/);
+    // and a prefix in front of something that is not a string instruction is still not in the subset
+    expect(() => decode(hex("f3 90"))).toThrow(/lock or repeat prefix/);
+  });
+
+  it("reads cld as nothing and refuses std by name", () => {
+    // clear the direction flag: already clear, and nothing translated can set it
+    expect(decode(hex("fc"))[0]!.op).toBe("cld");
+    expect(() => decode(hex("fd"))).toThrow(/std is not in the decoded subset/);
+  });
+});
+
 describe("group 3 at a byte's width", () => {
   it("reads test, not and neg, and names the encodings it does not have", () => {
     // f6 c6 48 is `test $0x48, %dh`, which is what the second instruction of a glibc ifunc resolver is

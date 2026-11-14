@@ -568,3 +568,75 @@ describe("a switch table whose base is loaded far from the jump", () => {
     expect(() => runWithTable(clobbered(), [0x2f, 0x35, 0x3b, 0x41])).toThrow(/its table cannot be read/);
   });
 });
+
+describe("the repeated string instructions", () => {
+  /*
+   * `rep stos`, `rep movs` and `rep lods` under a `0xf3` prefix, which is what both walks stopped on: `f3 48 ab` is eight bytes of
+   * `%rax` written `%rcx` times. The count is a loop whose condition is checked before the first element, so a zero `%rcx` writes
+   * nothing, and the flags are untouched, so a branch after one still reads the comparison before it.
+   */
+  it("writes %rax %rcx times and leaves %rdi past the last element", () => {
+    // mov $0x400100,%rdi ; mov $5,%rax ; mov $3,%rcx ; rep stos %rax,(%rdi)
+    const { buffer } = run(hex("48 c7 c7 00 01 40 00 48 c7 c0 05 00 00 00 48 c7 c1 03 00 00 00 f3 48 ab c3"));
+    for (const offset of [0x100, 0x108, 0x110]) {
+      expect(buffer[offset]).toBe(5);
+      expect(buffer[offset + 7]).toBe(0);
+    }
+    // the fourth qword is outside the count and still zero, which is what says the loop stopped at three
+    expect(buffer[0x118]).toBe(0);
+  });
+
+  it("writes a byte %rcx times, which is the width the even opcode carries", () => {
+    // mov $0x400100,%rdi ; mov $0x41,%al ; mov $3,%rcx ; rep stos %al,(%rdi)
+    const { buffer } = run(hex("48 c7 c7 00 01 40 00 b0 41 48 c7 c1 03 00 00 00 f3 aa c3"));
+    expect(buffer[0x100]).toBe(0x41);
+    expect(buffer[0x101]).toBe(0x41);
+    expect(buffer[0x102]).toBe(0x41);
+    expect(buffer[0x103]).toBe(0x00);
+  });
+
+  it("writes nothing when the count is zero, and does not move the pointer", () => {
+    // mov $0x400100,%rdi ; mov $0x41,%al ; xor %rcx,%rcx ; rep stos %al,(%rdi) ; mov %rdi,%rax ; ret
+    const zero = run(hex("48 c7 c7 00 01 40 00 b0 41 48 31 c9 f3 aa 48 89 f8 c3"), { fill: 0x11 });
+    expect(zero.buffer[0x100]).toBe(0x11);
+    // %rdi is the answer, and it is where it started rather than one past the first element
+    expect(zero.result).toBe(0x400100n);
+  });
+
+  it("moves the bytes the source held, eight at a time and one at a time", () => {
+    /** Fills a source range, runs a translated body through the same buffer, and hands it back. */
+    const copy = (bytes: string, source: number, length: number): Uint8Array => {
+      const memory = new runtime.Memory({ initial: 1 });
+      const buffer = new Uint8Array(memory.buffer);
+      buffer.fill(0);
+      for (let index = 0; index < length; index += 1) buffer[source + index] = 0xa0 + index;
+      const module = translateBytes(hex(bytes), "main", { addresses: addressSpaceOf(imageOf()), memoryPages: 1 });
+      const instance = new runtime.Instance(new runtime.Module(module), { env: { memory } });
+      instance.exports.main!();
+      return buffer;
+    };
+
+    // mov $0x400100,%rdi ; mov $0x400200,%rsi ; mov $1,%rcx ; rep movs %rax,(%rsi)
+    const qword = copy("48 c7 c7 00 01 40 00 48 c7 c6 00 02 40 00 48 c7 c1 01 00 00 00 f3 48 a5 c3", 0x200, 8);
+    for (let index = 0; index < 8; index += 1) expect(qword[0x100 + index]).toBe(0xa0 + index);
+    // the byte after the copied qword is untouched, which is what makes the width the operand size rather than a guess
+    expect(qword[0x108]).toBe(0);
+
+    // the byte form: mov $3,%rcx ; rep movs %al,(%rsi), three bytes and the fourth left alone
+    const bytes8 = copy("48 c7 c7 00 01 40 00 48 c7 c6 00 02 40 00 48 c7 c1 03 00 00 00 f3 a4 c3", 0x200, 4);
+    expect([0, 1, 2, 3].map((index) => bytes8[0x100 + index])).toEqual([0xa0, 0xa1, 0xa2, 0x00]);
+  });
+
+  it("leaves the flags a comparison set, so a branch after one still reads it", () => {
+    // mov $2,%rax ; cmp $2,%rax ; mov $0x400100,%rdi ; mov $2,%rcx ; rep stos %rax,(%rdi) ; jne skip ; mov $1,%rax ; ret ; skip: xor %rax,%rax ; ret
+    const taken = run(
+      hex("48 c7 c0 02 00 00 00 48 39 c0 48 c7 c7 00 01 40 00 48 c7 c1 02 00 00 00 f3 48 ab 75 07 48 c7 c0 01 00 00 00 c3 48 31 c0 c3"),
+    );
+    expect(taken.result).toBe(1n);
+  });
+
+  it("refuses a repeat that would stop early on the zero flag, and names it", () => {
+    // f3 a6 is rep cmpsb, which counts matches rather than elements
+    expect(() => run(hex("f3 a6 c3"))).toThrow(/cmps/);
+  });
+});
