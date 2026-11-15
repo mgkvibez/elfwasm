@@ -407,7 +407,13 @@ const BYTE_REGISTER_OPS: Readonly<Record<number, { op: string; intoRegister: boo
   0x8a: { op: "mov", intoRegister: true },
 };
 
-const SHIFTS: readonly (string | undefined)[] = [undefined, undefined, undefined, undefined, "shl", "shr", undefined, "sar"];
+/**
+ * The shift group's `/reg` field, in the order the field numbers them.
+ *
+ * `/0` and `/1` are the two rotates, `/4`, `/5` and `/7` the three shifts. `/2` and `/3` are `rcl` and `rcr`, which rotate through the
+ * carry, and `/6` is not an encoding at all: they are left undefined here so the refusal can name them separately.
+ */
+const SHIFTS: readonly (string | undefined)[] = ["rol", "ror", undefined, undefined, "shl", "shr", undefined, "sar"];
 
 function decodeOne(bytes: Uint8Array, offset: number): Instruction {
   const cursor: Cursor = { bytes, start: offset, index: offset };
@@ -1225,7 +1231,10 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
     if (mnemonic === undefined) {
       throw new DecodeError(
         offset,
-        `shift group /${modrm.regField} is a rotate or an undefined encoding, and neither is in the decoded subset`,
+        modrm.regField === 2 || modrm.regField === 3
+          ? `shift group /${modrm.regField} is ${modrm.regField === 2 ? "rcl" : "rcr"}, which rotates through the carry and is not in ` +
+            "the decoded subset: the bit coming in is the one an earlier instruction left"
+          : `shift group /${modrm.regField} is not an encoding: the group numbers its six operations 0, 1, 2, 3, 4, 5 and 7`,
       );
     }
     if (opcode === 0xd0 || opcode === 0xd1) return finish(mnemonic, [modrm.rm, { kind: "immediate", value: 1n }]);

@@ -127,6 +127,14 @@ const SBB_CARRY = 18;
  * two locals: so an exchange that borrowed them would change what a `jne` after an earlier `cmp` answers. That is the bug the first
  * test written for this caught, and the swap is not a comparison in any case.
  */
+/**
+ * Where a rotate keeps its count and the value it is rotating.
+ *
+ * The count is a run-time number, so the two shifts that make a rotate need it twice, and the second one needs its complement. Keeping
+ * both in locals means the count is computed once and the value is masked once, instead of twice each.
+ */
+const ROT_K = 23;
+const ROT_X = 24;
 const EXCH_A = 19;
 const EXCH_B = 20;
 /**
@@ -136,7 +144,7 @@ const EXCH_B = 20;
  * its own beyond which block to run next. This local is that.
  */
 const PC = 3;
-const LOCAL_COUNT = 23;
+const LOCAL_COUNT = 25;
 
 /** The imported syscall's function index, which is 0: an import comes before every function the module defines. */
 const SYSCALL_INDEX = 0;
@@ -1140,6 +1148,68 @@ function translateShift(instruction: Instruction): number[] {
 }
 
 /**
+ * A rotate of a register by an immediate or by `%cl`.
+ *
+ * A rotate is two shifts and an `or`: rotating right by `k` is `(x >> k) | (x << (w - k))`, and rotating left is the same with the two
+ * shifts swapped. The count is masked the way the processor masks it, five bits below 64 and six at 64, and then reduced to the width,
+ * so `ror $8,%al` is no rotation at all rather than eight shifts.
+ *
+ * The width matters only in the mask: a byte rotates inside its own eight bits, which is why the value is masked to the width before
+ * anything else and the result is masked again before it is written back. `w - k` is computed as `-k` and masked, so a count of zero
+ * gives a shift of zero in both directions and the answer is the value unchanged.
+ */
+function translateRotate(instruction: Instruction): number[] {
+  const [destination, count] = instruction.operands;
+  if (destination === undefined || count === undefined) {
+    throw new TranslateError(instruction.offset, `${instruction.op} needs two operands`);
+  }
+  if (destination.kind !== "reg") {
+    throw new TranslateError(instruction.offset, `a ${instruction.op} into ${destination.kind} is not translated yet`);
+  }
+  if (count.kind === "memory") {
+    throw new TranslateError(instruction.offset, `a ${instruction.op} whose count is in memory is not translated yet`);
+  }
+  const width = destination.bits;
+  if (width !== 8 && width !== 16 && width !== 32 && width !== 64) {
+    throw new TranslateError(instruction.offset, `a ${width}-bit ${instruction.op} is not translated yet`);
+  }
+  const mask = width === 8 ? 0xffn : width === 16 ? 0xffffn : width === 32 ? 0xffffffffn : 0xffffffffffffffffn;
+  const within = BigInt(width - 1);
+  const right = instruction.op === "ror";
+  return [
+    // the count, masked as the processor masks it and then reduced to the width
+    ...operandCode64(count, instruction),
+    ...i64Const(width === 64 ? 63n : 31n),
+    OP.i64And,
+    ...i64Const(within),
+    OP.i64And,
+    OP.localSet,
+    ...unsigned(ROT_K),
+    // the value, masked to the width it rotates inside
+    ...read(destination, instruction),
+    ...i64Const(mask),
+    OP.i64And,
+    OP.localSet,
+    ...unsigned(ROT_X),
+    // (x >> k) | (x << -k) for a rotate right, and the two shifts the other way round for a rotate left
+    ...localGet(ROT_X),
+    ...localGet(ROT_K),
+    right ? OP.i64ShrU : OP.i64Shl,
+    ...localGet(ROT_X),
+    ...i64Const(0n),
+    ...localGet(ROT_K),
+    OP.i64Sub,
+    ...i64Const(within),
+    OP.i64And,
+    right ? OP.i64Shl : OP.i64ShrU,
+    OP.i64Or,
+    ...i64Const(mask),
+    OP.i64And,
+    ...write(destination, instruction),
+  ];
+}
+
+/**
  * An operand at the width the operation happens at, ready to sit next to the destination on the stack.
  *
  * A 32-bit register source must be narrowed as well as the destination. Narrowing only the destination is the bug this
@@ -1774,6 +1844,14 @@ function flagCondition(suffix: string, flags: Flags, instruction: Instruction): 
         "and leave the sign, the parity, the carry and the overflow undefined, so only je and jne can be read after one",
     );
   }
+  if (flags.kind === "rotate" && !SHIFT_CONDITIONS.has(suffix)) {
+    throw new TranslateError(
+      instruction.offset,
+      `a ${instruction.op} after a rotate reads a flag the rotate does not define here: the zero, sign and parity flags come through a ` +
+        "rotate unchanged and are still the ones before it, but the carry and the overflow describe the bits that went round, which is " +
+        "not modelled",
+    );
+  }
   if (flags.kind === "shift" && !SHIFT_CONDITIONS.has(suffix)) {
     throw new TranslateError(
       instruction.offset,
@@ -1802,7 +1880,7 @@ interface Flags {
    * What defined them. A comparison defines every condition a compiler reads; a bit test defines the carry and leaves the rest
    * undefined, so the conditions that read them are refused instead of being answered from a value that is not there.
    */
-  kind?: "bit" | "shift" | "zero" | undefined;
+  kind?: "bit" | "shift" | "zero" | "rotate" | undefined;
 }
 
 function indexOfOffset(instructions: readonly Instruction[], offset: number): number {
@@ -2109,6 +2187,13 @@ function translateRange(
           "a backward jmp needs a loop, and this one does not begin where a loop is opened",
         );
       }
+      if (target > to) {
+        throw new TranslateError(
+          instruction.offset,
+          "a jmp out of the block it sits in, past that block's end, cannot be transcribed without restructuring the block " +
+            "around it: the jump would have to leave two nested regions at once, and a branch here leaves one",
+        );
+      }
       // the bytes it skips are unreachable, and are emitted behind an always-false branch so that the module stays
       // structured and a jmp past code this cannot translate is refused rather than quietly skipped
       out.push(...i32Const(0), OP.ifEmpty, OP.emptyBlockType);
@@ -2148,6 +2233,21 @@ function translateRange(
         throw new TranslateError(
           instruction.offset,
           `a backward ${instruction.op} needs a loop, and this one does not begin where a loop is opened`,
+        );
+      }
+      if (target > to) {
+        /*
+         * A jump out of the block it sits in, past that block's end. The conditional form would have to leave two nested regions at
+         * once to reach the target, and an `if` here leaves one, so the region built for the skipped bytes would run past the end of
+         * the region it sits in and translate the target's own block as part of them. That is not a refusal for tidiness: it is the
+         * shape that answered a wrong number before this check existed, because the bytes after the enclosing end were translated
+         * once as skipped code and once as the fall-through, and the copy inside the `if` answered a branch that was not taken.
+         */
+        throw new TranslateError(
+          instruction.offset,
+          `a ${instruction.op} out of the block it sits in, past that block's end at offset ` +
+            `${instructions[to]?.offset.toString(16) ?? "?"}, needs the block around it restructured: a branch here leaves one ` +
+            "region, and reaching this target means leaving two",
         );
       }
       const join = findJoin(instructions, index + 1, target, target, to);
@@ -3027,6 +3127,22 @@ function translateRange(
       index += 1;
       continue;
     }
+    if (instruction.op === "rol" || instruction.op === "ror") {
+      /*
+       * A rotate is the one bit-moving instruction that does *not* touch the flags a comparison left: the zero, sign and parity flags
+       * come through it unchanged, and only the carry and the overflow describe the bits that went round. So nothing is written to the
+       * comparison locals here, and a `jz` after a rotate still answers the comparison before it, which is what the processor does.
+       *
+       * The carry is a different matter: it is the last bit that came round, this translator does not compute it, and reading it from
+       * the comparison locals would answer an older comparison. So the flags are marked as a rotate's, which allows the conditions the
+       * rotate really defines and refuses the ones that describe the bits it moved.
+       */
+      out.push(...translateRotate(instruction));
+      flags.borrows = undefined;
+      flags.kind = "rotate";
+      index += 1;
+      continue;
+    }
     if (instruction.op === "inc" || instruction.op === "dec") {
       /*
        * `inc` is `add $1` and `dec` is `sub $1`, so both go through the arithmetic path rather than beside it, including the memory
@@ -3391,7 +3507,8 @@ function registerNumberOf(name: string): number | undefined {
  */
 /** The operations whose first operand is the register they write, which is what makes one instruction the definition of another. */
 const WRITING_OPERATIONS = new Set([
-  "mov", "movsxd", "movzx", "movsx", "lea", "add", "sub", "and", "or", "xor", "adc", "sbb", "shl", "shr", "sar", "imul", "inc",
+  "mov", "movsxd", "movzx", "movsx", "lea", "add", "sub", "and", "or", "xor", "adc", "sbb", "shl", "shr", "sar", "rol", "ror",
+  "imul", "inc",
   "pcmpeqd",
   "shufps",
   "shufpd",

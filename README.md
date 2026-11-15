@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 363
+**Tests:** 368
 
 ```bash
 npm ci && npm run verify
@@ -107,19 +107,20 @@ not the ones the compiler emitted, and everything after that point is out of pha
 Everything outside the subset is refused by offset, never skipped: an SSE opcode that is not in the subset, a 16-bit operand
 size, a rotate, `movzx` from a 16-bit register, a truncated instruction, and the `lea` form that cannot exist are each named.
 
-Measured on `/bin/ls`, the decoder accounts for the first 11285 instructions of `.text` and then refuses at offset `0xb4c5` on
-the shift group's `/1`, which is a rotate: the one instruction family this decoder can name but does not read, because `ror` and
-`rol` come through the same opcodes as `shr` and `shl` and only the reg field tells them apart. Every byte before it is decoded,
-and the instruction it stops on is named by what it is rather than as something else, because a reader sent to the wrong part of
-the architecture will not find it. Earlier measurements stood in this paragraph and each one is gone as its instruction landed:
-`movdqa` at `0x10a`, `f3 48 ab` at `0x49a8` which was `rep stos %rax,(%rdi)`, and `66 0f c6` at `0x8891` which was `shufpd`.
+Measured on `/bin/ls`, the decoder accounts for the first 11297 instructions of `.text` and then refuses at offset `0xb4f0` on
+a lock or repeat prefix, which is the one prefix it names and does not read. Every byte before it is decoded, and the instruction
+it stops on is named by what it is rather than as something else, because a reader sent to the wrong part of the architecture will
+not find it. Earlier measurements stood in this paragraph and each one is gone as its instruction landed: `movdqa` at `0x10a`,
+`f3 48 ab` at `0x49a8` which was `rep stos %rax,(%rdi)`, `66 0f c6` at `0x8891` which was `shufpd`, and the shift group's `/1` at
+`0xb4c5` which was `ror`.
 
 ## The translator
 
 `translate` takes the decoder's instructions and emits one WASM function per x86-64 function: no parameters, one `i64`
 result, sixteen `i64` globals for the sixteen registers in encoding order. The subset is `mov`, `lea`, `movzx`, `movsx`,
 `movsxd`, `add`, `sub`, `xor`, `and` and `or` at every width from a byte to a qword, `adc` and `sbb` in the group 1 and group 3
-forms, `imul` at 32 and 64 bits, `inc` and `dec` at every width, `cmp` and `test`, `cmpxchg`, `xchg`, `setcc`, `pcmpeqd`, the ten
+forms, `imul` at 32 and 64 bits, `inc` and `dec` at every width, `shl`, `shr`, `sar`, `rol` and `ror` by an immediate or by `%cl`,
+`cmp` and `test`, `cmpxchg`, `xchg`, `setcc`, `pcmpeqd`, the ten
 conditional branches that need only zf, sf, cf and of, `jmp` in both directions, loops, `movs`, `stos` and `lods` under a `rep`
 prefix, `cld`, `shufps` and `shufpd`, `punpckhqdq`, `call`, `syscall`, and `ret`, which returns `rax`.
 
@@ -582,6 +583,42 @@ and are named for that reason: every one a compiler emits is repeated.
 The tests pin the three things that are easy to get wrong: three qwords written and a fourth left alone, a byte count of zero
 that writes nothing and leaves `%rdi` where it was, and a `jne` after a `rep stos` that still reads the `cmp` before it, since
 a repeat writes no flag.
+
+### The two rotates
+
+`rol` and `ror` share their opcode with `shr` and `shl`: the group's `/reg` field is the only thing that separates them, `/0` and
+`/1` against `/4` and `/5`. Two more of the eight slots are the rotates through the carry, `rcl` and `rcr`, and one is not an
+encoding at all; all three are refused by name rather than as "not in the subset", because a reader looking up the wrong slot will
+not find why.
+
+A rotate is two shifts and an `or`. Rotating right by `k` is `(x >> k) | (x << (w - k))`, and rotating left is the same with the two
+shifts exchanged. The count is masked the way the processor masks it, five bits below 64 and six at 64, and then reduced to the
+width, so `ror $8,%al` is no rotation rather than eight shifts and `ror %cl` with 33 in `%cl` rotates a dword by one. `w - k` is
+computed as `-k` and masked, so a count of zero shifts by zero in both directions and the answer is the value unchanged.
+
+The reason a rotate is not simply a shift is the flags. A shift replaces the zero, sign, parity and carry flags with facts about the
+bits that left; a rotate leaves the zero, sign and parity flags exactly as they were and writes only the carry and the overflow. So
+nothing is written to the comparison locals on a rotate's path, and a `jz` after a rotate still answers the comparison before it,
+which is what a compiler relies on in a loop like `cmp $8,%eax ; ror $1,%rbx ; jne`. The carry is a different matter: it is the
+last bit that came round, this translator does not compute it, and reading it from the comparison locals would answer an older
+comparison. A carry condition after a rotate is therefore refused by name, and so is an `adc` or `sbb`, through the same flag kind
+that already refuses them after a shift.
+
+`tools/native/rotate.s` checks every case against the processor: the swap-halves idiom, a byte rotating inside its own eight bits, a
+count equal to the width, a word rotated through `%cl`, and the two flag cases. It is an integer instruction on a host whose SSE is
+untrustworthy rather than its arithmetic, so it can be compared here where the shuffles cannot.
+
+#### A jump out of its own block
+
+While writing those cases I found that a branch from inside an `if` to a target *past the end of that if* was translated into the
+wrong shape, and answered the wrong number without saying anything. The region built for the bytes a conditional jump skips ran past
+the end of the region it sat in, so the target's own block was translated twice: once as code the jump steps over and once as the
+fall-through. A branch inside the `if` that was not taken then reached the copy inside the region instead of the block it named.
+
+The honest answer is a refusal, and it is what happens now: a `jcc` or `jmp` whose target is past its enclosing region's end says
+that the block around it would have to be restructured, and names the end it cannot reach past. Targets that *are* a boundary of an
+enclosing region, which is the common shape of a compiled function, are untouched and still translate. This costs coverage, and it
+is why the static-PIE entry now stops on a `js` in its own first thirty-two bytes rather than a hundred instructions into libc.
 
 ### The two shuffles
 

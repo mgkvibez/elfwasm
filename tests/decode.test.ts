@@ -323,7 +323,7 @@ describe("the pieces a compiler leans on", () => {
     expect(refuseBytes(hex("0f 57 c0")).message).toContain("SSE");
   });
 
-  it("reads the four accumulator instructions and still refuses the rotates by name", () => {
+  it("reads the four accumulator instructions, the two rotates, and refuses the carries by name", () => {
     // `f7 f1` is div %rcx: an opcode whose registers the encoding does not name, which the decoder now reports as such
     expect(decode(hex("f7 f1"))[0]).toMatchObject({ op: "div" });
     expect(decode(hex("f7 e1"))[0]).toMatchObject({ op: "mul" });
@@ -331,7 +331,22 @@ describe("the pieces a compiler leans on", () => {
     expect(decode(hex("f7 f9"))[0]).toMatchObject({ op: "idiv" });
     // the byte form is still refused, because its dividend is `%ax` rather than `%rdx:%rax`
     expect(refuseBytes(hex("f6 f1")).message).toContain("implicit registers");
-    expect(refuseBytes(hex("d1 c0")).message).toContain("rotate");
+    // `d1 c0` is `rol $1,%eax`, which is read now: the group's `/0` and `/1` are the two rotates and `/4`, `/5`, `/7` the shifts
+    // the destination is named by its 64-bit name and carries its own width, which is how every non-byte register reads here
+    expect(decode(hex("d1 c0"))[0]).toMatchObject({
+      op: "rol",
+      operands: [{ kind: "reg", name: "rax", bits: 32 }, { kind: "immediate", value: 1n }],
+    });
+    // and the same bytes behind REX.W are the 64-bit form, so the rotate is a rotation of the whole register
+    expect(decode(hex("48 d1 c0"))[0]).toMatchObject({
+      op: "rol",
+      operands: [{ kind: "reg", name: "rax", bits: 64 }, { kind: "immediate", value: 1n }],
+    });
+    expect(decode(hex("d1 c8"))[0]).toMatchObject({ op: "ror" });
+    // what is still refused are the two that rotate through the carry, and the encoding the group does not define
+    expect(refuseBytes(hex("d1 d0")).message).toContain("rcl");
+    expect(refuseBytes(hex("d1 d8")).message).toContain("rcr");
+    expect(refuseBytes(hex("d1 f0")).message).toContain("is not an encoding");
   });
 
   it("reads a shift by cl as cl, not as a fixed count", () => {

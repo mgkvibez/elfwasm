@@ -16,6 +16,16 @@ the translator to a number written by hand.
 Adding a program: write the `.s` file, end it in `ret`, keep the result in `rax`, and make sure the result fits in the
 low eight bits, since that is what a process exit status carries.
 
+## rotate.s
+
+The two rotates, at every width the translator reads them: the swap-halves idiom (`ror $32`), a byte rotating inside its own eight
+bits, a count equal to the width which is no rotation at all, a word rotated through `%cl`, and the two flag cases a branch depends
+on, a comparison that a rotate must not disturb. Every case compares against a constant that can be read off the definition, and a
+failure returns the number of the case, so the exit status names what broke rather than needing a second run.
+
+All the cases share one failure label, which is not only tidy: a jump out of the block it sits in is refused now (see the README's
+note on that shape), and a program whose every branch lands in one block after the last check never asks for it.
+
 ## The two shuffles, which are not here
 
 `shufps` and `shufpd` have no program in this directory, and the reason is the host rather than the instructions. The sandbox this

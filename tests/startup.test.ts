@@ -399,10 +399,16 @@ describe("the extent a resolver is translated from", () => {
       writeFileSync(source, "int main(void) { return 7; }\n");
       execFileSync("gcc", ["-static-pie", "-o", executable, source], { stdio: "ignore" });
       const bytes = readFileSync(executable) as Uint8Array;
-      const loaded = loadResolved(bytes, { base: 0x400000n, stackPages: 8 });
-      const entry = BigInt(loaded.image.entryAddress) + loaded.image.baseAddress;
+      /*
+       * The load is inside the guard as well, because it translates: a static PIE resolves its own relocations by translating the
+       * functions they name, and a function this cannot transcribe refuses at that point rather than at the entry. That is where the
+       * entry's own branch shape now stops, a `js` whose target is past the end of the block it sits in, so the frontier is in the
+       * entry's function and not yet inside libc.
+       */
       let refusal: unknown;
       try {
+        const loaded = loadResolved(bytes, { base: 0x400000n, stackPages: 8 });
+        const entry = BigInt(loaded.image.entryAddress) + loaded.image.baseAddress;
         translatedResolver({ bytes, image: loaded.image, memory: loaded.memory, stackPages: 8 })(entry);
       } catch (error) {
         refusal = error;
