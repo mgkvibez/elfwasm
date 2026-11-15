@@ -66,7 +66,7 @@ and `mmap`. Two honest limits of the mapping:
 WASM linear memory has no per-page protection, so the `read`/`write`/`execute` flags are carried for the translator to
 honour rather than enforced by hardware; and the 32-bit address space means an image larger than 4 GiB is refused.
 
-**Tests:** 358
+**Tests:** 363
 
 ```bash
 npm ci && npm run verify
@@ -107,12 +107,12 @@ not the ones the compiler emitted, and everything after that point is out of pha
 Everything outside the subset is refused by offset, never skipped: an SSE opcode that is not in the subset, a 16-bit operand
 size, a rotate, `movzx` from a 16-bit register, a truncated instruction, and the `lea` form that cannot exist are each named.
 
-Measured on `/bin/ls`, the decoder accounts for the first 8438 instructions of `.text` and then refuses at offset `0x8891` on
-`66 0f c6`, which is `shufps`: a shuffle across the four lanes of a vector register, the first SSE instruction the walk has
-reached that is not one this decoder reads. Every byte before it is decoded, and the instruction it stops on is named by what
-it is rather than as something else, because a reader sent to the wrong part of the architecture will not find it. Earlier
-measurements stood in this paragraph and each one is gone as its instruction landed: `movdqa` at `0x10a`, then `f3 48 ab`
-at `0x49a8`, which was `rep stos %rax,(%rdi)` and is now translated.
+Measured on `/bin/ls`, the decoder accounts for the first 11285 instructions of `.text` and then refuses at offset `0xb4c5` on
+the shift group's `/1`, which is a rotate: the one instruction family this decoder can name but does not read, because `ror` and
+`rol` come through the same opcodes as `shr` and `shl` and only the reg field tells them apart. Every byte before it is decoded,
+and the instruction it stops on is named by what it is rather than as something else, because a reader sent to the wrong part of
+the architecture will not find it. Earlier measurements stood in this paragraph and each one is gone as its instruction landed:
+`movdqa` at `0x10a`, `f3 48 ab` at `0x49a8` which was `rep stos %rax,(%rdi)`, and `66 0f c6` at `0x8891` which was `shufpd`.
 
 ## The translator
 
@@ -121,7 +121,7 @@ result, sixteen `i64` globals for the sixteen registers in encoding order. The s
 `movsxd`, `add`, `sub`, `xor`, `and` and `or` at every width from a byte to a qword, `adc` and `sbb` in the group 1 and group 3
 forms, `imul` at 32 and 64 bits, `inc` and `dec` at every width, `cmp` and `test`, `cmpxchg`, `xchg`, `setcc`, `pcmpeqd`, the ten
 conditional branches that need only zf, sf, cf and of, `jmp` in both directions, loops, `movs`, `stos` and `lods` under a `rep`
-prefix, `cld`, `call`, `syscall`, and `ret`, which returns `rax`.
+prefix, `cld`, `shufps` and `shufpd`, `punpckhqdq`, `call`, `syscall`, and `ret`, which returns `rax`.
 
 Flags are never materialised as variables. `cmp` and `test` leave their operands in two extra locals and a `jcc` becomes
 the comparison itself, at the width the operands were: that is why `cmp $-1, %eax ; jl` and `cmp $-1, %rax ; jl` behave
@@ -582,6 +582,36 @@ and are named for that reason: every one a compiler emits is repeated.
 The tests pin the three things that are easy to get wrong: three qwords written and a fourth left alone, a byte count of zero
 that writes nothing and leaves `%rdi` where it was, and a `jne` after a `rep stos` that still reads the `cmp` before it, since
 a repeat writes no flag.
+
+### The two shuffles
+
+`66 0f c6` and `0f c6` share an opcode and differ only by the `0x66`: the prefixed one is `shufpd`, which selects each of the two
+quadwords from either operand, and the plain one is `shufps`, which selects each of the four dwords. Both take a byte after the
+ModRM that says which lane goes where.
+
+`shufpd` draws one bit per half. The low half comes from the destination, its own low quadword or its high one when bit 0 is set;
+the high half comes from the source, low or high by bit 1. That is `_mm_shuffle_pd` written out, and it has a consequence worth
+stating: `shufpd $0` is not a no-op. The high half of the result is always the source's, so `$0` writes the source's low quadword
+into it, and only `$1` and `$2` leave one half of the destination alone.
+
+`shufps` reaches only four dwords: the low half of each operand. Selectors 0 and 1 are the destination's first two dwords and 2
+and 3 the source's, so a register's high half cannot be named at all. The selectors are known at translation time, so each output
+lane is a shift and a mask of one of two scratch locals rather than an indexed read: nothing is computed at run time that could
+have been computed here.
+
+#### Why these two have no hardware check
+
+Every other instruction in the subset that could be compared against the processor is, through `tools/native`. These two are not,
+and the reason is the host rather than the code. The sandbox runs under gVisor, and its `shufps` answers are not the
+architecture's: with the destination `[1,2,3,4]` and the source `[5,6,7,8]`, the immediate `0x1b` returned `[4,3,6,5]`, whose lanes
+2 and 3 are the *source's* low dwords, while `0xe4` returned lanes 2 and 3 from the source's *high* dwords. Both were measured
+with `movq` and `punpckhqdq`, so the reading does not depend on the instruction under test, and they contradict each other: no
+single mapping of selector to lane produces both. Its `shufpd` was consistent with the manual on all four immediates and its
+`punpcklqdq` was too, which is what makes the `shufps` result a fault in the emulation rather than in the reading.
+
+So the expectations in `tests/shuffle.test.ts` are written from the intrinsic each instruction defines, and the test file says so
+at the top. The failure that a real processor would catch is caught here by construction instead: each case names the selector it
+is exercising and where that lane must land.
 
 ### The compare and swap
 

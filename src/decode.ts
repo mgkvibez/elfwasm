@@ -212,7 +212,7 @@ interface Rex {
  * The prefix is what makes them vector instructions rather than the MMX or packed-float instructions the same bytes name without
  * it, so a byte that is not in this set is refused by name rather than read as something it is not.
  */
-const VECTOR_WITH_66 = new Set([0x62, 0x6c, 0x6e, 0x76, 0x7e, 0xd6, 0x6f, 0x7f, 0x28, 0x29, 0xdb, 0xdf, 0xeb, 0xef]);
+const VECTOR_WITH_66 = new Set([0x62, 0x6c, 0x6d, 0x6e, 0x76, 0x7e, 0xd6, 0x6f, 0x7f, 0x28, 0x29, 0xdb, 0xdf, 0xeb, 0xef, 0xc6]);
 
 function isSseOpcode(second: number): boolean {
   return (
@@ -816,6 +816,41 @@ function decodeOne(bytes: Uint8Array, offset: number): Instruction {
         throw new DecodeError(offset, "punpcklqdq from memory is not in the decoded subset: only a vector register source is");
       }
       return finish("punpcklqdq", [
+        vectorOperand(modrm.regField, rex.r, "lo", 64),
+        vectorOperand(modrm.rmField ?? 0, rex.b, "lo", 64),
+      ]);
+    }
+    if (second === 0xc6) {
+      /*
+       * The two shuffles that share this opcode, told apart by the mandatory prefix: `66 0f c6` is `shufpd`, which picks each of the two
+       * quadwords from either operand, and `0f c6` is `shufps`, which picks each of the four dwords the same way. The byte after the
+       * ModRM is the selection: two bits per lane for `shufps`, one bit per quadword for `shufpd`.
+       *
+       * The source is a vector register and not memory, for the same reason as the other vector operations here: sixteen bytes from
+       * memory would be two loads this decoder does not emit.
+       */
+      const modrm = decodeModRm(cursor, rex, 64, segment);
+      const op = vector ? "shufpd" : "shufps";
+      if (modrm.rm.kind === "memory") {
+        throw new DecodeError(offset, `${op} from memory is not in the decoded subset: only a vector register source is`);
+      }
+      return finish(op, [
+        vectorOperand(modrm.regField, rex.r, "lo", 64),
+        vectorOperand(modrm.rmField ?? 0, rex.b, "lo", 64),
+        { kind: "immediate", value: readImmediate(cursor, 1) },
+      ]);
+    }
+    if (vector && second === 0x6d) {
+      /*
+       * `punpckhqdq`: the same interleave one half up, so the destination's high half comes down and the source's high half becomes the
+       * high half. It is here for the tests rather than for a program in the walk: without it a translated vector's high half cannot be
+       * read out with anything the subset already has, since `movq` to memory stores the low half only.
+       */
+      const modrm = decodeModRm(cursor, rex, 64, segment);
+      if (modrm.rm.kind === "memory") {
+        throw new DecodeError(offset, "punpckhqdq from memory is not in the decoded subset: only a vector register source is");
+      }
+      return finish("punpckhqdq", [
         vectorOperand(modrm.regField, rex.r, "lo", 64),
         vectorOperand(modrm.rmField ?? 0, rex.b, "lo", 64),
       ]);

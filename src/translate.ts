@@ -87,6 +87,13 @@ const SSE_B = 5;
  */
 const SSE_C = 21;
 /**
+ * Where `shufps` keeps the two halves of its source.
+ *
+ * It reads four halves and writes two, and one of the two it writes is a half it also reads, so every half has to be somewhere else
+ * before the first write. `SSE_A` and `SSE_B` hold the destination's two, `SSE_C` and this the source's.
+ */
+const SSE_D = 22;
+/**
  * Where a division keeps its long-division state.
  *
  * `%rdx:%rax` is a 128-bit dividend and WASM has no divide at that width, so `div` and `idiv` are a bit at a time: the remaining
@@ -129,7 +136,7 @@ const EXCH_B = 20;
  * its own beyond which block to run next. This local is that.
  */
 const PC = 3;
-const LOCAL_COUNT = 22;
+const LOCAL_COUNT = 23;
 
 /** The imported syscall's function index, which is 0: an import comes before every function the module defines. */
 const SYSCALL_INDEX = 0;
@@ -2811,19 +2818,112 @@ function translateRange(
       index += 1;
       continue;
     }
+    if (instruction.op === "shufpd") {
+      /*
+       * `shufpd $imm, %xmm1, %xmm0` draws each result half from one operand, chosen by one bit: the low half is the destination's own
+       * low quadword, or its high one when bit 0 is set, and the high half is the source's low quadword, or its high one when bit 1 is
+       * set. It is `_mm_shuffle_pd(a, b, imm)` written out: `r0 = imm & 1 ? a[1] : a[0]` and `r1 = imm & 2 ? b[1] : b[0]`.
+       *
+       * The low bit chooses between the destination's own two halves, and the high bit between the source's two, so the high half of the
+       * result always comes from the source: `$0` is not a no-op, it writes the source's low quadword into the high half. Only `$2` and
+       * `$1` leave one half of the result where it was, and no immediate writes nothing at all.
+       *
+       * Every half that is read is read before either write, because the destination may be the source too: `shufpd $1, %xmm0, %xmm0`
+       * moves a register's high half down into its low half, and a write first would destroy the value the second read wants.
+       */
+      const [destination, source, selector] = instruction.operands;
+      if (destination === undefined || destination.kind !== "reg" || source === undefined || source.kind !== "reg") {
+        throw new TranslateError(instruction.offset, "shufpd takes two vector registers");
+      }
+      if (selector === undefined || selector.kind !== "immediate") {
+        throw new TranslateError(instruction.offset, "shufpd needs the byte that says which half comes from where");
+      }
+      const takesDestinationHigh = (selector.value & 1n) !== 0n;
+      const takesSourceHigh = (selector.value & 2n) !== 0n;
+      // the high half always comes from the source, one half of it or the other, so it is always read and always written
+      out.push(
+        ...read(takesSourceHigh ? otherHalf(source, instruction) : source, instruction),
+        ...localSet(SSE_D),
+      );
+      if (takesDestinationHigh) {
+        out.push(...read(otherHalf(destination, instruction), instruction), ...localSet(SSE_A));
+        out.push(...localGet(SSE_A), ...write(destination, instruction));
+      }
+      out.push(...localGet(SSE_D), ...write(otherHalf(destination, instruction), instruction));
+      index += 1;
+      continue;
+    }
+    if (instruction.op === "shufps") {
+      /*
+       * `shufps $imm, %xmm1, %xmm0` places four dword lanes in an order the byte chooses, but only four dwords are reachable: the low
+       * half of each operand. Selectors 0 and 1 are the destination's first two dwords and 2 and 3 the source's, so the high halves of
+       * both registers cannot be named at all.
+       *
+       * The selectors are known here, at translation time, so nothing is indexed at run time: each output lane is a shift and a mask of
+       * one of two scratch locals. Both are filled before the destination is written, because the destination is one of the operands.
+       */
+      const [destination, source, selector] = instruction.operands;
+      if (destination === undefined || destination.kind !== "reg" || source === undefined || source.kind !== "reg") {
+        throw new TranslateError(instruction.offset, "shufps takes two vector registers");
+      }
+      if (selector === undefined || selector.kind !== "immediate") {
+        throw new TranslateError(instruction.offset, "shufps needs the byte that says which lane goes where");
+      }
+      const choices = [0, 2, 4, 6].map((shift) => Number((selector.value >> BigInt(shift)) & 3n));
+      out.push(...read(destination, instruction), ...localSet(SSE_A));
+      out.push(...read(source, instruction), ...localSet(SSE_C));
+      // 0 and 1 name the destination's low half, 2 and 3 the source's; the low bit of the choice says which dword inside that half
+      const lane = (choice: number): number[] => {
+        const local = choice < 2 ? SSE_A : SSE_C;
+        const shift = choice % 2 === 0 ? 0n : 32n;
+        return [
+          ...localGet(local),
+          ...(shift === 0n ? [] : [...i64Const(shift), OP.i64ShrU]),
+          ...i64Const(0xffffffffn),
+          OP.i64And,
+        ];
+      };
+      for (const [half, low, high] of [
+        [destination, choices[0]!, choices[1]!] as const,
+        [otherHalf(destination, instruction), choices[2]!, choices[3]!] as const,
+      ]) {
+        out.push(...lane(low), ...lane(high), ...i64Const(32n), OP.i64Shl, OP.i64Or, ...write(half, instruction));
+      }
+      index += 1;
+      continue;
+    }
     if (instruction.op === "punpcklqdq") {
       /*
-       * `punpcklqdq %xmm1, %xmm0` interleaves the low quadwords, and since a quadword is exactly a half of the register, that is a
-       * pair of moves: the destination's low half goes up into its high half, and the source's low half becomes the low half.
-       * The destination's old low half is read first, because writing the low half is what overwrites it.
+       * `punpcklqdq %xmm1, %xmm0` interleaves the low quadwords, and because a quadword is exactly one half of the register, the whole
+       * operation is: the destination's low half stays where it is and the source's low half becomes the high half.
+       *
+       * The source is read before the write, since it may be the destination: `punpcklqdq %xmm0,%xmm0` copies a register's low half into
+       * its high one. This was translated the other way round until the shuffle tests caught it, which put the source in the low half and
+       * the destination's old value in the high one: the two operands swapped, and a program that read the result back saw them reversed.
        */
       const [destination, source] = instruction.operands;
       if (destination === undefined || source === undefined || destination.kind !== "reg" || source.kind !== "reg") {
         throw new TranslateError(instruction.offset, "punpcklqdq takes two vector registers");
       }
-      out.push(...read(destination, instruction), ...localSet(SSE_A));
-      out.push(...read(source, instruction), ...write(destination, instruction));
-      out.push(...localGet(SSE_A), ...write(otherHalf(destination, instruction), instruction));
+      out.push(...read(source, instruction), ...write(otherHalf(destination, instruction), instruction));
+      index += 1;
+      continue;
+    }
+    if (instruction.op === "punpckhqdq") {
+      /*
+       * The interleave one half up: the destination's low half becomes its own high half and its high half becomes the source's high
+       * half. Both are read before either is written, since the destination may be the source.
+       */
+      const [destination, source] = instruction.operands;
+      if (destination === undefined || destination.kind !== "reg" || source === undefined || source.kind !== "reg") {
+        throw new TranslateError(instruction.offset, "punpckhqdq takes two vector registers");
+      }
+      out.push(
+        ...read(otherHalf(destination, instruction), instruction), ...localSet(SSE_A),
+        ...read(otherHalf(source, instruction), instruction), ...localSet(SSE_B),
+        ...localGet(SSE_A), ...write(destination, instruction),
+        ...localGet(SSE_B), ...write(otherHalf(destination, instruction), instruction),
+      );
       index += 1;
       continue;
     }
@@ -3293,6 +3393,9 @@ function registerNumberOf(name: string): number | undefined {
 const WRITING_OPERATIONS = new Set([
   "mov", "movsxd", "movzx", "movsx", "lea", "add", "sub", "and", "or", "xor", "adc", "sbb", "shl", "shr", "sar", "imul", "inc",
   "pcmpeqd",
+  "shufps",
+  "shufpd",
+  "punpckhqdq",
   "dec", "neg", "not", "pop", "xchg",
 ]);
 
